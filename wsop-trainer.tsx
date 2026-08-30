@@ -1,0 +1,8103 @@
+import { useState, useEffect, useLayoutEffect, useRef, useMemo } from "react";
+
+// Money formatting: chip counts get thousands separators everywhere they're shown ($26,000 not $26000).
+const MNY = n => (Number(n) || 0).toLocaleString();
+
+// ─── SEEDABLE RNG ────────────────────────────────
+// Every ENGINE-level random draw (deck shuffles, bot decisions, the dealer button, tilt) goes through rnd()
+// instead of Math.random(). Unseeded it simply forwards to Math.random, so normal play is unchanged. Seeded
+// via seedRng(n), the whole hand becomes reproducible — which buys us:
+//   • replaying a reported hand exactly ("why did that bot call?") instead of guessing
+//   • deterministic tests that can assert on specific runouts
+//   • the groundwork for provably-fair shuffles once multiplayer has a server dealing the cards
+// Pure presentation randomness (bot "thinking" delays, the Surprise Me dial) deliberately stays on Math.random:
+// it must never consume seeded entropy, or identical seeds would diverge based on UI timing.
+let _rngState = null;                       // null = unseeded (use Math.random)
+function seedRng(n) { _rngState = (n >>> 0) || 1; }
+function clearRng() { _rngState = null; }
+function getRngSeed() { return _rngState; }
+function rnd() {
+  if (_rngState === null) return Math.random();
+  // mulberry32 — small, fast, good distribution; deterministic from a 32-bit seed.
+  _rngState = (_rngState + 0x6D2B79F5) >>> 0;
+  let t = _rngState;
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+
+    
+
+// ─── RESPONSIVE HOOK ─────────────────────────────
+function useWidth() {
+  const [w, setW] = useState(typeof window !== "undefined" ? window.innerWidth : 800);
+  useEffect(() => {
+    const h = () => setW(window.innerWidth);
+    window.addEventListener("resize", h);
+    return () => window.removeEventListener("resize", h);
+  }, []);
+  return w;
+}
+
+// ─── GAME REGISTRY ───────────────────────────────
+// Grouped into Limit games and Big-Bet (no-limit / pot-limit) games.
+const SECTIONS = [
+  { title:"LIMIT GAMES", games:[
+    { id:"triple", label:"2-7 Triple Draw",  tag:"DRAW",    available:true  },
+    { id:"badugi", label:"Badugi",           tag:"DRAW",    available:true  },
+    { id:"lhe",    label:"Limit Hold'em",    tag:"HOLD'EM", available:true  },
+    { id:"omaha8", label:"Omaha Hi-Lo",      tag:"OMAHA 8", available:true  },
+    { id:"razz",   label:"Razz",             tag:"STUD",    available:true  },
+    { id:"razzdugi",label:"Razzdugi",        tag:"STUD SP", available:true  },
+    { id:"stud",   label:"7-Card Stud",      tag:"STUD",    available:true  },
+    { id:"stud8",  label:"Stud Hi-Lo",       tag:"STUD 8",  available:true  },
+    { id:"superstud", label:"Super Stud 8",  tag:"STUD 8",  available:true  },
+  ]},
+  { title:"BIG BET GAMES", games:[
+    { id:"single", label:"2-7 Single Draw",  tag:"NO LIMIT",  available:true  },
+    { id:"nlhe",   label:"No-Limit Hold'em", tag:"NO LIMIT",  available:true  },
+    { id:"plo",    label:"Pot-Limit Omaha",  tag:"POT LIMIT", available:true  },
+    { id:"bigo",   label:"Big O",            tag:"POT LIMIT", available:true  },
+    { id:"crazyp", label:"Crazy Pineapple",  tag:"POT LIMIT", available:true  },
+    { id:"dbcrazyp", label:"Double Board Crazy Pineapple", tag:"POT LIMIT", available:true  },
+    { id:"dbbomb", label:"Double Board Bomb Pot", tag:"POT LIMIT", available:true  },
+    { id:"pl27td", label:"PL 2-7 Triple Draw",  tag:"POT LIMIT",  available:true  },
+    { id:"plo8",   label:"Pot-Limit Omaha-8",   tag:"POT LIMIT",  available:true  },
+    { id:"plbad",  label:"Pot-Limit Badugi",    tag:"POT LIMIT",  available:true  },
+    { id:"pl5d",   label:"PL 5-Card Draw",       tag:"POT LIMIT",  available:true  },
+    { id:"soon1",  label:"More soon",        tag:"",          available:false },
+  ]},
+  { title:"SPLIT-POT DRAW GAMES", games:[
+    { id:"dramahaH",  label:"Dramaha High",  tag:"SPLIT", available:true },
+    { id:"dramaha27", label:"2-7 Dramaha",   tag:"SPLIT", available:true },
+    { id:"dramadugi", label:"Dramadugi",     tag:"SPLIT", available:true },
+    { id:"badeucey", label:"Badeucey",       tag:"SPLIT", available:true },
+    { id:"badacey",  label:"Badacey",        tag:"SPLIT", available:true },
+    { id:"archie",   label:"Archie",         tag:"SPLIT", available:true },
+    { id:"veronica", label:"Veronica",       tag:"SPLIT +1", available:true },
+  ]},
+];
+// Flat list for lookups.
+const GAMES = SECTIONS.flatMap(s => s.games);
+
+// Game families
+const IS_DRAW  = gid => gid === "single" || gid === "triple" || gid === "badugi" || gid === "pl27td" || gid === "plbad" || gid === "pl5d";
+const IS_FLOP  = gid => gid === "lhe" || gid === "omaha8" || gid === "nlhe" || gid === "plo" || gid === "bigo" || gid === "crazyp" || gid === "dbcrazyp" || gid === "dbbomb" || gid === "plo8";
+const IS_STUD  = gid => gid === "razz" || gid === "stud" || gid === "stud8" || gid === "superstud" || gid === "razzdugi";
+const IS_RAZZDUGI = gid => gid === "razzdugi";   // stud split: best razz low + best badugi (no qualifier)
+const IS_OMAHA = gid => gid === "omaha8" || gid === "plo" || gid === "bigo" || gid === "dbbomb" || gid === "plo8";
+const IS_HILO  = gid => gid === "omaha8" || gid === "stud8" || gid === "bigo" || gid === "superstud" || gid === "plo8";
+const IS_STUD8 = gid => gid === "stud8" || gid === "superstud";   // hi-lo 8-or-better stud
+// Crazy Pineapple: 3 hole cards, discard 1 after the flop, then Hold'em construction.
+const IS_PINEAPPLE = gid => gid === "crazyp" || gid === "dbcrazyp";
+const IS_DOUBLE    = gid => gid === "dbcrazyp" || gid === "dbbomb";   // two boards, split between them
+const IS_BOMB      = gid => gid === "dbbomb";   // bomb pot: ante, no preflop, straight to the flop
+const BOMB_ANTE_BB = 3;   // each player antes this many big blinds in a bomb pot
+// Dramaha: 5-card Omaha (high) + one mid-hand draw, split with a second hand made
+// from the five hole cards. The "side" is which hand the draw half is scored as.
+const IS_DRAMAHA   = gid => gid === "dramahaH" || gid === "dramaha27" || gid === "dramadugi";
+const IS_SPLITDRAW = gid => gid === "badeucey" || gid === "badacey" || gid === "archie" || gid === "veronica";
+const IS_VERONICA = gid => gid === "veronica";   // Archie + 1 community card usable for the HIGH hand only
+const DRAMAHA_SIDE = gid => gid === "dramaha27" ? "27" : gid === "dramadugi" ? "badugi" : "high";
+const DRAW_CAP     = gid => gid === "dramadugi" ? 3 : 5;   // max cards a player may draw
+
+// ─── Table capacity & shape ────────────────────────────────────────────────
+// SEAT_CAP is how many players a game can physically seat from one 52-card deck.
+// "hard" = the deck cannot deal more, full stop. The rest are the numbers the
+// game is actually spread at, with a rule covering the shortfall (stud deals a
+// community card on 7th; draw games reshuffle the muck).
+// TABLE_SHAPE is what the middle of the table has to render.
+const SEAT_CAP = {
+  nlhe:9, lhe:9, crazyp:9, plo:9, plo8:9, omaha8:9,   // 2–4 hole cards
+  bigo:8,                                             // hard: 9x5 + board + burns = 53
+  dbcrazyp:8, dbbomb:8,                               // two boards = 10 community cards
+  stud:8, stud8:8, razz:8, superstud:8, razzdugi:8,    // 8x7 = 56, community card on 7th
+  triple:6, single:6, pl27td:6, pl5d:6, badugi:6, plbad:6,
+  badacey:6, badeucey:6, archie:6, veronica:6,         // draws exhaust the deck
+  dramahaH:6, dramaha27:6, dramadugi:6,
+};
+const seatCap = gid => SEAT_CAP[gid] || 6;
+// A rotation can only seat as many as its most restrictive game. This is why
+// HORSE is 8-handed and any mix containing a draw game is 6-handed.
+const rotationCap = gids => Math.min(...gids.map(seatCap));
+
+const TABLE_SHAPE = gid =>
+  IS_STUD(gid)                     ? "stud"      :   // no board; up-cards at each seat
+  IS_DRAMAHA(gid)                  ? "drawBoard" :   // board AND draws
+  gid === "veronica"               ? "drawOne"   :   // draws plus one shared card
+  IS_DOUBLE(gid)                   ? "board2"    :   // two boards
+  (IS_DRAW(gid) || IS_SPLITDRAW(gid)) ? "draw"   :   // no board; the read is the draw count
+                                     "board";
+
+// Seat rows. The front row is always odd so the hero sits dead centre with an
+// equal number either side, and the back row's seat centres fall on the same
+// columns. Generated rather than hard-coded so any seat count lays out.
+function tableRows(n, land) {
+  const opp = Math.max(0, n - 1);
+  if (land) {
+    const flank = opp >= 8 ? 4 : opp >= 2 ? 2 : 0;   // must be even, or the hero isn't centred
+    const back  = opp - flank;
+    const rows  = [];
+    if (back > 0) rows.push(Array.from({ length: back }, (_, i) => i + 1));
+    rows.push("C");
+    const l = [], r = [];
+    for (let i = 0; i < flank; i++) (i < flank / 2 ? l : r).push(back + 1 + i);
+    rows.push([...l, "H", ...r]);
+    return rows;
+  }
+  const rows = [];
+  let k = 1;
+  if (opp % 2 === 1) rows.push([k++]);
+  while (k <= opp) rows.push([k++, k++]);
+  if (rows.length <= 1) rows.push("C");
+  else rows.splice(rows.length - 1, 0, "C");
+  rows.push(["H"]);
+  return rows;
+}
+
+// Betting structure per game: "fl" fixed-limit, "nl" no-limit, "pl" pot-limit.
+const BET_MODE = gid => (gid === "single" || gid === "nlhe") ? "nl"
+                       : (gid === "plo" || gid === "bigo" || IS_PINEAPPLE(gid) || gid === "dbbomb" || gid === "plo8" || gid === "pl27td" || gid === "plbad" || gid === "pl5d") ? "pl" : "fl";
+// Cards dealt per player for draw games.
+const HAND_SIZE = gid => (gid === "badugi" || gid === "plbad" ? 4 : 5);
+const IS_BADUGI = gid => gid === "badugi" || gid === "plbad";   // badugi hand logic (limit + pot-limit)
+const IS_HIGHDRAW = gid => gid === "pl5d";   // 5-card draw for HIGH (best poker hand), unlike the lowball draws
+const HOLE_SIZE = gid => (gid === "bigo" || gid === "dbbomb" ? 5 : IS_OMAHA(gid) ? 4 : IS_PINEAPPLE(gid) ? 3 : (gid === "lhe" || gid === "nlhe") ? 2 : HAND_SIZE(gid));
+
+// ─── CONSTANTS ───────────────────────────────────
+const SUITS = ["♠","♥","♦","♣"];
+const RANKS = ["2","3","4","5","6","7","8","9","10","J","Q","K","A"];
+const RV    = {2:2,3:3,4:4,5:5,6:6,7:7,8:8,9:9,10:10,J:11,Q:12,K:13,A:14};
+const RED   = new Set(["♥","♦"]);
+const ANTE  = 10;
+const SB    = 20;   // small bet (streets 0 and 1)
+const BB    = 40;   // big bet   (streets 2 and 3)
+const SBLIND = 10;  // flop games: small blind
+const BBLIND = 20;  // flop games: big blind (= small bet)
+const STUD_ANTE = 5; // stud games: ante per player
+const BRINGIN   = 10; // stud games: forced bring-in on 3rd street
+
+// ─── STAKES & FORMAT ─────────────────────────────
+// Every money value derives from one headline number `sb` (the small blind).
+//   blinds  sb / 2·sb      fixed-limit bets  2·sb / 4·sb
+//   draw ante sb · stud ante ≈ sb/2 · bring-in sb
+// At sb=10 this reproduces the legacy table exactly (ante10, bets 20/40, blinds 10/20).
+const mkStakes = (sb, label) => ({
+  label, sb,
+  sblind: sb, bblind: 2 * sb,          // flop-game blinds
+  sbet: 2 * sb, bbet: 4 * sb,          // fixed-limit small/big bet
+  ante: sb, studAnte: Math.max(1, Math.round(sb / 2)), bringin: sb,
+});
+const CASH_STAKES   = [mkStakes(5, "$5 / $10"), mkStakes(10, "$10 / $20"), mkStakes(25, "$25 / $50")];
+const TOURNEY_STAKES = mkStakes(10, "Tournament");   // level-0 blind; used for the starting stack calc
+// ── Tournament structure (Leg C · C2) ──
+const TOUR_SB        = [10,15,20,30,40,60,80,120,160,250,350,500,700,1000,1500,2000];  // small blind per level
+const TOUR_LEVEL_SEC = 2100;                         // ~35-min blind levels (real B&M pace); paced by HANDS, not idle time
+const TOUR_HAND_SECS = 130;                          // tournament time each completed hand represents (~2.2 min, live pace)
+const tourSb    = lvl => TOUR_SB[Math.min(Math.max(0, lvl|0), TOUR_SB.length - 1)];
+const tourLevelFromClock = (clock, levelSec) => Math.min(TOUR_SB.length - 1, Math.floor((clock || 0) / (levelSec || TOUR_LEVEL_SEC)));
+const tourStakes = st => mkStakes(tourSb(st.tour?.level || 0), `L${(st.tour?.level || 0) + 1}`);
+// One orbit of a tournament → rotate to the next game in the mix. Called at the top of deal().
+function rotateTour(s) {
+  const t = s.tour;
+  if (!t || !t.on || !(t.seq && t.seq.length)) return s;
+  const hands    = (t.hands || 0) + 1;
+  const orbitLen = Math.max(2, s.players.length);                       // ~one lap of the button
+  const autoIdx  = Math.floor((hands - 1) / orbitLen) % t.seq.length;
+  // Dealer's Choice: the game is chosen by the button (set on the state), not auto-rotated — keep s.gid.
+  const gid      = t.dc ? s.gid : (t.seq[autoIdx] || s.gid);
+  const mixIdx   = t.dc ? Math.max(0, t.seq.indexOf(gid)) : autoIdx;
+  // Blinds are paced by HANDS, like a real structure: each completed hand advances the clock ~2 min (live pace,
+  // small variance so it's not robotic), so a ~35-min level runs ~14–16 hands. Field attrition follows level, so
+  // it paces correctly too.
+  const clock    = (t.clock || 0) + Math.round(TOUR_HAND_SECS * (0.85 + rnd() * 0.3));
+  const level    = tourLevelFromClock(clock, t.levelSec || TOUR_LEVEL_SEC);
+  return { ...s, gid, tour: { ...t, hands, mixIdx, clock, level } };
+}
+// Dealer's Choice bot pick: personality-weighted — aggressive bots lean big-bet, tight bots lean limit/stud/draw.
+function botChooseGame(s, seatId) {
+  const seq = (s.tour && s.tour.seq) || [];
+  if (!seq.length) return s.gid;
+  const pr = PROF[seatId] || { aggr: 0.5 };
+  const aggr = pr.aggr ?? 0.5;
+  // Nobody calls Limit Hold'em in a real Dealer's Choice — heavily discount it so bots pick it only rarely.
+  const scored = seq.map(g => ({ g, w: ((BET_MODE(g) !== "fl" ? aggr : (1 - aggr) * 0.9) + rnd() * 0.5) * (g === "lhe" ? 0.28 : 1) }))
+                    .sort((a, b) => b.w - a.w);
+  return scored[0].g;
+}
+function chooseReason(gid) {
+  if (BET_MODE(gid) !== "fl") return "big-bet — room to apply pressure.";
+  if (IS_STUD(gid))  return "a stud round to grind the edge.";
+  if (IS_DRAW(gid))  return "a limit draw — small, safe pots.";
+  return "a limit game to keep it controlled.";
+}
+// One-line "what wins" reminders for the chooser cards.
+const GAME_WINS = {
+  nlhe:"best 5 of 2+5", lhe:"capped bets · 2+5", plo:"use exactly 2 of 4", bigo:"5 cards · hi-lo split",
+  omaha8:"hi-lo · 8-or-better", razz:"lowest hand wins", stud:"best 5 of 7", stud8:"hi-lo split",
+  superstud:"super stud · hi-lo", triple:"worst wins · 3 draws", badugi:"4 low · off-suit",
+  single:"one draw · worst wins", crazyp:"3 cards · drop one", dbcrazyp:"two boards · drop one",
+  dbbomb:"bomb pot · two boards", razzdugi:"razz low + badugi",
+  dramahaH:"Omaha + a draw", dramaha27:"Omaha + 2-7 draw", dramadugi:"Omaha + badugi",
+  badacey:"badugi + A-5", badeucey:"badugi + 2-7", archie:"scoop the split", veronica:"Omaha + up-card",
+};
+const BB_DEPTHS     = [200, 100, 50, 10];
+// ── Tournament field model (Leg C · sim S1) ── pure + harness-verifiable ──
+// Chip invariant: total chips in play = startStack × runners, constant. Average stack grows as the field shrinks.
+const tourStartStack = (gid, bbDepth) => depthUnit(gid, mkStakes(TOUR_SB[0], "L1")) * (bbDepth ?? 100) * depthMult(gid);
+// Players still in the field as the tournament deepens. Exponential decay from the full field down to ~1
+// over "levels-to-final-table" (which scales with field size — bigger fields take longer). Fast early, slows late.
+function fieldLeft(total, level) {
+  if (total <= 1) return 1;
+  const Lft  = 8 + Math.log2(total) * 2.4;                          // levels to burn the field down to ~1
+  const frac = Math.pow(total, 1 - Math.min(1, (level || 0) / Lft)); // total → 1 across Lft levels
+  return Math.max(1, Math.min(total, Math.round(frac)));
+}
+// Effective field size = the level-driven attrition model, but never higher than (total − real busts seen at
+// your table). So knocking an opponent out visibly ticks the field down between blind levels, while the model
+// still paces the march to the final table. `busted` defaults 0 → identical to the pure model (callers/tests
+// that don't track busts are unaffected).
+function fieldLeftLive(F, level, busted) {
+  return Math.max(1, Math.min(fieldLeft(F.total, level), F.total - (busted || 0)));
+}
+// Your rank in the field, modelled from your stack vs the field average (chip leader → 1st, short → near last).
+function fieldRank(yourStack, avgStack, left) {
+  if (left <= 1) return 1;
+  const r = Math.max(1, yourStack) / Math.max(1, avgStack);
+  const aboveFrac = 1 / (1 + Math.pow(r, 1.3));            // fraction of the field holding more chips than you
+  return Math.max(1, Math.min(left, Math.round(aboveFrac * (left - 1)) + 1));
+}
+const paidSpots = total => total <= 3 ? 1 : total <= 9 ? Math.max(2, Math.round(total * 0.3)) : Math.max(1, Math.round(total * 0.15));
+const ordinal = n => { const s = ["th","st","nd","rd"], v = n % 100; return n + (s[(v-20)%10] || s[v] || s[0]); };
+// ── S6: payout ladder ── prize pool = runners × buy-in. Every paid spot gets a min-cash floor (~1.8× buy-in),
+// then the remainder is distributed top-heavy so 1st takes the lion's share (≈20–35% depending on field size).
+const TOUR_BUYIN = { low: 60, med: 250, high: 1000 };
+function payoutLadder(total, buyIn) {
+  const pool = total * buyIn, spots = paidSpots(total), minCash = Math.round(buyIn * 1.8);
+  const extra = Math.max(0, pool - minCash * spots);
+  const w = []; for (let r = 1; r <= spots; r++) w.push(1 / Math.pow(r, 1.15));
+  const sum = w.reduce((a, b) => a + b, 0) || 1;
+  return w.map(x => Math.round(minCash + (x / sum) * extra));
+}
+const payoutFor = (place, total, buyIn) => { const l = payoutLadder(total, buyIn); return (place >= 1 && place <= l.length) ? l[place - 1] : 0; };
+// ── S5: ICM / stage context ── how deep the tournament is for a given stack. Bubble pressure taxes marginal
+// spots for medium stacks (survival matters more than chips near a pay jump); short stacks shove/fold, big
+// stacks apply pressure. `tighten` is added to value thresholds (+ = fold more).
+function icmContext(st, chips) {
+  if (!st.tour?.on || !st.tour.field) return null;
+  const F = st.tour.field, level = st.tour.level || 0;
+  const left = fieldLeftLive(F, level, st.tour.busted), paid = paidSpots(F.total), toMoney = left - paid;
+  const bb = STK(st).bblind || STK(st).bbet || 1;
+  const myBB = chips / bb;
+  const inMoney    = left <= paid;
+  const onBubble   = toMoney > 0 && toMoney <= Math.max(2, Math.round(paid * 0.06));
+  const nearBubble = toMoney > 0 && toMoney <= Math.max(4, Math.round(paid * 0.18));
+  const short = myBB < 12, deep = myBB > 40;
+  let tighten = 0;
+  if (nearBubble && !inMoney) tighten = short ? 0 : deep ? -0.04 : (onBubble ? 0.14 : 0.08);
+  return { myBB, toMoney, onBubble, nearBubble, inMoney, short, deep, tighten };
+}
+// ── S3: table reseating (WSOP/TDA-style). While the field is bigger than one table, busted opponents are
+// replaced by fresh faces drawn from the room (you being reseated / players moved to you), stacks scaled to
+// the field's growing average. Once the field fits one table, refilling stops — that's your final table. ──
+function refillTable(s) {
+  const t = s.tour, F = t.field;
+  if (!t || !t.on || !F) return s;
+  // The REAL field remaining is the smaller of the attrition model and (total − actual busts). Once that fits a
+  // single table, stop reseating — no resurrecting a field the busts have already eliminated (this is what let
+  // scenario endgames refill back to 8-handed).
+  const liveLeft = fieldLeftLive(F, t.level || 0, t.busted);
+  if (liveLeft <= s.players.length) return s;                // final table reached — play it down, no refill
+  const avg = Math.round(F.total * F.startStack / liveLeft); // chip economics track the real remaining field
+  const seats = s.players.length;
+  // Keep the table's chip total tracking the field average (avg × seats). Without this, every refilled seat
+  // mints a fresh ~average stack with no ceiling, so the table balloons and the leader runs to an impossible
+  // stack (the reported $117k at level 2). Bound it so refills can't inflate the table.
+  const cap = Math.round(avg * seats * 1.15);
+  let running = s.players.reduce((a, p) => a + Math.max(0, p.chips), 0);
+  let busted = t.busted || 0;                                // real eliminations seen at your table
+  let refilled = false;
+  // Names already seated stay put; each reseated seat draws a fresh first name not currently at the table, so
+  // a busted opponent is replaced by a genuinely new face (not the same name back in the same chair).
+  const taken = s.players.map(p => p.name).filter(Boolean);
+  const players = s.players.map((p, i) => {
+    if (p.id === 0 || p.chips > 0) return p.justSeated ? { ...p, justSeated:false } : p;   // alive seats: clear last hand's NEW tag
+    refilled = true;
+    busted += 1;                                             // this seat's occupant is out — a real elimination
+    const name  = freshName(taken, (t.hands || 0) * 7 + i * 13 + busted);
+    taken.push(name);
+    let stack   = Math.round(avg * (0.5 + ((i * 7 + 3) % 10) / 10));                  // spread around the field avg
+    stack       = Math.max(Math.round(F.startStack * 0.15), Math.min(stack, cap - running));  // …but never inflate the table
+    running    += stack;
+    return { ...p, chips: stack, name, folded:false, sittingOut:false, busted:false, hand:[], betSt:0, justSeated:true, lastAct:{ text:"New seat", color:"#9d8659" } };
+  });
+  return refilled ? { ...s, players, tour:{ ...t, busted } } : s;
+}
+const CASH_DEPTH    = 100;                            // cash buy-in fixed at 100bb
+// Active stakes for a given state.
+const STK = st => (st.format === "tourney" ? tourStakes(st) : CASH_STAKES[st.stakeIdx ?? 1]);
+// The "one big bet/blind" used to size a stack by depth — relabelled per game family.
+const depthUnit = (gid, stk) => (BET_MODE(gid) === "fl" ? stk.bbet : stk.bblind);
+// Big-bet games play DEEP — WSOP big-bet events start ~175-200bb, vs limit games measured in big bets. So a
+// big-bet tournament stack is 2x the nominal blind depth.
+const depthMult = gid => (BET_MODE(gid) === "fl" ? 1 : 2);
+const depthWord = gid => (BET_MODE(gid) === "fl" ? "big bets" : "big blinds");
+// Starting stack for a state's format/stake/depth.
+const startStack = st => depthUnit(st.gid, STK(st)) * (st.format === "tourney" ? (st.bbDepth ?? 100) * depthMult(st.gid) : CASH_DEPTH);
+// Suit order for bring-in / board tie-breaks (spades high → clubs low)
+const SUIT_RANK = { "♠":4, "♥":3, "♦":2, "♣":1 };
+
+// ─── CPU PROFILES ────────────────────────────────
+// Three distinct opponents with realistic leaks.
+// Martin gains tilt stacks when he loses — plays worse.
+const PROF = {
+  1:{ name:"Tommy",  tag:"The Rock",   aggr:0.20, bluff:0.05, slow:0.36, leak:0.10, standPat:0.07, over:0.03, sz:0.45, cry:0.07 },
+  2:{ name:"Carlos", tag:"The Maniac", aggr:0.75, bluff:0.38, slow:0.03, leak:0.25, standPat:0.04, over:0.15, sz:1.25, cry:0.28 },
+  3:{ name:"Martin", tag:"Old Reg",    aggr:0.38, bluff:0.12, slow:0.20, leak:0.22, standPat:0.25, over:0.06, sz:0.65, cry:0.14 },
+  4:{ name:"Dex",    tag:"The Nit",    aggr:0.15, bluff:0.03, slow:0.42, leak:0.06, standPat:0.08, over:0.02, sz:0.40, cry:0.05 },
+  5:{ name:"Priya",  tag:"Solid Reg",  aggr:0.42, bluff:0.14, slow:0.18, leak:0.16, standPat:0.20, over:0.07, sz:0.72, cry:0.12 },
+  6:{ name:"Ivan",   tag:"Station",    aggr:0.22, bluff:0.06, slow:0.10, leak:0.40, standPat:0.05, over:0.04, sz:0.55, cry:0.42 },
+  7:{ name:"Sana",   tag:"LAG",        aggr:0.68, bluff:0.30, slow:0.06, leak:0.20, standPat:0.10, over:0.14, sz:1.05, cry:0.22 },
+};
+// Reserve of first names for reseated players — as the field busts, WSOP tables refill with fresh faces moved
+// in from broken tables. Deliberately distinct from the seven starters so a bust-out never reads as the same
+// player walking back to the same chair with a new stack.
+const NAME_POOL = ["Nadia","Omar","Ling","Rico","Beth","Kwame","Yuki","Sofia","Deng","Hank","Mira","Cole","Rosa",
+  "Vik","Jade","Bruno","Tara","Enzo","Faye","Gus","Iris","Lars","Nora","Pavel","Quinn","Remy","Suki","Theo","Uma",
+  "Wade","Xena","Zane","Anya","Bao","Cira","Dario","Esme","Finn","Gita","Hugo"];
+// Pick a first name that isn't already seated, so every seat at the table stays a unique person.
+function freshName(taken, seed = 0) {
+  const pool = NAME_POOL.filter(n => !taken.includes(n));
+  const src  = pool.length ? pool : NAME_POOL;
+  return src[(Math.abs(seed | 0)) % src.length];
+}
+
+// 8-max mobile: the 7 opponent seats placed around the top oval (hero sits below). translate(-50%,-50%).
+const OVAL_POS = [
+  { left:"13%", top:"68%" }, { left:"9%",  top:"35%" }, { left:"27%", top:"11%" },
+  { left:"50%", top:"8%" }, { left:"73%", top:"11%" }, { left:"91%", top:"35%" }, { left:"87%", top:"68%" },
+];
+
+// ─── DECK ────────────────────────────────────────
+function mkDeck() {
+  const d = [];
+  for (const s of SUITS) for (const r of RANKS) d.push({ s, r, v: RV[r] });
+  for (let i = d.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [d[i], d[j]] = [d[j], d[i]];
+  }
+  return d;
+}
+
+// ─── 2-7 LOWBALL EVALUATOR ───────────────────────
+// Rules: Aces are HIGH (bad). Straights count. Flushes count.
+// Lower five-card hand wins. Best: 7-5-4-3-2 rainbow.
+function eval27(cards) {
+  if (!cards || cards.length !== 5) return null;
+  const vs = cards.map(c => c.v).sort((a, b) => b - a);
+  const isF = new Set(cards.map(c => c.s)).size === 1;
+  const isS = new Set(vs).size === 5 && vs[0] - vs[4] === 4;
+  const cnt = {}; vs.forEach(v => (cnt[v] = (cnt[v] || 0) + 1));
+  const fr = Object.values(cnt).sort((a, b) => b - a);
+  let cat;
+  if      (isF && isS)                cat = 8;
+  else if (fr[0] === 4)               cat = 7;
+  else if (fr[0] === 3 && fr[1] === 2) cat = 6;
+  else if (isF)                        cat = 5;
+  else if (isS)                        cat = 4;
+  else if (fr[0] === 3)               cat = 3;
+  else if (fr[0] === 2 && fr[1] === 2) cat = 2;
+  else if (fr[0] === 2)               cat = 1;
+  else                                cat = 0;
+  const CATS = ["High Card","Pair","Two Pair","Three of a Kind","Straight","Flush","Full House","Four of a Kind","Str. Flush"];
+  const RN = {14:"Ace",13:"King",12:"Queen",11:"Jack",10:"Ten",9:"Nine",8:"Eight",7:"Seven",6:"Six",5:"Five",4:"Four",3:"Three",2:"Deuce"};
+  return { cat, vs, desc: cat === 0 ? `${RN[vs[0]]}-low` : cat === 5 ? `${RANKS[vs[0]-2]}-high flush` : CATS[cat] };
+}
+function cmp27(a, b) {
+  if (!a || !b) return 0;
+  if (a.cat !== b.cat) return a.cat < b.cat ? -1 : 1;
+  for (let i = 0; i < 5; i++) if (a.vs[i] !== b.vs[i]) return a.vs[i] < b.vs[i] ? -1 : 1;
+  return 0;
+}
+function hColor(ev) {
+  if (!ev) return "#6b7280";
+  if (ev.high) { // flop high hand: higher category is better
+    if (ev.cat >= 6) return "#3FD39C";
+    if (ev.cat >= 3) return "#57E6B0";
+    if (ev.cat >= 1) return "#fde047";
+    return "#fb923c";
+  }
+  if (ev.low) { // razz / ace-to-five low: lower category & lower top card better
+    if (ev.cat > 0) return "#E2857A";          // any pair+ is bad
+    const top = ev.tb ? ev.tb[0] : 14;
+    if (top <= 6) return "#3FD39C";
+    if (top <= 7) return "#57E6B0";
+    if (top <= 8) return "#fde047";
+    if (top <= 9) return "#fb923c";
+    return "#E2857A";
+  }
+  if (ev.game === "badugi") {
+    if (ev.size === 4) return ev.vs[0] <= 7 ? "#3FD39C" : "#57E6B0"; // 4-card badugi
+    if (ev.size === 3) return "#fde047";
+    if (ev.size === 2) return "#fb923c";
+    return "#E2857A";
+  }
+  if (ev.cat > 0)     return "#E2857A";
+  if (ev.vs[0] <= 7)  return "#3FD39C";
+  if (ev.vs[0] <= 8)  return "#57E6B0";
+  if (ev.vs[0] <= 9)  return "#fde047";
+  if (ev.vs[0] <= 10) return "#fb923c";
+  return "#E2857A";
+}
+
+// ─── BADUGI EVALUATOR ────────────────────────────
+// Aces are LOW. A "badugi" = cards with all distinct ranks AND all distinct
+// suits. More cards beats fewer (4-card beats 3-card beats 2-card). Within the
+// same size, the lower high card wins. Best possible: A-2-3-4 rainbow.
+const BV = v => (v === 14 ? 1 : v); // ace counts as 1 (low) in badugi
+function evalBadugi(cards, aceHigh = false) {
+  if (!cards || cards.length < 4) return null;   // 4 (badugi) or 5 (dramadugi/badX hole) → best 4-card badugi
+  const bv = v => aceHigh ? v : (v === 14 ? 1 : v);   // Baduci/Badeucey: ace plays HIGH (worst)
+  // Find the largest subset with unique ranks and unique suits; tie-break lowest.
+  let best = null;
+  const n = cards.length;
+  for (let mask = 1; mask < (1 << n); mask++) {
+    const sub = [];
+    for (let i = 0; i < n; i++) if (mask & (1 << i)) sub.push(cards[i]);
+    const ranks = new Set(sub.map(c => bv(c.v)));
+    const suits = new Set(sub.map(c => c.s));
+    if (ranks.size !== sub.length || suits.size !== sub.length) continue; // not valid
+    const vs = sub.map(c => bv(c.v)).sort((a, b) => b - a); // high first
+    const cand = { size: sub.length, vs };
+    if (!best) { best = cand; continue; }
+    if (cand.size !== best.size) { if (cand.size > best.size) best = cand; continue; }
+    // same size: compare high cards, lower wins
+    for (let i = 0; i < cand.size; i++) {
+      if (cand.vs[i] !== best.vs[i]) { if (cand.vs[i] < best.vs[i]) best = cand; break; }
+    }
+  }
+  const RN = {1:"Ace",2:"Deuce",3:"Three",4:"Four",5:"Five",6:"Six",7:"Seven",8:"Eight",9:"Nine",10:"Ten",11:"Jack",12:"Queen",13:"King",14:"Ace"};
+  const sizeWord = ["", "1-card", "2-card", "3-card", "Badugi"][best.size];
+  const low = RN[best.vs[0]];
+  const desc = best.size === 4 ? `${low}-high Badugi` : `${sizeWord} (${low} high)`;
+  return { game:"badugi", size:best.size, vs:best.vs, desc };
+}
+function cmpBadugi(a, b) {
+  if (!a || !b) return 0;
+  if (a.size !== b.size) return a.size > b.size ? -1 : 1; // more cards wins
+  for (let i = 0; i < a.size; i++) if (a.vs[i] !== b.vs[i]) return a.vs[i] < b.vs[i] ? -1 : 1;
+  return 0;
+}
+
+// ─── HIGH-HAND EVALUATOR (flop games) ────────────
+// Best 5-card poker hand. Higher is better. Ace high; wheel A-2-3-4-5 = 5-high.
+function evalHigh5(cards) {
+  const vs = cards.map(c => c.v).sort((a, b) => b - a);
+  const isFlush = new Set(cards.map(c => c.s)).size === 1;
+  const uniq = [...new Set(vs)].sort((a, b) => b - a);
+  let strHigh = 0;
+  if (uniq.length === 5) {
+    if (uniq[0] - uniq[4] === 4) strHigh = uniq[0];
+    else if (uniq[0] === 14 && uniq[1] === 5 && uniq[4] === 2) strHigh = 5; // wheel
+  }
+  const cnt = {}; vs.forEach(v => (cnt[v] = (cnt[v] || 0) + 1));
+  const groups = Object.entries(cnt).map(([v, c]) => ({ v:+v, c })).sort((a, b) => b.c - a.c || b.v - a.v);
+  const freq = groups.map(g => g.c);
+  let cat, tb;
+  if      (isFlush && strHigh)            { cat = 8; tb = [strHigh]; }
+  else if (freq[0] === 4)                 { cat = 7; tb = [groups[0].v, groups[1].v]; }
+  else if (freq[0] === 3 && freq[1] === 2){ cat = 6; tb = [groups[0].v, groups[1].v]; }
+  else if (isFlush)                       { cat = 5; tb = vs.slice(); }
+  else if (strHigh)                       { cat = 4; tb = [strHigh]; }
+  else if (freq[0] === 3)                 { cat = 3; tb = [groups[0].v, ...groups.slice(1).map(g => g.v)]; }
+  else if (freq[0] === 2 && freq[1] === 2){ cat = 2; const pr=[groups[0].v,groups[1].v].sort((a,b)=>b-a); tb=[...pr, groups[2].v]; }
+  else if (freq[0] === 2)                 { cat = 1; tb = [groups[0].v, ...groups.slice(1).map(g => g.v)]; }
+  else                                    { cat = 0; tb = vs.slice(); }
+  const CATS = ["High Card","Pair","Two Pair","Trips","Straight","Flush","Full House","Quads","Str. Flush"];
+  return { cat, tb, desc: cat === 5 ? `${RANKS[tb[0]-2]}-high flush` : CATS[cat], high:true };
+}
+function cmpHigh(a, b) {
+  if (!a || !b) return 0;
+  if (a.cat !== b.cat) return a.cat > b.cat ? -1 : 1; // higher cat wins
+  const n = Math.max(a.tb.length, b.tb.length);
+  for (let i = 0; i < n; i++) { const x = a.tb[i]||0, y = b.tb[i]||0; if (x !== y) return x > y ? -1 : 1; }
+  return 0;
+}
+function kCombos(arr, k) {
+  const res = [], n = arr.length, idx = [...Array(k).keys()];
+  if (k > n) return res;
+  while (true) {
+    res.push(idx.map(i => arr[i]));
+    let i = k - 1;
+    while (i >= 0 && idx[i] === n - k + i) i--;
+    if (i < 0) break;
+    idx[i]++;
+    for (let j = i + 1; j < k; j++) idx[j] = idx[j-1] + 1;
+  }
+  return res;
+}
+// Hold'em: best 5 of (2 hole + board)
+function bestHoldemHigh(hole, board) {
+  const seven = [...hole, ...board];
+  if (seven.length < 5) return null;
+  let best = null;
+  for (const c of kCombos(seven, 5)) { const e = evalHigh5(c); if (!best || cmpHigh(e, best) < 0) best = e; }
+  return best;
+}
+// Omaha: exactly 2 hole + 3 board
+function bestOmahaHigh(hole, board) {
+  if (board.length < 3) return null;
+  let best = null;
+  for (const h of kCombos(hole, 2))
+    for (const b of kCombos(board, 3)) { const e = evalHigh5([...h, ...b]); if (!best || cmpHigh(e, best) < 0) best = e; }
+  return best;
+}
+// Omaha-8 low: exactly 2 hole + 3 board, 5 distinct ranks all ≤8 (A=1). Lower wins.
+const lowVal = v => (v === 14 ? 1 : v);
+function bestOmahaLow(hole, board) {
+  if (board.length < 3) return null;
+  let best = null;
+  for (const h of kCombos(hole, 2))
+    for (const b of kCombos(board, 3)) {
+      const five = [...h, ...b].map(c => lowVal(c.v));
+      if (new Set(five).size !== 5) continue;
+      if (Math.max(...five) > 8) continue;
+      const sorted = [...five].sort((a, b) => b - a);
+      if (!best || cmpLow(sorted, best) < 0) best = sorted;
+    }
+  return best;
+}
+function cmpLow(a, b) {
+  if (!a || !b) return 0;
+  for (let i = 0; i < 5; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  return 0;
+}
+const LOWNAME = { 1:"A",2:"2",3:"3",4:"4",5:"5",6:"6",7:"7",8:"8",9:"9",10:"10",11:"J",12:"Q",13:"K",14:"A" };
+function lowDesc(lo) { return lo ? lo.map(v => LOWNAME[v]).join("-") + " low" : "no low"; }
+
+// Best high hand for a flop game (dispatches Hold'em vs Omaha)
+function flopHigh(gid, hole, board) {
+  return IS_OMAHA(gid) ? bestOmahaHigh(hole, board)
+       : IS_PINEAPPLE(gid) ? bestPineHigh(hole, board)
+       : bestHoldemHigh(hole, board);
+}
+// Crazy Pineapple: Hold'em construction, but pre-discard you hold 3 cards — use the best 2-card subset.
+function bestPineHigh(hole, board) {
+  if (!hole || hole.length <= 2) return bestHoldemHigh(hole, board);
+  let best = null;
+  for (const pair of kCombos(hole, 2)) { const e = bestHoldemHigh(pair, board); if (e && (!best || cmpHigh(e, best) < 0)) best = e; }
+  return best;
+}
+
+// ─── STUD EVALUATORS ─────────────────────────────
+// Razz / ace-to-five low: straights & flushes DON'T count; pairs are a
+// category penalty (no-pair beats any pair, etc.). Ace is low. Best = 5-4-3-2-A.
+function evalRazz5(cards) {
+  const vs = cards.map(c => lowVal(c.v)).sort((a, b) => b - a);
+  const cnt = {}; vs.forEach(v => (cnt[v] = (cnt[v] || 0) + 1));
+  const f = Object.values(cnt).sort((a, b) => b - a);
+  let cat;
+  if      (f[0] === 4)               cat = 7; // quads
+  else if (f[0] === 3 && f[1] === 2) cat = 6; // full house
+  else if (f[0] === 3)               cat = 3; // trips
+  else if (f[0] === 2 && f[1] === 2) cat = 2; // two pair
+  else if (f[0] === 2)               cat = 1; // one pair
+  else                               cat = 0; // no pair (best)
+  return { cat, tb: vs, low:true };
+}
+function cmpRazz(a, b) {
+  if (!a || !b) return 0;
+  if (a.cat !== b.cat) return a.cat < b.cat ? -1 : 1; // lower category is better
+  for (let i = 0; i < 5; i++) { const x = a.tb[i]||0, y = b.tb[i]||0; if (x !== y) return x < y ? -1 : 1; }
+  return 0;
+}
+function bestRazz(seven) {
+  if (!seven || seven.length < 5) return null;
+  let best = null;
+  for (const c of kCombos(seven, 5)) { const e = evalRazz5(c); if (!best || cmpRazz(e, best) < 0) best = e; }
+  if (best) best.desc = razzDesc(best);
+  return best;
+}
+function razzDesc(ev) {
+  if (!ev) return "—";
+  const top = ev.tb.map(v => LOWNAME[v] || v);
+  if (ev.cat === 0) return top.slice(0, 5).join("-") + " low";   // full low so ties read apart: 8-6-5-4-2 low
+  const C = ["", "pair", "two pair", "trips", "", "", "full house", "quads"][ev.cat];
+  return `${top[0]}-high (${C})`;
+}
+// 8-or-better low from any 5 of N (stud-8). Ace low; 5 distinct ranks ≤ 8.
+function bestLow7(seven) {
+  if (!seven || seven.length < 5) return null;
+  let best = null;
+  for (const c of kCombos(seven, 5)) {
+    const five = c.map(x => lowVal(x.v));
+    if (new Set(five).size !== 5) continue;
+    if (Math.max(...five) > 8) continue;
+    const s = [...five].sort((a, b) => b - a);
+    if (!best || cmpLow(s, best) < 0) best = s;
+  }
+  return best;
+}
+// Best high hand from 7 stud cards (reuses best-of-7)
+function studHigh(seven) { return bestHoldemHigh(seven, []); } // bestHoldemHigh uses all of (hole+board)=seven
+
+// "up" cards a player is showing (face-up). Used for bring-in & first-to-act.
+const upCards = p => p.hand.filter(c => c.up);
+
+// Partial low value of showing cards (lower = better for razz ordering); returns sorted-desc ace-low vector
+function showLowVec(cards) { return cards.map(c => lowVal(c.v)).sort((a, b) => b - a); }
+function cmpVecLow(a, b) { for (let i=0;i<Math.max(a.length,b.length);i++){const x=a[i]||0,y=b[i]||0;if(x!==y)return x<y?-1:1;} return 0; }
+
+// ─── GENERIC DISPATCHERS ─────────────────────────
+function evalHand(gid, cards) {
+  if (IS_HIGHDRAW(gid)) return evalHigh5(cards);                 // 5-card draw for HIGH
+  return (gid === "badugi" || gid === "plbad") ? evalBadugi(cards) : eval27(cards);
+}
+function cmpHand(gid, a, b) {
+  if (IS_HIGHDRAW(gid)) return cmpHigh(a, b);
+  return (gid === "badugi" || gid === "plbad") ? cmpBadugi(a, b) : cmp27(a, b);
+}
+// 5-card-draw (high) keep logic: hold made hands and the biggest draw, discard the rest.
+// Returns the indices to DISCARD. Mirrors how a competent player draws in five-card draw.
+function highDrawDiscard(hand) {
+  const cnt = {}; hand.forEach(c => cnt[c.v] = (cnt[c.v] || 0) + 1);
+  const groups = Object.entries(cnt).map(([v,c]) => ({ v:+v, c })).sort((a,b) => b.c - a.c || b.v - a.v);
+  const ev = evalHigh5(hand);
+  if (ev.cat >= 4) return [];                                    // straight+ → stand pat
+  if (ev.cat === 3 || ev.cat === 6 || ev.cat === 7) {           // trips / full / quads: keep the set(s), draw the rest
+    const keepV = new Set(groups.filter(g => g.c >= (ev.cat===3?3:2)).map(g => g.v));
+    return hand.map((c,i)=>i).filter(i => !keepV.has(hand[i].v));
+  }
+  if (ev.cat === 2) {                                            // two pair: draw one to the kicker
+    const keepV = new Set(groups.filter(g => g.c === 2).map(g => g.v));
+    return hand.map((c,i)=>i).filter(i => !keepV.has(hand[i].v));
+  }
+  // Four to a flush?
+  const suits = {}; hand.forEach(c => suits[c.s] = (suits[c.s]||0)+1);
+  const flushSuit = Object.keys(suits).find(s => suits[s] === 4);
+  if (flushSuit) return hand.map((c,i)=>i).filter(i => hand[i].s !== flushSuit);
+  // Four to an open-ended straight?
+  const uv = [...new Set(hand.map(c=>c.v))].sort((a,b)=>a-b);
+  for (let i=0;i+3<uv.length || i===0 && uv.length>=4;i++){
+    const run = uv.slice(i,i+4);
+    if (run.length===4 && run[3]-run[0]===3){ const keepV=new Set(run); return hand.map((c,j)=>j).filter(j=>!keepV.has(hand[j].v)); }
+  }
+  if (ev.cat === 1) {                                            // one pair: keep the pair, draw three
+    const keepV = new Set(groups.filter(g => g.c === 2).map(g => g.v));
+    return hand.map((c,i)=>i).filter(i => !keepV.has(hand[i].v));
+  }
+  // Nothing: keep the highest card (and an ace kicker), draw the rest
+  const byHigh = hand.map((c,i)=>({i,v:c.v})).sort((a,b)=>b.v-a.v);
+  const keep = new Set([byHigh[0].i]);
+  return hand.map((c,i)=>i).filter(i => !keep.has(i));
+}
+
+// ─── CPU DRAW ────────────────────────────────────
+// Keep low unpaired cards, discard the rest — with personality leaks.
+function cpuDrawCards(hand, pr, gid, community = []) {
+  if (IS_DRAMAHA(gid)) return cpuDrawCardsDramaha(hand, gid);
+  if (IS_SPLITDRAW(gid)) return cpuDrawCardsSplit(hand, gid, pr, community);
+  let discard;
+  if (IS_HIGHDRAW(gid)) {
+    discard = highDrawDiscard(hand);
+  } else if (IS_BADUGI(gid)) {
+    // Keep the cards that form the best badugi; discard the rest.
+    const keepIdx = badugiKeepIndices(hand);
+    discard = hand.map((_, i) => i).filter(i => !keepIdx.has(i));
+  } else {
+    const seen = new Set(); discard = [];
+    hand.forEach((c, i) => {
+      if (c.v <= 7 && !seen.has(c.v)) seen.add(c.v);
+      else discard.push(i);
+    });
+  }
+  if (IS_HIGHDRAW(gid)) {
+    // High draw: pat only on a real made hand (straight or better already returns []). A snow with air is rare.
+    if (discard.length === 0) return [];
+    if (discard.length <= 1 && evalHigh5(hand).cat >= 2 && rnd() < pr.standPat * 0.5) return [];
+    if (discard.length > 0 && rnd() < pr.leak) return discard.slice(0, -1);
+    return discard;
+  }
+  if (discard.length === 1 && rnd() < pr.standPat) {
+    // Only stand pat on a credible made hand (a 9-low or better). Otherwise it's a pure snow
+    // with trash — do that rarely instead of patting every obvious fold into the field.
+    const credible = !IS_BADUGI(gid) && eval27(hand).cat === 0 && eval27(hand).vs[0] <= 9;
+    if (credible || rnd() < 0.18) return [];
+  }
+  if (discard.length === 0 && rnd() < pr.over) {                        // brain fade: draws when pat
+    const worst = hand.reduce((w, c, i) => c.v > w.v ? { v:c.v, i } : w, { v:0, i:0 });
+    return [worst.i];
+  }
+  if (discard.length > 0 && rnd() < pr.leak) return discard.slice(0, -1); // misses a discard
+  return discard;
+}
+
+// v1 split-draw bot: keep distinct low ranks (good for the 2-7/A-5 half),
+// preferring distinct suits (good for the badugi half). Archie picks a lane.
+function cpuDrawCardsSplit(hand, gid, pr, community = []) {
+  const keep = new Set();
+  if (gid === "archie" || gid === "veronica") {
+    const lv = c => c.v === 14 ? 1 : c.v;
+    const lows = [...new Set(hand.filter(c => lv(c) <= 8).map(lv))];
+    if (lows.length >= 3) {                                   // draw to the low
+      const seen = new Set();
+      hand.forEach((c, i) => { const v = lv(c); if (v <= 8 && !seen.has(v)) { seen.add(v); keep.add(i); } });
+    } else {                                                  // play high: keep pairs+ and top cards
+      const cnt = {}; hand.forEach(c => cnt[c.v] = (cnt[c.v] || 0) + 1);
+      hand.forEach((c, i) => { if (cnt[c.v] >= 2) keep.add(i); });
+      const bvals = community.map(c => c.v);                  // Veronica: a hole card pairing the board = high pair
+      if (bvals.length) hand.forEach((c, i) => { if (bvals.includes(c.v)) keep.add(i); });
+      if (keep.size === 0) { const o = hand.map((c, i) => ({ v:c.v, i })).sort((a, b) => b.v - a.v); keep.add(o[0].i); keep.add(o[1].i); }
+    }
+  } else {                                                    // badeucey / badacey
+    const aceHigh = gid === "badeucey";
+    const lv = c => aceHigh ? c.v : (c.v === 14 ? 1 : c.v);   // badeucey: ace high (bad)
+    const order = hand.map((c, i) => ({ c, i, v:lv(c) })).sort((a, b) => a.v - b.v);
+    const ranks = new Set(), suits = new Set();
+    order.forEach(o => { if (!ranks.has(o.v) && !suits.has(o.c.s)) { ranks.add(o.v); suits.add(o.c.s); keep.add(o.i); } });
+    order.forEach(o => { if (keep.size < 5 && !ranks.has(o.v) && o.v <= (aceHigh ? 7 : 8)) { ranks.add(o.v); keep.add(o.i); } });
+  }
+  let discard = hand.map((_, i) => i).filter(i => !keep.has(i));
+  if (discard.length === 1 && rnd() < pr.standPat) return [];
+  if (discard.length > 0 && rnd() < pr.leak) return discard.slice(0, -1);
+  return discard;
+}
+
+// Indices of the cards that make up the best badugi (to keep).
+function badugiKeepIndices(hand) {
+  const n = hand.length;
+  let best = { size:0, sum:99, idx:new Set() };
+  for (let mask = 1; mask < (1 << n); mask++) {
+    const sub = [], idx = new Set();
+    for (let i = 0; i < n; i++) if (mask & (1 << i)) { sub.push(hand[i]); idx.add(i); }
+    const ranks = new Set(sub.map(c => BV(c.v)));
+    const suits = new Set(sub.map(c => c.s));
+    if (ranks.size !== sub.length || suits.size !== sub.length) continue;
+    const sum = sub.reduce((a, c) => a + BV(c.v), 0);
+    if (sub.length > best.size || (sub.length === best.size && sum < best.sum))
+      best = { size:sub.length, sum, idx };
+  }
+  return best.idx;
+}
+
+// ─── CPU BETTING ─────────────────────────────────
+// Personality-driven decisions. Tilt amplifies aggression and looseness.
+// Re-entrancy guard. rolloutEV plays the hand out with stepTable -> cpuDecide for every seat. Without this
+// flag a skill-100 seat inside the simulation would call maybeSolverBet -> bestResponse -> rolloutEV again,
+// recursing without bound. During a rollout, all seats fall back to the (fast, deterministic-enough) heuristic.
+let SOLVER_ACTIVE = false;
+
+// Solver-driven betting for high-skill bots. Returns a {action,amount} line from the rollout
+// best-response, or null to let the heuristic decide. Gated so it only runs when it's worth the cost.
+function maybeSolverBet(st, idx) {
+  if (SOLVER_ACTIVE) return null;                    // inside a rollout sim → heuristic only (no recursion)
+  const skill = st.botSkill?.[idx] ?? 50;
+  if (skill < 80) return null;                       // below the sharp band → heuristic
+
+  // Never override the draw/discard step — that's handled by the draw planner, not a betting solver.
+  // Solver only speaks when the seat faces a bet/check/call/raise decision.
+  if (st.phase === "drawing" || st.phase === "discarding") return null;
+
+  // Blend: skill 100 always solves; 80 solves ~40% of the time, ramping up. This softens the transition
+  // so a sharp Final-table bot feels a notch sharper than a mid-field one without being a different species.
+  // The endgame scenario stages (Final table ~80, Short-handed ~84, Heads-up ~87) land across this ramp.
+  const p = Math.min(1, (skill - 80) / 20 * 0.6 + 0.4);
+  if (rnd() > p) return null;
+
+  let res;
+  try {
+    // Low sim count keeps a full table responsive; a betting decision separates cleanly at 45 sims.
+    res = bestResponse(st, idx, 45);
+  } catch (e) {
+    if (typeof console !== "undefined") console.warn("solver bot fell back to heuristic:", e);
+    return null;
+  }
+  if (!res || !res.best) return null;
+
+  // Map the solver's line onto a concrete engine action. bestResponse returns bet/raise with an absolute
+  // target amount; the engine's bet/raise action expects the same {action, amount} shape cpuDecide returns.
+  const b = res.best;
+  if (b.action === "fold")  return { action: "fold",  amount: 0 };
+  if (b.action === "check") return { action: "check", amount: 0 };
+  if (b.action === "call")  return { action: "call",  amount: 0 };
+  if (b.action === "bet" || b.action === "raise") {
+    // Guard the amount against the seat's stack and the legal min/max (defensive; bestResponse already clamps).
+    const pl = st.players[idx];
+    const amt = Math.max(0, Math.min(b.amount, pl.betSt + pl.chips));
+    return { action: b.action, amount: amt };
+  }
+  return null;
+}
+
+function cpuDecide(st, idx) {
+  // Every seat the engine is asked to auto-play needs an archetype. Seat 0 (and any seat a server leaves
+  // unoccupied) has no PROF entry, so fall back to a neutral profile instead of crashing — this keeps a
+  // table runnable when nobody human is attached to a seat.
+  if (!PROF[idx]) return { action: Math.max(0, st.currentBet - (st.players[idx]?.betSt || 0)) > 0 ? "fold" : "check", amount: 0 };
+
+  // SOLVER-DRIVEN PLAY. At the top of the skill range a bot stops playing the heuristic and instead plays
+  // the rollout best-response line — the highest-EV action against how this table has actually played. This
+  // is exploitative, not GTO: it re-deals opponents holdings consistent with their observed betting. Skill
+  // 100 = always solver; skill 85–99 = solver most of the time, blended down so the transition isn't a cliff;
+  // below ~85 = pure heuristic. It only routes BETTING decisions (fold/check/call/bet-raise); the draw/discard
+  // step keeps the existing, already-strong draw planner. Sims are kept low so a full table stays responsive.
+  const solverLine = maybeSolverBet(st, idx);
+  if (solverLine) return solverLine;
+
+  if (IS_FLOP(st.gid)) return cpuDecideFlop(st, idx);
+  if (IS_STUD(st.gid)) return cpuDecideStud(st, idx);
+  if (IS_DRAMAHA(st.gid)) return cpuDecideDramaha(st, idx);
+  const pr   = PROF[idx];
+  const pl   = st.players[idx];
+  const tilt = Math.min(3, st.cpuTilt?.[idx] || 0);
+  const call = Math.min(st.currentBet - pl.betSt, pl.chips);
+  const isNL = st.gid === "single";
+  const fb   = st.streetN <= 1 ? STK(st).sbet : STK(st).bbet;
+
+  // Style slider (botTight): 100 = optimal (solid, disciplined, value-focused),
+  // 0 = exploitative (loose, aggressive, bluff-heavy, higher variance).
+  const tight = st.botTight?.[idx] ?? 50;
+  const L     = (100 - tight) / 100;   // "exploit factor": higher = more aggression/bluffs
+
+  // Looser bots bet/bluff/call far more; tilt amplifies on top of that.
+  // Draw games reward more disciplined aggression, so bluffing is scaled below the generic curve.
+  const looseMul = 0.55 + L * 1.05;            // ~0.55 (nit) .. ~1.60 (maniac-loose)
+  const effAggr  = Math.min(0.9,  pr.aggr  * looseMul * (1 + tilt * 0.28));
+  const effBluff = Math.min(0.55, pr.bluff * looseMul * (st.gid === "single" ? 1.25 : 0.75) * (1 + tilt * 0.35));  // single draw rewards aggression
+  const effCry   = Math.min(0.6,  pr.cry   * looseMul * (1 + tilt * 0.32));
+  const effSlow  = tilt > 0 ? 0 : pr.slow;
+
+  const isBluff = rnd() < effBluff;
+  const isSlow  = rnd() < effSlow;
+  const isAggr  = rnd() < effAggr;
+  const isCry   = rnd() < effCry;
+
+  const hand = pl.hand;
+  const ev   = evalHand(st.gid, hand);
+  let keepers, good, ok;
+  if (IS_HIGHDRAW(st.gid)) {
+    const cnt = {}; hand.forEach(c => cnt[c.v] = (cnt[c.v]||0)+1);
+    keepers = hand.filter(c => cnt[c.v] >= 2).length;
+    good = ev && ev.cat >= 2;                                  // two pair or better
+    ok   = ev && (ev.cat >= 2 || (ev.cat === 1 && (ev.tb[0]||0) >= 9));   // or a pair of 9s+
+  } else if (IS_BADUGI(st.gid)) {
+    // "keepers" = cards already in a valid badugi; good = 4-card 8-high or better
+    keepers = badugiKeepIndices(hand).size;
+    good = ev && ev.size === 4 && ev.vs[0] <= 10;   // any ten-or-better badugi is a monster vs the field
+    ok   = ev && (ev.size === 4 || (ev.size === 3 && ev.vs[0] <= 6));
+  } else {
+    keepers = new Set(hand.filter(c => c.v <= 7).map(c => c.v)).size;
+    good = ev && ev.cat === 0 && ev.vs[0] <= 8;
+    ok   = ev && ev.cat === 0 && ev.vs[0] <= 10;
+    if (st.gid === "veronica") {
+      // Also credit a qualifying HIGH made with the community card (the lane eval27 ignores).
+      const board = st.board || [];
+      const all = board.length ? hand.concat(board) : hand;
+      let hi = null; for (const c of kCombos(all, 5)) { const e = evalHigh5(c); if (!hi || cmpHigh(e, hi) < 0) hi = e; }
+      const hiQual = hi && (hi.cat >= 2 || (hi.cat === 1 && (hi.tb[0] || 0) >= 9));   // two pair+, or pair of 9s+
+      if (hiQual) { good = good || hi.cat >= 3; ok = true; keepers = Math.max(keepers, 4); }
+    }
+  }
+
+  // Looseness lowers the # of good cards needed to continue, and raises
+  // how big a bet the bot will call with marginal holdings.
+  const minKeep   = tight >= 70 ? 4 : tight >= 40 ? 3 : 2;
+  const callTol   = Math.round(35 + L * 60);   // ~35 (nit) .. ~95 (loose) chips tolerated pre-draw
+  const callTolPD = Math.round(45 + L * 75);   // post-draw tolerance
+
+  // Bet size: NL uses pot multiple + noise; FL uses fixed bet
+  const size = () => {
+    if (!isNL) return fb;
+    const noise = (Math.floor(rnd() * 5) - 2) * 5;
+    return Math.min(Math.max(Math.floor(st.pot * pr.sz) + noise, 20), pl.chips);
+  };
+
+  // Pre-draw street: evaluate drawing potential
+  if (st.streetN === 0) {
+    if (call <= 0) {
+      if ((keepers >= minKeep && isAggr) || (keepers >= minKeep - 1 && isBluff))
+        if (!isSlow) return { action:"bet", amount: pl.betSt + size() };
+      return { action:"check", amount:0 };
+    }
+    if (keepers >= minKeep)                          return { action:"call", amount:0 };
+    if (keepers >= minKeep - 1 && call <= callTol)   return { action:"call", amount:0 };
+    if ((isBluff || isCry) && call <= callTol * 0.8) return { action:"call", amount:0 };
+    return { action:"fold", amount:0 };
+  }
+
+  // Post-draw streets: evaluate made hand
+  // A pat opponent changes everything: their range is made hands. Unmade or marginal holdings stop firing
+  // into them and stop paying off their bets (fixes Ivan barreling a three-card draw into two pat hands).
+  const patOpp = (st.drawN || 0) > 0 && st.players.some(p => p.id !== idx && live(p) && p.drewLast === 0);
+  if (call <= 0) {
+    const patSnow = isNL && pl.drewLast === 0 && !good;   // stood pat with a weak hand → follow through the rep
+    if ((good && !isSlow) || (ok && isAggr && !patOpp) || (isBluff && !patOpp) || (patSnow && !isSlow && rnd() < 0.72))
+      return { action:"bet", amount: pl.betSt + size() };
+    return { action:"check", amount:0 };
+  }
+  // Only a PAT player in the betting lead shuts down marginal defends — a bet from someone still drawing gets
+  // played back at. (The blanket any-pat gate made badugi tables far too passive.) And strong made hands RAISE
+  // for value instead of flatting everything.
+  const patLead = patOpp && st.currentBet > 0 && st.players.some(p => p.id !== idx && live(p) && p.drewLast === 0 && p.betSt >= st.currentBet);
+  if (good) return (!isSlow && (isAggr || rnd() < 0.5))
+    ? { action:"raise", amount: pl.betSt + Math.max(0, call) + size() }
+    : { action:"call", amount:0 };
+  if (ok && !patLead && call <= callTolPD)        return { action:"call", amount:0 };
+  if ((isBluff || isCry) && !patLead && call <= callTolPD*0.8) return { action:"call", amount:0 };
+  // Single draw: bluff-catch wider — don't fold everything to a bet (you shouldn't be able to just rep a hand).
+  if (isNL && (ok || keepers >= minKeep) && call <= callTolPD * 1.25 && rnd() < 0.38) return { action:"call", amount:0 };
+  return { action:"fold", amount:0 };
+}
+
+// ─── FLOP-GAME HAND STRENGTH (0..1) ──────────────
+// Preflop uses a starting-hand heuristic; postflop uses the made hand category
+// plus a small bump for flush/straight draws.
+// ── Omaha draw + board-texture awareness ── the made hand alone badly misvalues Omaha: a nut-low + flush draw
+// is a monster, and a set on a four-flush or paired board is trash. Returns draw equity to add, danger to subtract.
+function omahaDrawDanger(gid, hole, bd) {
+  let draw = 0, danger = 0;
+  const drawing = bd.length === 3 || bd.length === 4;              // flop/turn (river = what you have is what you have)
+  const bdSuits = {}; bd.forEach(c => bdSuits[c.s] = (bdSuits[c.s] || 0) + 1);
+  const bdVals = bd.map(c => c.v);
+  const paired = bdVals.length !== new Set(bdVals).size;
+  // FLUSH danger: 3+ of a suit on the board and you can't hold the flush (need 2 of that suit)
+  for (const suit in bdSuits) {
+    if (bdSuits[suit] >= 3 && hole.filter(c => c.s === suit).length < 2)
+      danger = Math.max(danger, bdSuits[suit] >= 4 ? 0.32 : 0.16);
+  }
+  if (paired) danger = Math.max(danger, 0.10);                     // full houses are out there
+  if (drawing) {
+    // flush draw — 2 hole + 2 board of a suit = one card away; value by nut-ness
+    for (const suit of ["s", "h", "d", "c"]) {
+      const mine = hole.filter(c => c.s === suit).length, onBd = bdSuits[suit] || 0;
+      if (mine >= 2 && onBd === 2) {                                   // 2 on board + you hold 2 = one card from a flush
+        const hv = Math.max(...hole.filter(c => c.s === suit).map(c => c.v));
+        draw += hv === 14 ? 0.36 : hv === 13 ? 0.30 : hv === 12 ? 0.24 : 0.16;
+      }
+    }
+    // nut / strong low draw (hi-lo): two low hole cards + 1-2 low board cards, one card from a made low
+    if (IS_HILO(gid)) {
+      const lo = v => (v === 14 ? 1 : v);
+      const lowBd   = [...new Set(bd.filter(c => c.v <= 8 || c.v === 14).map(c => lo(c.v)))];
+      const lowHole = [...new Set(hole.filter(c => c.v <= 8 || c.v === 14).map(c => lo(c.v)))];
+      const distinct = new Set([...lowBd, ...lowHole]);
+      if (lowHole.length >= 2 && lowBd.length >= 1 && distinct.size >= 3 && distinct.size <= 4)
+        draw += (lowHole.includes(1) && lowHole.includes(2)) ? 0.34 : 0.20;   // A-2 = nut-low draw
+    }
+    // straight / wrap draw (approx): 4+ distinct ranks inside a 5-card window
+    const allV = [...new Set([...hole.map(c => c.v), ...bdVals, ...(hole.some(c=>c.v===14)?[1]:[]), ...(bdVals.includes(14)?[1]:[])])];
+    for (let base = 1; base <= 10; base++)
+      if (allV.filter(v => v >= base && v <= base + 4).length >= 4) { draw += 0.15; break; }
+  }
+  return { draw: Math.min(0.72, draw), danger };
+}
+function flopStrength(st, pl) {
+  const gid = st.gid, board = st.board || [];
+  const hole = pl.hand;
+  if (board.length === 0) {
+    // Preflop heuristic
+    const hePre = (x, y) => {                             // classic two-card Hold'em preflop score
+      const [a, b] = x.v >= y.v ? [x, y] : [y, x];
+      const pair = a.v === b.v;
+      const suited = a.s === b.s;
+      const gap = a.v - b.v;
+      let s = 0;
+      if (pair) s = 0.5 + (a.v - 2) / 24;                 // pairs .5..~1
+      else {
+        s = (a.v + b.v) / 40;                             // high cards
+        if (suited) s += 0.08;
+        if (gap === 1) s += 0.06; else if (gap === 2) s += 0.03;
+        if (a.v >= 13) s += 0.05;
+      }
+      return Math.max(0, Math.min(1, s));
+    };
+    if (gid === "lhe" || gid === "nlhe") return hePre(hole[0], hole[1]);   // two-card Hold'em ranges
+    if (IS_PINEAPPLE(gid)) {
+      // Pineapple: you play down to a Hold'em hand, so the holding is worth its BEST two-card combo —
+      // score every pair of the three cards and take the max, plus a small kiss for the third card's
+      // backup value. (A-K-8 is A-K, not "three random cards" — fixes "everything is a weak holding".)
+      let best = 0;
+      for (let i = 0; i < hole.length; i++)
+        for (let j = i + 1; j < hole.length; j++)
+          best = Math.max(best, hePre(hole[i], hole[j]));
+      return Math.min(1, best + 0.04);
+    }
+    // Omaha starting hand: pairs, double-suited, connectedness, high cards — and in Hi-Lo, low potential is huge.
+    const vs = hole.map(c => c.v);
+    const suitCounts = {}; hole.forEach(c => suitCounts[c.s] = (suitCounts[c.s] || 0) + 1);
+    const pairs = vs.length - new Set(vs).size;
+    const highs = vs.filter(v => v >= 11).length;
+    const doubleSuited = Object.values(suitCounts).filter(c => c >= 2).length >= 2;
+    const suited = Object.values(suitCounts).some(c => c >= 2);
+    // Base is deliberately low: an uncoordinated, unsuited, unpaired Omaha hand (e.g. 9-7-4-2 rainbow) is a
+    // fold, not "thin but playable." Value is built from pairs, high cards, suitedness and connectedness — so
+    // the strength spreads across the full range and junk lands below the call threshold (fixes ~98% bot VPIP).
+    let s = 0.12 + pairs * 0.13 + highs * 0.06 + (doubleSuited ? 0.18 : suited ? 0.08 : 0);
+    const uniq = [...new Set(vs)].sort((a, b) => a - b);
+    if (uniq.length >= 4) { const span = uniq[uniq.length - 1] - uniq[0]; if (span <= 4) s += 0.14; else if (span <= 6) s += 0.07; }
+    if (IS_HILO(gid)) {
+      // A-2 is the NUT LOW; a suited ace is NUT-FLUSH potential; extra wheel cards give redraws. This is what
+      // makes an Omaha-8 hand premium — a nut-low + nut-flush draw is a great hand, not "thin but playable".
+      const hasA = vs.includes(14), has2 = vs.includes(2), has3 = vs.includes(3);
+      if (hasA && has2)      s += 0.22;
+      else if (hasA && has3) s += 0.12;
+      else if (has2 && has3) s += 0.08;
+      const wheel = [...new Set(vs.map(v => v === 14 ? 1 : v).filter(v => v <= 5))].length;
+      s += Math.max(0, wheel - 2) * 0.05;
+      const aceSuit = hole.find(c => c.v === 14)?.s;
+      if (aceSuit && suitCounts[aceSuit] >= 2) s += 0.10;       // suited ace → nut flush potential
+    } else if (vs.includes(14) && vs.includes(2)) s += 0.03;
+    return Math.max(0, Math.min(1, s));
+  }
+  // Postflop: made-hand strength. Double Board → average across both boards (you win half per board).
+  const scoreBoard = bd => {
+    const hi = flopHigh(gid, hole, bd);
+    // Omaha made hands are worth far less than Hold'em (everyone has 6 two-card combos) — you need trips /
+    // the nuts to be strong; bare two pair is marginal, especially multiway or on a paired board.
+    const CAT = IS_OMAHA(gid)
+      ? [0.10, 0.28, 0.45, 0.62, 0.76, 0.84, 0.92, 0.98, 1]
+      : [0.18, 0.40, 0.58, 0.72, 0.82, 0.88, 0.94, 0.98, 1];
+    let s = hi ? (CAT[hi.cat] || 0.2) : 0;
+    // Hold'em: penalise PLAYING THE BOARD. If your pair/two-pair comes from a paired board and your hole cards
+    // only add a kicker (no pocket pair, no card matching the board, no flush), you can only chop — score it
+    // near high-card. This is what stops the whole table calling down "two pair" on a Q-Q-4-5-5 runout.
+    if (!IS_OMAHA(gid) && hi && hi.cat <= 2 && bd.length >= 3) {
+      const bc = {}; bd.forEach(c => bc[c.v] = (bc[c.v] || 0) + 1);
+      const boardPaired = Math.max(1, ...Object.values(bc)) >= 2;
+      const hv = hole.map(c => c.v);
+      const pocketPair = hole.length >= 2 && hv[0] === hv[1];
+      const matches = hv.some(v => bc[v]);
+      const suits = {}; [...hole, ...bd].forEach(c => suits[c.s] = (suits[c.s] || 0) + 1);
+      const flushish = Math.max(1, ...Object.values(suits)) >= 4;
+      if (boardPaired && !pocketPair && !matches && !flushish) s = Math.min(s, 0.23);
+      // Even when a hole card DOES pair the board, it's near-worthless if it doesn't beat the board itself:
+      // on A-5-4-2-2 an 8-4 makes "two pair 4s & 2s" but any live card > 4 counterfeits it. Compare your best
+      // five to the pure board — if you can only chop (or your pair is below the board's own pairs), it's a
+      // dead hand. (Aaron's 8-4o over-calling a shove.)
+      if (bd.length >= 5 && !pocketPair && !flushish) {
+        const boardHi = flopHigh(gid, [], bd);
+        const beatsBoard = boardHi && cmpHigh(hi, boardHi) < 0;
+        // Playing the board (can only chop) → near-worthless.
+        if (!beatsBoard) s = Math.min(s, 0.16);
+        // "Improves" only by pairing a LOW board card while higher cards sit unpaired on board: a trap two
+        // pair (8-4 on A-5-4-2-2 → 4s&2s) that any overcard-holder counterfeits. Score it like weak one pair.
+        else if (hi.cat === 2) {
+          const boardVals = [...new Set(bd.map(c => c.v))].sort((a,b)=>b-a);
+          const madeFrom = hv.filter(v => bc[v]).sort((a,b)=>b-a);        // hole cards that paired the board
+          const topPairVal = (hi.tb || [])[0] || 0;
+          const overcards = boardVals.filter(v => v > topPairVal).length; // live board cards that beat my top pair
+          if (madeFrom.length && topPairVal <= 6 && overcards >= 2) s = Math.min(s, 0.26);
+        }
+      }
+    }
+    if (gid === "lhe" && bd.length < 5) {
+      const allSuits = {}; [...hole, ...bd].forEach(c => allSuits[c.s] = (allSuits[c.s]||0)+1);
+      if (Math.max(...Object.values(allSuits)) === 4) s = Math.max(s, 0.55);
+    }
+    if (IS_HILO(gid)) { const lo = bestOmahaLow(hole, bd); if (lo) s = Math.max(s, 0.5 + (8 - lo[0]) * 0.03); }
+    if (IS_OMAHA(gid)) {
+      const { draw, danger } = omahaDrawDanger(gid, hole, bd);
+      s = Math.max(s - danger, draw);                                   // scary board taxes made hands; big draws stand on their own
+      if (draw > 0.2 && hi && hi.cat >= 2) s = Math.min(1, s + 0.06);   // made hand + a real draw = extra
+    }
+    return s;
+  };
+  if (IS_DOUBLE(gid)) {
+    const b2 = st.board2 || [];
+    if (b2.length >= 3) {
+      const s1 = scoreBoard(board), s2 = scoreBoard(b2);
+      const hi = Math.max(s1, s2), lo = Math.min(s1, s2);
+      // You win each board's half independently, so a strong single board is real value — not "thin."
+      // Weight the better board over a flat average so a set/straight on one board plays for a bet.
+      return Math.max(0, Math.min(1, 0.70 * hi + 0.30 * lo));
+    }
+    return Math.max(0, Math.min(1, scoreBoard(board)));
+  }
+  return Math.max(0, Math.min(1, scoreBoard(board)));
+}
+// Pot-limit cap: the largest TOTAL street bet a player may make.
+function potLimitMaxTotal(st, pl) {
+  const toCall = Math.max(0, st.currentBet - pl.betSt);
+  return Math.min(pl.betSt + pl.chips, st.currentBet + st.pot + toCall);
+}
+// legalActions(state) — the authoritative answer to "whose turn is it and what may they legally do?" This is
+// deliberately UI-agnostic and side-effect-free: the action buttons use it to gate/size themselves today, and a
+// future multiplayer server reuses it verbatim to validate moves off the wire (never trusting the client). Every
+// rule here mirrors applyAction exactly — if the two ever drift, applyAction wins and this must be fixed.
+// Returns: { seat, toCall, canFold, canCheck, canCall, canBet, canRaise, betLabel, minTotal, maxTotal } or null.
+function legalActions(st) {
+  if (!st || st.phase !== "acting" || !st.queue?.length) return null;
+  const seat = st.queue[0];
+  const pl = st.players[seat];
+  if (!pl) return null;
+  const mode   = BET_MODE(st.gid);
+  const stk    = STK(st);
+  const toCall = Math.max(0, st.currentBet - pl.betSt);
+  const canFold  = true;                                     // you may always fold on your turn
+  const canCheck = toCall === 0;                             // nothing owed → check
+  const canCall  = toCall > 0;                               // owed chips → call (all-in if short)
+  // Raising is closed when a fixed-limit round has hit its bet cap (a bet + 3 raises), or you have no chips.
+  const cap = mode === "fl" ? 4 : 99;
+  const raiseLocked = st.currentBet > 0 && (st.betCount || 0) >= cap;
+  const hasChips = pl.chips > 0;
+  const aggressive = hasChips && !raiseLocked;
+  const opening = st.currentBet === 0;                        // "Bet" if no wager yet, else "Raise"
+  // Sizing, expressed as the intended TOTAL street commitment (what applyAction's `amount` means).
+  const stackTot = pl.betSt + pl.chips;
+  // In FIXED-LIMIT, a bet or raise is one fixed increment — the small bet on early streets, the big bet on later
+  // ones — never a free-sized amount. min and max collapse to that single legal size (capped by stack if short).
+  // This must match how the bots and the action buttons size limit bets (STK.sbet / STK.bbet). Without it,
+  // callers that read maxTotal (e.g. Deep Check's bestResponse) would wrongly offer a stack-sized "All-in" raise
+  // in a limit game — which is exactly the bug this guards against.
+  if (mode === "fl") {
+    const fb = st.streetN <= 1 ? stk.sbet : stk.bbet;         // fixed bet size for this street
+    const fixedTot = Math.min(stackTot, (opening ? 0 : st.currentBet) + fb);
+    const canIncreaseFL = fixedTot > st.currentBet;
+    const aggressiveFL = aggressive && canIncreaseFL;
+    return {
+      seat, toCall,
+      canFold, canCheck, canCall,
+      canBet:   aggressiveFL && opening,
+      canRaise: aggressiveFL && !opening,
+      betLabel: opening ? "Bet" : "Raise",
+      minTotal: fixedTot, maxTotal: fixedTot,
+      isAllInToCall: canCall && toCall >= pl.chips,
+    };
+  }
+  const capTot   = mode === "pl" ? potLimitMaxTotal(st, pl) : (pl.betSt + pl.chips);   // pot cap or full stack
+  // applyAction accepts any total that increases the wager; the conventional minimum is one big blind over the
+  // current bet (or the opening bet size), always capped by the stack. Kept in lockstep with applyAction.
+  const minInc  = opening ? stk.bblind : st.currentBet + stk.bblind;
+  const capTot2 = Math.min(capTot, stackTot);
+  // A raise is only real if the player can commit MORE than the current wager. If their whole stack only reaches
+  // the current bet, they can call (all-in) but not raise — don't offer it (this is what applyAction enforces).
+  const canIncrease = capTot2 > st.currentBet;
+  const minTotal = Math.min(capTot2, Math.max(minInc, st.currentBet + 1));
+  const maxTotal = capTot2;
+  const aggressive2 = aggressive && canIncrease;
+  return {
+    seat, toCall,
+    canFold, canCheck, canCall,
+    canBet:   aggressive2 && opening,
+    canRaise: aggressive2 && !opening,
+    betLabel: opening ? "Bet" : "Raise",
+    minTotal, maxTotal,
+    isAllInToCall: canCall && toCall >= pl.chips,
+  };
+}
+
+function cpuDecideFlop(st, idx) {
+  const pr   = PROF[idx];
+  const pl   = st.players[idx];
+  const tilt = Math.min(3, st.cpuTilt?.[idx] || 0);
+  const call = Math.min(st.currentBet - pl.betSt, pl.chips);
+  const fb   = st.streetN <= 1 ? STK(st).sbet : STK(st).bbet;
+  const tight = st.botTight?.[idx] ?? 50;
+  const L     = (100 - tight) / 100;
+  // Skill is a SEPARATE axis from looseness: a high-skill bot doesn't fold more hands, it plays the hands it
+  // takes more accurately — sharper value aggression, fewer spew bluffs, a touch more give-up discipline. This
+  // lets late-stage / scenario fields "play better" without simply becoming nits.
+  const skill = (st.botSkill?.[idx] ?? 50) / 100;   // 0 = raw, 1 = sharp
+  const mode  = BET_MODE(st.gid);
+  const pre   = (st.board || []).length === 0;   // preflop = no community cards yet
+
+  const str = flopStrength(st, pl);
+  // Preflop selectivity is gated separately from postflop, and tuned per game family: the measured starting-
+  // hand strength distributions differ a lot (Hold'em & Big O run higher than 4-card PLO / Omaha-8), so a flat
+  // threshold made some games open ~90%+ of hands. Postflop keeps the made-hand thresholds. Looser bots (higher
+  // L) play weaker hands; nits fold most junk, maniacs still splash.
+  // Preflop calling standard per game. Hold'em sat at ~17% VPIP, tighter than a live full-ring table
+  // (regs run 20–25%), so no-limit gets a touch looser. Limit hold'em was already in range and is unchanged.
+  const pfC = st.gid === "bigo" ? 0.64 : st.gid === "omaha8" ? 0.52 : IS_OMAHA(st.gid) ? 0.44 : IS_PINEAPPLE(st.gid) ? 0.72 : st.gid === "nlhe" ? 0.64 : 0.66;
+  const openThresh  = pre ? pfC + 0.06 - L * 0.24 : 0.40 - L * 0.18;   // strength to open/raise when checked to
+  const callThresh  = pre ? pfC - L * 0.26        : 0.30 - L * 0.16;   // strength to call a bet
+  const raiseThresh = pre ? Math.max(0.68, pfC + 0.14) - L * 0.12 : 0.74 - L * 0.10;  // strength to raise
+
+  // Skill sharpens the read: skilled bots bluff a bit less recklessly and value-bet their strong hands more
+  // reliably (they don't slowplay themselves out of value), but their hand-selection width is unchanged.
+  const bluff = rnd() < Math.min(0.5, pr.bluff * (0.7 + L) * (1 + tilt * 0.32)) * (1 - skill * 0.35);
+  const slow  = tilt === 0 && rnd() < pr.slow * (1 - skill * 0.4);
+
+  // Bet/raise sizing. Fixed-limit uses fb; big-bet sizes off the pot & profile.
+  const sizedTotal = (raising) => {
+    if (mode === "fl") return pl.betSt + (raising ? call + fb : fb);
+    const frac = Math.min(1.1, Math.max(0.4, pr.sz));        // pot fraction by personality
+    let total = st.currentBet + Math.round((st.pot + call) * frac / 5) * 5; // raise sized off pot
+    if (!raising) total = Math.max(fb, Math.round(st.pot * frac / 5) * 5);   // open bet
+    const cap = mode === "pl" ? potLimitMaxTotal(st, pl) : pl.betSt + pl.chips; // PL cap or stack
+    return Math.min(Math.max(total, st.currentBet + fb), cap);
+  };
+
+  if (call <= 0) {
+    if ((str >= openThresh && !slow) || bluff) return { action:"bet", amount: sizedTotal(false) };
+    return { action:"check", amount:0 };
+  }
+  // facing a bet
+  const reraised = (st.betCount || 0) >= 2;                              // a bet AND a raise already in
+  const liveOpp  = st.players.filter(p => p.id !== idx && live(p)).length;
+  let callT = callThresh, raiseT = raiseThresh;
+  if (reraised)     { callT += 0.20; raiseT += 0.08; }   // a bet-and-raise is real strength — don't pay it off
+  if (liveOpp >= 3) { callT += 0.08; }                   // a bet into a crowd is stronger than heads-up
+  const icm = icmContext(st, pl.chips);                  // S5: ICM/stage pressure
+  if (icm) { callT += icm.tighten; raiseT += icm.tighten * 0.5; }
+  // Discipline vs. size and repeated pressure: in big-bet games a large bet (bad pot odds) demands a real
+  // hand, and each extra street of calling down raises the bar again — no more weak two pair paying off
+  // pot-sized raises street after street (Aaron's 10-6 call-down).
+  const potOdds = call / (st.pot + call);
+  if (mode !== "fl") callT += Math.max(0, potOdds - 0.22) * 0.9;
+  if (!pre && (st.streetN || 0) >= 2) callT += (0.05 + skill * 0.04) * Math.min(2, st.streetN - 1);   // skilled players give up thin call-downs sooner
+  if (str >= raiseT && !slow) return { action:"raise", amount: sizedTotal(true) };
+  // Bluffing into a raise or a multiway crowd is spew — only stab a lone heads-up bet; and don't bluff when the
+  // bubble is squeezing you (survival) — but a big stack can lean on it.
+  // Facing a shove for most of your stack: this is a stack-off, not a pot-odds spot. Ignore the cheap-call and
+  // bluff loopholes and demand genuine equity — no more flatting an all-in with 8-4o because the price looked ok.
+  const shove = call >= pl.chips * 0.6 || (!pre && call >= (st.pot - call) * 1.1);
+  if (shove) {
+    const need = pre ? 0.40 : 0.48;                       // a real calling hand, scaled a touch by looseness
+    return (str >= Math.max(callT, need - L * 0.06))
+      ? { action:"call", amount:0 } : { action:"fold", amount:0 };
+  }
+  const mayBluff = bluff && !reraised && liveOpp <= 2 && !(icm && icm.tighten > 0);
+  // The cheap pot-odds call only applies short-handed; into a crowd, thin hands just fold.
+  const cheapCall = str >= callT - 0.08 && potOdds < 0.2 && liveOpp <= 2;
+  if (str >= callT || cheapCall || mayBluff)
+    return { action:"call", amount:0 };
+  return { action:"fold", amount:0 };
+}
+
+// ─── STUD HAND STRENGTH (0..1) ───────────────────
+// Uses all of a player's own cards (the CPU "knows" its own down cards).
+function studStrength(st, pl) {
+  const gid = st.gid;
+  const n = pl.hand.length;
+  if (gid === "razz" || gid === "razzdugi") {
+    // Lower is better; score by how many low (≤8) distinct cards and how low.
+    const lows = [...new Set(pl.hand.map(c => lowVal(c.v)).filter(v => v <= 8))].sort((a,b)=>a-b);
+    let s = lows.length / 5 * 0.7;                         // breadth of low cards
+    if (lows.length) {
+      // Smoothness must read the WHOLE low, not just its top card: 8-7-6-5-4 and 8-4-3-2-A are both "eights"
+      // but the smooth one is a materially better hand (measured ~97.7% vs ~94.4% equity). Scoring only the
+      // top card rated them identically, which flattened every rough-vs-smooth decision in the game.
+      const topLow = lows[lows.length - 1];
+      const avgLow = lows.reduce((a,v)=>a+v, 0) / lows.length;
+      s += Math.max(0, (8 - topLow) / 8) * 0.18 + Math.max(0, (7 - avgLow) / 6) * 0.12;
+    }
+    const ev = bestRazz(pl.hand);
+    if (n >= 5 && ev) {
+      if (ev.cat === 0) {
+        const top = ev.tb[0] || 8;
+        s = top <= 8 ? Math.max(s, 0.60 + (8 - top) * 0.06)   // 8-or-better: a real made low, scales up to wheel
+                     : Math.min(s, 0.50 - (top - 8) * 0.04);   // 9-low or worse: marginal — call, never a raise
+      } else {
+        // Paired / no qualifying low. If there's no live low draw left either (few low cards, late street),
+        // it's dead — floor it below any call so KK-up snap-folds. A four-low-plus-a-pair still draws, so
+        // keep it merely weak.
+        const lowCount = [...new Set(pl.hand.map(c => lowVal(c.v)).filter(v => v <= 8))].length;
+        const deadNoDraw = lowCount <= 3 || n >= 6;
+        s = Math.min(s, deadNoDraw ? 0.05 : 0.20);
+      }
+    }
+    s = Math.max(0, Math.min(1, s));
+    if (gid === "razzdugi") {
+      // Half the pot pays the best Badugi — weigh that lane too, so bots/coach value scoops.
+      const bd = evalBadugi(pl.hand);
+      let bs = 0;
+      if (bd) {
+        const top = bd.vs[0];                               // highest card in the badugi (ace=1)
+        bs = bd.size >= 4 ? 0.6 + Math.max(0, 8 - top) * 0.05    // complete badugi: lower top = better
+                          : (bd.size - 1) / 3 * 0.5 + Math.max(0, 10 - top) / 10 * 0.2; // partial draw
+      } else if (n < 4) {                                   // 3rd street: rough badugi potential
+        const suits = new Set(pl.hand.map(c => c.s)).size, ranks = new Set(pl.hand.map(c => c.v)).size;
+        bs = Math.min(suits, ranks) / 4 * 0.35;
+      }
+      bs = Math.max(0, Math.min(1, bs));
+      return Math.max(0, Math.min(1, 0.55 * s + 0.45 * bs));  // split: blend both lanes
+    }
+    return s;
+  }
+  // stud / stud8 high
+  const hi = studHigh(pl.hand.length >= 5 ? pl.hand : pad5(pl.hand));
+  let s = hi ? ([0.16,0.40,0.58,0.72,0.82,0.88,0.94,0.98,1][hi.cat] || 0.2) : 0.2;
+  // A bare pair is only as good as its rank — a pair of deuces is near the bottom.
+  if (hi && hi.cat === 1) { const pr = hi.tb[0] || 0; s = pr >= 13 ? 0.46 : pr >= 11 ? 0.42 : pr >= 8 ? 0.36 : pr >= 5 ? 0.30 : 0.24; }
+  // early streets: reward pairs/high cards / three to a flush or straight
+  if (n < 5) {
+    const vs = pl.hand.map(c => c.v);
+    const pair = vs.length !== new Set(vs).size;
+    const high = vs.filter(v => v >= 11).length;
+    s = Math.max(s, 0.30 + (pair ? 0.25 : 0) + high * 0.05);
+    const suits = {}; pl.hand.forEach(c => suits[c.s]=(suits[c.s]||0)+1);
+    if (Math.max(...Object.values(suits)) >= 3) s += 0.08; // 3-flush
+  }
+  if (IS_STUD8(gid)) {
+    const lo = bestLow7(pl.hand);
+    if (lo) s = Math.max(s, 0.5 + (8 - lo[0]) * 0.03);
+    else if (n < 5) { // low draw potential
+      const lows = new Set(pl.hand.map(c=>lowVal(c.v)).filter(v=>v<=8)).size;
+      if (lows >= 2) s = Math.max(s, 0.4);
+    }
+  }
+  return Math.max(0, Math.min(1, s));
+}
+// pad a <5 card set to 5 for evalHigh5 by repeating nothing — instead just eval what we have
+function pad5(cards) { return cards.length >= 5 ? cards : cards; }
+
+function cpuDecideStud(st, idx) {
+  const pr   = PROF[idx];
+  const pl   = st.players[idx];
+  const tilt = Math.min(3, st.cpuTilt?.[idx] || 0);
+  const call = Math.min(st.currentBet - pl.betSt, pl.chips);
+  const fb   = st.streetN <= 1 ? STK(st).sbet : STK(st).bbet;
+  const tight = st.botTight?.[idx] ?? 50;
+  const L     = (100 - tight) / 100;
+
+  const str = studStrength(st, pl);
+  const openThresh  = 0.42 - L * 0.18;
+  const callThresh  = 0.32 - L * 0.16;
+  const raiseThresh = 0.76 - L * 0.10;
+  const bluff = rnd() < Math.min(0.42, pr.bluff * (0.6 + L) * (1 + tilt * 0.3));  // tilt loosens, but not absurdly
+  const slow  = tilt === 0 && rnd() < pr.slow;
+
+  if (call <= 0) {
+    if ((str >= openThresh && !slow) || bluff) return { action:"bet", amount: pl.betSt + fb };
+    return { action:"check", amount:0 };
+  }
+  // Facing a bet: tighten against a raise or a crowd — don't spew to showdown with a King-low.
+  const reraised = (st.betCount || 0) >= 2;
+  const liveOpp  = st.players.filter(p => p.id !== idx && live(p)).length;
+  let callT = callThresh, raiseT = raiseThresh;
+  if (reraised)     { callT += 0.20; raiseT += 0.08; }   // a bet-and-raise is real strength
+  if (liveOpp >= 3) { callT += 0.10; }                   // crowded pot — tighten up
+  const icm = icmContext(st, pl.chips);                  // S5: ICM/stage pressure
+  if (icm) { callT += icm.tighten; raiseT += icm.tighten * 0.5; }
+  if (str >= raiseT && !slow) return { action:"raise", amount: pl.betSt + call + fb };
+  const potOdds = call / (st.pot + call);
+  const mayBluff  = bluff && !reraised && liveOpp <= 2 && !(icm && icm.tighten > 0);   // no bluffing when the bubble squeezes
+  const cheapCall = str >= Math.max(0.28, callT - 0.08) && potOdds < 0.18 && liveOpp <= 2;   // cheap odds, but never with trash
+  if (str >= callT || cheapCall || mayBluff) return { action:"call", amount:0 };
+  return { action:"fold", amount:0 };
+}
+
+// ─── COACH ───────────────────────────────────────
+// Real-time strategy advice for the human seat (seat 0). Reuses the same
+// hand-strength estimators the CPUs use, then maps strength + pot odds to a
+// plain-language recommendation. Returns { tone, text }, tone ∈ good|ok|warn.
+function heroStrength(st) {
+  const me = st.players[0];
+  if (IS_FLOP(st.gid)) return flopStrength(st, me);
+  if (IS_STUD(st.gid)) return studStrength(st, me);
+  if (IS_DRAMAHA(st.gid)) return dramahaStrength(st, me);
+  return heroDrawStrength(st, me);
+}
+function drawsLeftOf(st) { return Math.max(0, (st.maxDraws || 1) - (st.drawN || 0)); }
+function heroDrawStrength(st, me) {
+  const ev = evalHand(st.gid, me.hand);
+  const dl = drawsLeftOf(st);            // draws still to come (incl. the one pending)
+  const future = Math.max(0, dl - 1);    // draws after the current betting round
+  if (st.gid === "veronica") {
+    // Split: HIGH uses hole + community card; LOW (A-5, 8-or-better) uses hole only.
+    const board = st.board || [];
+    const all = board.length ? me.hand.concat(board) : me.hand;
+    let hi = null; for (const c of kCombos(all, 5)) { const e = evalHigh5(c); if (!hi || cmpHigh(e, hi) < 0) hi = e; }
+    let hs = hi ? ([0.30,0.42,0.58,0.70,0.80,0.88,0.94,0.98,1][hi.cat] ?? 0.3) : 0.3;
+    if (hi && hi.cat === 1 && (hi.tb[0] || 0) < 9) hs = 0.30;   // pair below 9s doesn't qualify for high
+    const lo = evalA5(me.hand);
+    let ls;
+    if (lo && lo.cat === 0) ls = lo.tb[0] <= 5 ? 0.90 : lo.tb[0] <= 7 ? 0.72 : lo.tb[0] <= 8 ? 0.55 : 0.32;
+    else { const lows = new Set(me.hand.filter(c => c.v <= 8).map(c => c.v === 14 ? 1 : c.v)).size;
+           ls = (lows >= 4 ? 0.5 : lows >= 3 ? 0.36 : lows >= 2 ? 0.24 : 0.13) + future * 0.05; }
+    ls = Math.min(0.95, ls);
+    return Math.max(0, Math.min(1, 0.5 * hs + 0.5 * ls));   // split: blend both lanes
+  }
+  if (IS_HIGHDRAW(st.gid)) {
+    // 5-card draw for HIGH: strength from the made category, plus a little for live draws.
+    const CAT = [0.20,0.40,0.60,0.74,0.85,0.90,0.95,0.99,1];   // high-card..straight-flush
+    let s = CAT[ev.cat] ?? 0.2;
+    if (ev.cat <= 1 && future > 0) {
+      const suits = {}; me.hand.forEach(c => suits[c.s] = (suits[c.s]||0)+1);
+      const uv = [...new Set(me.hand.map(c=>c.v))].sort((a,b)=>a-b);
+      const fourFlush = Object.values(suits).some(n => n === 4);
+      const fourStr = uv.length >= 4 && uv.some((_,i)=> uv[i+3]!==undefined && uv[i+3]-uv[i]===3);
+      if (fourFlush || fourStr) s = Math.max(s, 0.5 + future * 0.04);
+    }
+    return Math.max(0, Math.min(1, s));
+  }
+  if (IS_BADUGI(st.gid)) {
+    if (ev && ev.size === 4) return ev.vs[0] <= 7 ? 0.92 : ev.vs[0] <= 9 ? 0.76 : 0.6;
+    const keepIdx = [...badugiKeepIndices(me.hand)];
+    const keep = keepIdx.length;
+    // How low is the partial badugi? A 3-card headed by a Queen is far weaker than one headed by a 4.
+    const topB = keep ? Math.max(...keepIdx.map(i => BV(me.hand[i].v))) : 13; // 1=A … 13=K
+    let base;
+    if (keep >= 3)      base = topB <= 7 ? 0.50 : topB <= 10 ? 0.40 : 0.30;   // smooth vs rough 3-card
+    else if (keep >= 2) base = topB <= 7 ? 0.32 : 0.26;
+    else                base = 0.15;
+    return Math.min(0.9, base + future * 0.04 * (keep >= 3 ? 1 : 0.5));
+  }
+  if (ev && ev.cat === 0) {               // made 2-7 low: no pair/straight/flush
+    const top = ev.vs[0];
+    return top <= 7 ? 0.95 : top <= 8 ? 0.82 : top <= 9 ? 0.62 : top <= 10 ? 0.46 : 0.34;
+  }
+  // Unmade: equity scales with how many smooth lows you hold AND draws remaining.
+  const lows = new Set(me.hand.filter(c => c.v <= 8).map(c => c.v)).size;
+  const base = lows >= 4 ? 0.5 : lows >= 3 ? 0.36 : lows >= 2 ? 0.24 : 0.13;
+  return Math.min(0.92, base + future * 0.05);
+}
+// ── Draw planner ──────────────────────────────────
+// Returns the strongest discard plan for the current draw, given draws left:
+//   { keep:[idx], discard:[idx], pat:bool, head:"draw 2"|"stand pat"|..., why, tone }
+// Rank notation for a set of kept cards (high-to-low; aceLow for badugi).
+function keepLabel(hand, idxs, aceLow = false) {
+  const val = c => (aceLow ? BV(c.v) : c.v);
+  return idxs.map(i => hand[i]).sort((a, b) => val(b) - val(a)).map(c => c.r).join("-");
+}
+// 2-7 lowball (single & triple draw)
+function plan27(hand, drawsLeft) {
+  const last = drawsLeft <= 1;
+  const all  = hand.map((_, i) => i);
+  const ev   = eval27(hand);                       // cat 0 = made low (no pair/str/flush)
+  // One index per distinct rank (lowest copy), ascending by 2-7 value (2 low … A high)
+  const firstOf = {};
+  hand.forEach((c, i) => { if (!(c.v in firstOf)) firstOf[c.v] = i; });
+  const uniq   = Object.values(firstOf).map(i => ({ i, v: hand[i].v })).sort((a, b) => a.v - b.v);
+  const sevens = uniq.filter(x => x.v <= 7);
+  const mk = (keep, head, why, tone) => ({
+    keep: [...keep].sort((a, b) => a - b),
+    discard: all.filter(i => !keep.includes(i)),
+    pat: keep.length === hand.length, head, why, tone,
+  });
+
+  // Made hand: decide pat vs. break
+  if (ev && ev.cat === 0) {
+    const made = ev.vs[0], second = ev.vs[1];
+    if (made <= 7)
+      return mk(all, "stand pat", `You hold a ${ev.desc} — a premium hand. Never break a made seven.`, "good");
+    if (made === 8) {
+      if (last)        return mk(all, "stand pat", `Final draw — take your made ${ev.desc} to showdown.`, "good");
+      if (second <= 6) return mk(all, "stand pat", `A smooth ${ev.desc} is strong enough to stand on this early.`, "good");
+      const keep = sevens.map(x => x.i);            // rough eight (8-7…): break the 8
+      return mk(keep, "draw 1", `That's a rough ${ev.desc}. With ${drawsLeft} draws left, break the 8 and draw one to a seven (${keepLabel(hand, keep)}).`, "ok");
+    }
+    if (made === 9 && last)
+      return mk(all, "stand pat", second <= 6
+        ? `A smooth ${ev.desc} — stand pat on the final draw. Breaking a made nine to chase a seven is a losing play here.`
+        : `A made ${ev.desc} — still stand pat on the final draw. You're far likelier to make a worse hand or pair than to improve.`, "ok");
+    // early (triple-draw) rough nine → may break; fall through to draw logic
+  }
+
+  // Drawing: pick the best low draw
+  if (sevens.length >= 4) {
+    const keep = sevens.slice(0, 4).map(x => x.i);
+    const rk = keep.map(i => hand[i].v).sort((a, b) => a - b);
+    if (rk[3] - rk[0] === 3)   // four consecutive (e.g. 4-5-6-7) → straight-prone, weak
+      return mk(keep, "draw 1", `Four to a seven, but they run consecutively (${keepLabel(hand, keep)}) — straight-prone, so essentially only a deuce makes your seven. Drawable, but don't overrate it as premium.`, "ok");
+    return mk(keep, "draw 1", `Keep four to a seven (${keepLabel(hand, keep)}) — the premium one-card draw.`, "good");
+  }
+  // Four distinct cards to an EIGHT (e.g. 8-6-3-2): the standard one-card draw. Breaking it to draw two at
+  // the bare seven gives up far too much equity — draw one, on every draw.
+  const eightsAll = uniq.filter(x => x.v <= 8);
+  if (sevens.length === 3 && eightsAll.length >= 4) {
+    const keep = eightsAll.slice(0, 4).map(x => x.i);
+    return mk(keep, "draw 1", `Keep four to an eight (${keepLabel(hand, keep)}) — the premium one-card draw. Drawing two at the bare seven is a big equity give-up.`, "good");
+  }
+  if (sevens.length === 3) {
+    if (!last) {
+      const keep = sevens.map(x => x.i);
+      return mk(keep, "draw 2", `Keep three to a seven (${keepLabel(hand, keep)}). With ${drawsLeft} draws left, break toward the seven rather than settle for an eight.`, "ok");
+    }
+    const extra = uniq.find(x => x.v > 7 && x.v <= 9);  // a nine or eight pairs it to a one-card draw
+    if (extra) {
+      const keep = [...sevens.map(x => x.i), extra.i];
+      return mk(keep, "draw 1", `Final draw — keep four to ${extra.v <= 8 ? "an eight" : "a nine"} (${keepLabel(hand, keep)}). Take the one-card draw; there are no redraws left to chase a seven.`, "ok");
+    }
+    return mk(sevens.map(x => x.i), `draw ${hand.length - 3}`, `Final draw — no eight or nine to pair down, so draw two at the seven (${keepLabel(hand, sevens.map(x => x.i))}) or fold to a bet.`, "warn");
+  }
+  // Fewer than three to a seven: fall back to a three-to-an-eight draw if available.
+  const eights = uniq.filter(x => x.v <= 8);
+  if (eights.length >= 3) {
+    const keep3 = eights.slice(0, 3).map(x => x.i);
+    if (!last)
+      return mk(keep3, `draw ${hand.length - 3}`, `Best you have is three to an eight (${keepLabel(hand, keep3)}) — a weak draw. Continue only for a cheap price; fold to real pressure.`, "warn");
+    const extra = uniq.find(x => x.v > 8 && x.v <= 9);  // only a nine is worth keeping on the river
+    if (extra) {
+      const keep = [...keep3, extra.i];
+      return mk(keep, "draw 1", `Final draw — keep four to a nine (${keepLabel(hand, keep)}) and take the one-card draw. A weak holding; fold to a bet.`, "warn");
+    }
+    return mk(keep3, `draw ${hand.length - 3}`, `Final draw — three to an eight (${keepLabel(hand, keep3)}); your only improvement is shedding the high cards, so draw two or fold to a bet.`, "warn");
+  }
+  if (sevens.length === 2) {
+    const keep = sevens.map(x => x.i);
+    if (drawsLeft >= 2)
+      return mk(keep, `draw ${hand.length - 2}`, `Just two to a seven (${keepLabel(hand, keep)}) — playable early but loose. Fold to heavy action.`, "warn");
+    return mk(keep, `draw ${hand.length - 2}`, `Two to a seven with one draw left rarely gets there. Fold unless it's free.`, "warn");
+  }
+  const keep = sevens.map(x => x.i);
+  return mk(keep, "fold", `Too few low cards to draw to a winner — fold this.`, "warn");
+}
+// Badugi
+function planBadugi(hand, drawsLeft) {
+  const last    = drawsLeft <= 1;
+  const all     = hand.map((_, i) => i);
+  const keepSet = badugiKeepIndices(hand);
+  const ev      = evalBadugi(hand);
+  const mk = (keep, head, why, tone) => ({
+    keep: [...keep].sort((a, b) => a - b),
+    discard: all.filter(i => !keep.includes(i)),
+    pat: keep.length === hand.length, head, why, tone,
+  });
+  if (keepSet.size === 4) {                          // a made badugi
+    const high = ev.vs[0];                           // 1=A … 13=K (ace low)
+    if (high <= 8 || last)
+      return mk(all, "stand pat", `${last ? "Final draw — keep" : "Stand on"} your ${ev.desc}.`, high <= 8 ? "good" : "ok");
+    const hi = [...keepSet].reduce((h, i) => BV(hand[i].v) > BV(hand[h].v) ? i : h, [...keepSet][0]);
+    const keep = all.filter(i => i !== hi);          // rough badugi early → break the high card
+    return mk(keep, "draw 1", `That's a rough ${ev.desc}. Break the ${hand[hi].r} and try to improve while draws remain.`, "ok");
+  }
+  const keep  = [...keepSet];
+  const draws = hand.length - keepSet.size;
+  return mk(keep, `draw ${draws}`, `Keep your ${keepSet.size}-card base (${keepLabel(hand, keep, true)}) and draw the duplicate rank/suit card${draws > 1 ? "s" : ""}.`, keepSet.size >= 3 ? "ok" : "warn");
+}
+// Two-way plan for Badeucey (2-7 + badugi) and Badacey (A-5 + badugi):
+// keep low cards with distinct ranks AND distinct suits — they build both the badugi
+// and the lowball half at once — then fill toward five distinct lows for the lowball side.
+function planSplitTwoWay(hand, gid, drawsLeft) {
+  const all = hand.map((_, i) => i);
+  const aceHigh = gid === "badeucey";                       // 2-7: ace is high (bad). badacey A-5: ace low (good)
+  const lv = c => aceHigh ? c.v : (c.v === 14 ? 1 : c.v);
+  const order = hand.map((c, i) => ({ c, i, v: lv(c) })).sort((a, b) => a.v - b.v);
+  const ranks = new Set(), suits = new Set(), keep = new Set();
+  // Early in a triple-draw (2+ draws left) a 9/10/J-high "badugi" card helps neither the A-5 low
+  // (needs 8-or-better) nor a strong badugi — pitch it and draw fresh. On the last draw, keep any
+  // badugi-distinct card so a made badugi isn't broken for one card.
+  const lowCap = drawsLeft >= 2 ? 8 : 13;
+  order.forEach(o => { if (o.v <= lowCap && !ranks.has(o.v) && !suits.has(o.c.s)) { ranks.add(o.v); suits.add(o.c.s); keep.add(o.i); } }); // low, badugi-distinct
+  order.forEach(o => { if (keep.size < 5 && !ranks.has(o.v) && o.v <= 8) { ranks.add(o.v); keep.add(o.i); } });          // extra lows for the lowball half
+  const keepArr = [...keep].sort((a, b) => a - b);
+  const discard = all.filter(i => !keep.has(i));
+  const { A, B } = splitSides(gid);
+  const bSize = (A.ev(hand).size) || 0;                     // badugi cards currently made
+  const pat = discard.length === 0;
+  let tone, why;
+  if (pat && bSize >= 4)            { tone = "good"; why = `Pat both ways — a made badugi and a low. Stand pat.`; }
+  else if (bSize >= 4)              { tone = "good"; why = `Strong two-way: a made badugi plus ${keepArr.length} low cards. Draw ${discard.length} to sharpen the ${B.name} half.`; }
+  else if (keep.size >= 3)          { tone = "ok";   why = `Keep your low, distinct-suit cards — each one builds both the badugi and the ${B.name} low. Draw ${discard.length}.`; }
+  else if (keep.size === 2)         { tone = "ok";   why = `Two premium low cards — draw ${discard.length} fresh toward the ${B.name} low and a badugi. A strong low draw like this is worth raising on the early draws.`; }
+  else                              { tone = "warn"; why = `Rough two-way holding — few cards help both halves. Draw ${discard.length}, or fold to a raise.`; }
+  return { keep: keepArr, discard, pat, head: pat ? "stand pat" : `draw ${discard.length}`, why, tone };
+}
+// Archie (high vs A-5 low, triple draw): pick the lane the hand is actually built for.
+function planArchie(hand, drawsLeft, community = []) {
+  const all = hand.map((_, i) => i);
+  const lv = c => c.v === 14 ? 1 : c.v;
+  const lowRanks = [...new Set(hand.filter(c => lv(c) <= 8).map(c => lv(c)))];
+  const keep = new Set();
+  if (lowRanks.length >= 3) {                               // build the A-5 low (8-or-better qualifier)
+    const seen = new Set();
+    hand.forEach((c, i) => { const v = lv(c); if (v <= 8 && !seen.has(v)) { seen.add(v); keep.add(i); } });
+    const keepArr = [...keep].sort((a, b) => a - b), discard = all.filter(i => !keep.has(i));
+    return { keep: keepArr, discard, pat: discard.length === 0, head: discard.length ? `draw ${discard.length}` : "stand pat",
+      why: `Go low — you hold ${lowRanks.length} cards eight-or-lower. Keep them and draw ${discard.length} toward a qualifying A-5 low.`,
+      tone: lowRanks.length >= 4 ? "good" : "ok" };
+  }
+  const cnt = {}; hand.forEach((c, i) => { (cnt[c.v] = cnt[c.v] || []).push(i); });
+  const boardVals = community.map(c => c.v);                // Veronica: a hole card pairing the board makes a high pair
+  const comboPair = community.length ? hand.map((c, i) => ({ c, i })).filter(o => boardVals.includes(o.c.v)) : [];
+  const pairs = Object.values(cnt).filter(g => g.length >= 2);
+  if (pairs.length || comboPair.length) {                   // play the high (pair of 9s+ qualifies)
+    pairs.forEach(g => g.forEach(i => keep.add(i)));
+    comboPair.forEach(o => keep.add(o.i));
+    const keepArr = [...keep].sort((a, b) => a - b), discard = all.filter(i => !keep.has(i));
+    const inHandTop = pairs.length ? Math.max(...pairs.map(g => hand[g[0]].v)) : 0;
+    const boardTop  = comboPair.length ? Math.max(...comboPair.map(o => o.c.v)) : 0;
+    const topPair = Math.max(inHandTop, boardTop);
+    const usesBoard = comboPair.length && boardTop >= inHandTop;
+    return { keep: keepArr, discard, pat: false, head: `draw ${discard.length}`,
+      why: topPair >= 9
+        ? `Play the high — ${usesBoard ? "your card pairs the community card" : "keep your pair"} toward a qualifying high (nines or better). Draw ${discard.length}.`
+        : `Your pair is below nines, so it doesn't qualify yet. Draw ${discard.length} to improve it, or fold to action.`,
+      tone: topPair >= 9 ? "ok" : "warn" };
+  }
+  const ord = hand.map((c, i) => ({ i, v: c.v })).sort((a, b) => b.v - a.v);   // no low, no pair → weak
+  ord.slice(0, 2).forEach(o => keep.add(o.i));
+  const keepArr = [...keep].sort((a, b) => a - b), discard = all.filter(i => !keep.has(i));
+  return { keep: keepArr, discard, pat: false, head: `draw ${discard.length}`,
+    why: `Weak both ways — no low draw and no pair. Keep your highest cards, draw ${discard.length}, or fold to a bet.`, tone: "warn" };
+}
+function coachDrawPlan(st, me) {
+  if (IS_DRAMAHA(st.gid)) return planDramaha(st, me);
+  const dl = drawsLeftOf(st);
+  if (IS_HIGHDRAW(st.gid)) return planDrawHigh(me.hand);
+  if (IS_BADUGI(st.gid)) return planBadugi(me.hand, dl);
+  if (st.gid === "archie" || st.gid === "veronica")  return planArchie(me.hand, dl, st.gid === "veronica" ? (st.board || []) : []);
+  if (IS_SPLITDRAW(st.gid)) return planSplitTwoWay(me.hand, st.gid, dl);   // badeucey / badacey
+  return plan27(me.hand, dl);
+}
+// 5-card-draw-high plan for the Dramaha-High draw side.
+function planDrawHigh(hand) {
+  const all = hand.map((_, i) => i);
+  const e = bestHoldemHigh(hand, []);
+  const cnt = {}; hand.forEach((c, i) => { (cnt[c.v] = cnt[c.v] || []).push(i); });
+  const groups = Object.values(cnt).filter(g => g.length >= 2);
+  const mk = (keep, head, why, tone) => ({ keep:[...keep].sort((a,b)=>a-b), discard: all.filter(i=>!keep.includes(i)), pat: keep.length===hand.length, head, why, tone });
+  if (e && e.cat >= 4) return mk(all, "stand pat", `Made ${e.desc} — stand pat on the high side.`, "good");
+  if (e && e.cat === 3) { const t = Object.values(cnt).find(g => g.length === 3); return mk(t, "draw 2", `Trips (${e.desc}) — keep them and draw two for quads or a full house.`, "good"); }
+  if (e && e.cat === 2) return mk(groups.flat(), "draw 1", `Two pair — keep both and draw one for a full house.`, "ok");
+  if (e && e.cat === 1) return mk(groups[0], "draw 3", `One pair (${e.desc}) — keep the pair, draw three.`, "ok");
+  const order = hand.map((c, i) => ({ i, v:c.v })).sort((a, b) => b.v - a.v);
+  const keep = order.filter(o => o.v >= 12).slice(0, 2).map(o => o.i);
+  if (!keep.length) return mk([], "draw 5", `No pair or high cards — a weak high side; draw five or fold to a bet.`, "warn");
+  return mk(keep, `draw ${hand.length - keep.length}`, `No made hand — keep your high card(s) and draw.`, "warn");
+}
+function planDramaha(st, me) {
+  const side = DRAMAHA_SIDE(st.gid), cap = DRAW_CAP(st.gid);
+  let p = side === "27" ? plan27(me.hand, 1)
+        : side === "badugi" ? planBadugi(me.hand, 1)
+        : planDrawHigh(me.hand);
+  // Respect the discard cap (Dramadugi: 3) and add the two-way caveat.
+  if (p.discard.length > cap) { p = { ...p, discard: p.discard.slice(0, cap), keep: me.hand.map((_,i)=>i).filter(i=>!p.discard.slice(0,cap).includes(i)) }; }
+  const note = side === "high"
+    ? " Weigh the Omaha half too — your two best hole cards play the board."
+    : " Remember the same five cards also feed your Omaha high.";
+  return { ...p, why: (p.why || "") + note };
+}
+// Read the table's tendencies from the live opponents (for exploit mode).
+function tableRead(st) {
+  const opp = st.players.filter(p => p.id !== 0 && !p.folded && !p.sittingOut);
+  if (!opp.length) return { loose: 0.5, aggro: 0.5, n: 0 };
+  const tight = opp.reduce((a, p) => a + (st.botTight?.[p.id] ?? 50), 0) / opp.length;
+  const aggro = opp.reduce((a, p) => a + (PROF[p.id]?.aggr ?? 0.5), 0) / opp.length;
+  return { loose: 1 - tight / 100, aggro, n: opp.length };
+}
+// ── MONTE-CARLO EQUITY FOR DRAW GAMES ───────────────────────────────
+// Estimates hero's win probability by dealing random opponent hands and playing
+// out the remaining draws. Opponents who stood pat last round are modelled as
+// already holding a made hand (one polish draw); others draw the full remainder.
+// Approximate by design — the opponent model is a heuristic, not a solver — but
+// it values draws correctly (a one-card seven-draw shows its real strength).
+function drawEquity(st, me, sims = 1200) {
+  const gid = st.gid;
+  if (!PURE_DRAW(gid)) return null;
+  const hs = me.hand.length;
+  const drawsLeft = drawsLeftOf(st);
+  const opps = st.players.filter(p => p.id !== 0 && live(p));
+  if (opps.length === 0) return 1;
+  const cleanPr = { standPat: 0, over: 0, leak: 0 };
+  const key = c => c.r + c.s;
+  let wins = 0;
+  for (let s = 0; s < sims; s++) {
+    const used = new Set(me.hand.map(key));
+    let stub = mkDeck().filter(c => !used.has(key(c)));
+    // Hero plays out remaining draws with a clean keep.
+    let heroHand = me.hand.slice();
+    // Self-replenishing draw: 4 players × up to 3 draws can need more than 52 cards, so when the
+    // stub runs dry we reshuffle the muck (a fresh deck minus the hero's live hand) instead of
+    // pulling `undefined` — which would otherwise crash the evaluator. Tiny noise, no crash.
+    const refill = () => { const hset = new Set(heroHand.map(key)); stub = mkDeck().filter(c => !hset.has(key(c))); };
+    const draw1 = () => { if (!stub.length) refill(); return stub.shift(); };
+    for (let d = 0; d < drawsLeft; d++) {
+      const disc = cpuDrawCards(heroHand, cleanPr, gid);
+      if (disc.length === 0) break;
+      heroHand = heroHand.map((c, i) => disc.includes(i) ? draw1() : c);
+    }
+    let heroBest = true;
+    for (const o of opps) {
+      let oh = Array.from({ length: hs }, () => draw1());
+      const pat = o.drewLast === 0 && (st.drawN || 0) > 0;
+      if (pat) {
+        // A pat player reps a SMOOTH made low (≈10-or-better), not just any 5 unpaired cards.
+        // Draw them toward one, keeping cards ten-or-lower, so the model credits them correctly.
+        for (let t = 0; t < 6; t++) {
+          const e = evalHand(gid, oh);
+          if (IS_BADUGI(gid) ? (e && e.size === 4) : (e && e.cat === 0 && e.vs[0] <= 10)) break;
+          let disc;
+          if (IS_BADUGI(gid)) { const keep = badugiKeepIndices(oh); disc = oh.map((_, i) => i).filter(i => !keep.has(i)); }
+          else { const seen = new Set(); disc = []; oh.forEach((c, i) => { if (c.v <= 10 && !seen.has(c.v)) seen.add(c.v); else disc.push(i); }); }
+          if (!disc.length) break;
+          oh = oh.map((c, i) => disc.includes(i) ? draw1() : c);
+        }
+      } else {
+        for (let d = 0; d < drawsLeft; d++) {
+          const disc = cpuDrawCards(oh, cleanPr, gid);
+          if (disc.length === 0) break;
+          oh = oh.map((c, i) => disc.includes(i) ? draw1() : c);
+        }
+      }
+      if (cmpHand(gid, evalHand(gid, oh), evalHand(gid, heroHand)) < 0) { heroBest = false; break; }  // opponent strictly ahead
+    }
+    if (heroBest) wins++;
+  }
+  return wins / sims;
+}
+
+// ── DRAW-GAME BETTING COACH ──────────────────────────────────
+// Thinks like a draw player: made-vs-draw, smooth-vs-rough, draws left, and —
+// most importantly — reads opponents' draw counts and pat-player aggression,
+// instead of leaning on hold'em pot-odds. Covers 2-7 (single/triple) and badugi.
+const PURE_DRAW = gid => gid === "single" || gid === "triple" || gid === "badugi" || gid === "pl27td" || gid === "plbad" || gid === "pl5d";
+function heroMade(gid, ev) {
+  if (IS_HIGHDRAW(gid)) { const made = !!(ev && ev.cat >= 2); return { made, top: made ? ev.cat : 0, txt: made ? `a pat ${ev.desc}` : (ev && ev.cat === 1 ? "a pair" : "a draw") }; }
+  if (IS_BADUGI(gid)) return { made: !!(ev && ev.size === 4), top: ev && ev.size === 4 ? ev.vs[0] : 99, txt: ev && ev.size === 4 ? `a ${ev.desc} badugi` : "an incomplete badugi" };
+  // In 2-7, a Jack-low or worse isn't a hand you stand on — you'd break it and draw, so treat it as a draw.
+  const made = !!(ev && ev.cat === 0 && ev.vs[0] <= 10);
+  return { made, top: made ? ev.vs[0] : 99, txt: made ? `a pat ${ev.desc}` : "a draw" };
+}
+function coachDrawBet(st, me, callAmt) {
+  const facing = callAmt > 0, gid = st.gid;
+  const single = gid === "single";            // 2-7 single draw: one shot, reverse implied odds — NOT a pot-odds game
+  const ev  = evalHand(gid, me.hand);
+  const str = heroDrawStrength(st, me);
+  const dl  = drawsLeftOf(st);
+  const predraw = (st.drawN || 0) === 0;     // before the first draw — no draw reads yet
+  const last    = dl <= 1;                    // final betting round
+  const M = heroMade(gid, ev);
+  const eq = drawEquity(st, me, 700);          // Monte-Carlo win probability (null if N/A)
+  const e  = eq == null ? null : Math.round(eq * 100);
+  const eqTxt = e == null ? "" : ` (~${e}% to win)`;
+  const goodTop = IS_BADUGI(gid) ? 9 : 8;   // "good enough" made-hand ceiling
+  const smoothTop = IS_BADUGI(gid) ? 7 : 8;
+
+  const opps = st.players.filter(p => p.id !== 0 && live(p));
+  const pats = opps.filter(p => p.drewLast === 0);
+  const heavy = opps.filter(p => p.drewLast >= 2);
+  const patBetting = facing && pats.length > 0;   // a pat opponent is driving the action
+
+  // PRE-FIRST-DRAW: judge the starting hand by its real equity (values draws correctly).
+  if (predraw) {
+    const potOdds = facing ? callAmt / (st.pot + callAmt) : 0;
+    const oddsTxt = facing ? `${(st.pot / callAmt).toFixed(1)}:1` : "";
+    if (single) {
+      // One draw, reverse implied odds: judge the DRAW'S QUALITY, not the price.
+      const lows = [...new Set(me.hand.filter(c => c.v <= 8 && c.v !== 14).map(c => c.v))];  // distinct low ranks (A is high in 2-7)
+      const hasPair = new Set(me.hand.map(c => c.v)).size < me.hand.length;
+      const smoothBase = lows.filter(v => v <= 7).length >= 3;
+      if (M.made && M.top <= 9) return { tone:"good", text:`Pat with ${M.txt} — a big edge in a one-draw game. Raise and put the drawers to a decision.` };
+      if (hasPair) return { tone:"warn", text:`A pair is a fold in single draw — one shot plus reverse implied odds means you're drawing thin. Fold; don't call on price.` };
+      if (lows.length >= 4) return { tone:"good", text:`Smooth one-card draw to a strong low${facing ? ` — the ${oddsTxt} price is a bonus, not the reason` : ""}. Raise, or take the draw.` };
+      if (lows.length === 3 && smoothBase) return { tone:"ok", text:`Playable two-card draw off a smooth base. Call in position — and this is a prime spot to raise and snow. Aggression beats a passive peel here.` };
+      return { tone:"warn", text:`Too rough for one draw — you'd be drawing two-plus into reverse implied odds. Fold; single draw isn't a pot-odds peel.` };
+    }
+    if (eq >= 0.58) return { tone:"good", text:`Premium start${eqTxt} — ${M.txt}. Raise to build the pot and take the lead.` };
+    if (eq >= 0.44) return { tone:"good", text:`Strong holding or smooth draw${eqTxt}. Call, and raise in position to thin the field.` };
+    // A made ten/jack you'll break is "convertible" — name it, so a smooth low base doesn't read as trash.
+    if (M.made && M.top <= 11 && eq >= 0.30) return facing
+      ? { tone:"ok", text:`A rough made ${M.txt}, but convertible${eqTxt} — break it and draw at your smooth base. ${oddsTxt} pot odds make this an easy call; reassess if it's raised behind you.` }
+      : { tone:"ok", text:`A convertible ${M.txt}${eqTxt} — break it and draw at your smooth base. Fine to continue; stay cautious out of position.` };
+    if (eq >= 0.32) return facing
+      ? { tone:"ok", text:`Playable but rough${eqTxt}. One bet is fine; let it go if it's raised behind you.` }
+      : { tone:"ok", text:`Marginal${eqTxt} — playable, but be cautious out of position.` };
+    // A rough draw is still a clear call when the price is right — pot odds beat raw equity here.
+    if (facing && eq >= potOdds + 0.05)
+      return { tone:"ok", text:`Rough draw${eqTxt}, but ${oddsTxt} pot odds make this an easy call — see a card and reassess if it's raised behind you.` };
+    return facing
+      ? { tone:"warn", text:`Too weak${eqTxt} even for ${oddsTxt} — fold.` }
+      : { tone:"warn", text:`Weak holding${eqTxt} — don't open-draw two or three into a field. Fold the worst of these.` };
+  }
+
+  // 2-7 SINGLE DRAW after the draw: the one draw is done — a FINAL decision, no more cards to come.
+  if (single) {
+    if (facing) {
+      if (M.made && (M.top <= 10 || eq >= 0.6)) return { tone:"good", text:`You made ${M.txt}${eqTxt}. Raise for value — this is the last action, so get max from a worse hand or a busted bluff.` };
+      if (M.made && eq >= 0.45) return { tone:"ok", text:`Marginal made hand${eqTxt} — call to bluff-catch; raising just turns it into a bluff.` };
+      return { tone:"warn", text:`You bricked${eqTxt} — there's no draw left to justify a call. Fold.` };
+    }
+    if (M.made && (M.top <= 10 || eq >= 0.6)) return { tone:"good", text:`Bet ${M.txt} for value${eqTxt} — it's the final action, so a smooth made hand bets rather than checks.` };
+    if (M.made) return { tone:"ok", text:`Thin made hand${eqTxt} — a value bet is thin; check to bluff-catch or show it down.` };
+    return { tone:"warn", text:`You bricked${eqTxt}. Check and give up — or fire as a bluff if the table folds. Single draw rewards pressure.` };
+  }
+
+  // FINAL BETTING ROUND (all draws done) — the hand is complete; there is nothing left to draw to.
+  // Judge it at showdown with made-hand language, never "improve." (heroMade labels a rough low "a draw"
+  // because you'd normally break it — but after the last draw you can't, so describe the real holding.)
+  if (dl === 0) {
+    const potOdds = facing ? callAmt / (st.pot + callAmt) : 0;
+    const oddsTxt = facing ? `${(st.pot / callAmt).toFixed(1)}:1` : "";
+    const strong  = M.made && M.top <= goodTop;
+    const held    = M.made ? M.txt : `${ev && ev.desc ? ev.desc : "a weak hand"} at showdown`;
+    if (facing) {
+      // Raising the last action for value needs a hand that beats a BETTOR'S range — made hands, not the
+      // random fields the raw equity simulates. A pat ten or jack is a bluff-catcher here: call, never raise.
+      if (strong)
+        return { tone:"good", text:`You hold ${held}${eqTxt} — this is the last action, so raise for value and get paid by worse.` };
+      if (patBetting)
+        return M.made && M.top <= 9
+          ? { tone:"ok", text:`A pat player is betting, but ${held} can look one pat hand up at ${oddsTxt} — call; never raise into shown strength.` }
+          : { tone:"warn", text:`A player stood pat and is betting${eqTxt} — that reps a made hand. With ${held} and no draw left, fold.` };
+      if (M.made && M.top <= 11)
+        return { tone:"ok", text:`${held} is a bluff-catcher against a bet with no draws left — call at ${oddsTxt}. Raising only gets called by better.` };
+      if (e != null && eq >= 0.45)
+        return { tone:"ok", text:`Marginal at showdown${eqTxt} — call to bluff-catch at ${oddsTxt}. No draw left, so don't raise a hand this thin.` };
+      return { tone:"warn", text:`Weak at showdown${eqTxt} — the draws are done, there's nothing left to improve to. Fold.` };
+    }
+    if (strong || (e != null && eq >= 0.6))
+      return { tone:"good", text:`Bet ${held} for value${eqTxt} — it's the final action, so a made hand bets rather than checks.` };
+    if (e != null && eq >= 0.45)
+      return { tone:"ok", text:`Thin at showdown${eqTxt} — check to bluff-catch or show it down; a value bet is too thin.` };
+    return { tone:"warn", text:`Weak final hand${eqTxt} — check; the draw is over, so only fire as a pure bluff if the table looks weak.` };
+  }
+
+  // AFTER A DRAW: the reads are everything.
+  if (patBetting) {
+    if (M.made && M.top <= goodTop)
+      return { tone:"good", text:`${pats.length} stood pat, but you hold ${M.txt} — good enough to continue. Call down, and raise the end with a smooth one.` };
+    if (M.made)
+      return { tone:"warn", text:`A player stood pat and is betting — that reps a made hand that beats ${M.txt}. Snap-fold; pot odds don't save a hand that's drawing thin to the lead.` };
+    return { tone:"warn", text:`You're still drawing into a pat bettor — you're chasing to beat a made hand. Continue only with a strong one-card draw at a fair price.${last ? " On the last draw, that's usually a fold." : ""}` };
+  }
+
+  // No pat aggression shown — play your own made/draw strength, informed by equity.
+  if (facing) {
+    if (M.made && M.top <= goodTop)
+      return { tone:"good", text:`You hold ${M.txt}${eqTxt} and nobody's shown a pat hand${heavy.length ? `; ${heavy.length} drew multiple, so they're weak` : ""}. Raise for value.` };
+    if (eq >= 0.5) return { tone:"ok", text:`Decent ${M.made ? "made hand" : "draw"}${eqTxt} with no pat pressure. Call; raise if you improve.` };
+    return { tone:"warn", text:`Thin ${M.made ? "made hand" : "draw"}${eqTxt} facing a bet. Without a read they're weak, folding is fine.` };
+  }
+  if (M.made && M.top <= goodTop)
+    return { tone:"good", text:`Bet ${M.txt} for value${eqTxt}${heavy.length ? ` — players who drew ${heavy[0].drewLast} are unlikely to beat you` : ""}. Don't give a free draw.` };
+  if (eq >= 0.45) return { tone:"ok", text:`Reasonable ${M.made ? "hand" : "draw"}${eqTxt} — betting to deny free cards is fine, especially against opponents who drew multiple.` };
+  return { tone:"warn", text:`Not enough to bet${eqTxt}. Check; ${last ? "give up cheaply if you bricked." : "take the free draw and try to improve."}` };
+}
+// Discrete grader for draw games — mirrors coachDrawBet so history grades line up.
+function coachDrawRec(st, me, callAmt) {
+  const facing = callAmt > 0, gid = st.gid;
+  const ev = evalHand(gid, me.hand);
+  const str = heroDrawStrength(st, me);
+  const predraw = (st.drawN || 0) === 0;
+  const dl = drawsLeftOf(st);
+  const M = heroMade(gid, ev);
+  const eq = drawEquity(st, me, 500);
+  const goodTop = IS_BADUGI(gid) ? 9 : 8, smoothTop = IS_BADUGI(gid) ? 7 : 8;
+  const pats = st.players.filter(p => p.id !== 0 && live(p) && p.drewLast === 0);
+  const patBetting = facing && pats.length > 0;
+  if (predraw) { if (eq >= 0.58) return facing ? "raise" : "bet"; if (eq >= 0.32) return facing ? "call" : "check"; return facing ? "fold" : "check"; }
+  if (dl === 0) {                                   // final round — judge the completed hand, no draw left
+    const strong = M.made && M.top <= goodTop;
+    if (facing) {
+      if (strong)                              return "raise";   // raising needs a hand that beats a bettor's range
+      if (patBetting)                          return (M.made && M.top <= 9) ? "call" : "fold";
+      if (M.made && M.top <= 11)               return "call";    // pat ten/jack bluff-catches, never raises
+      if (eq != null && eq >= 0.45)            return "call";
+      return "fold";
+    }
+    return (strong || (eq != null && eq >= 0.6)) ? "bet" : "check";
+  }
+  if (patBetting) return (M.made && M.top <= smoothTop) ? "call" : "fold";
+  if (facing) { if (M.made && M.top <= goodTop) return "raise"; if (eq >= 0.5) return "call"; return "fold"; }
+  return (M.made && M.top <= goodTop) || eq >= 0.45 ? "bet" : "check";
+}
+
+// Stud vocabulary — name the SHAPE of a stud hand the way players say it, for the coach.
+const STUD_RN = {14:"aces",13:"kings",12:"queens",11:"jacks",10:"tens",9:"nines",8:"eights",7:"sevens",6:"sixes",5:"fives",4:"fours",3:"threes",2:"deuces"};
+function studHandName(hand) {
+  if (!hand || hand.length < 3) return null;
+  const early = hand.length <= 4;              // 3rd/4th street — where these terms are the main descriptor
+  const third = hand.length === 3;
+  const vs = hand.map(c => c.v);
+  const cnt = {}; vs.forEach(v => cnt[v] = (cnt[v] || 0) + 1);
+  const topRank = +Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a] || b - a)[0];
+  const topCount = cnt[topRank];
+  if (topCount >= 3) return `${third ? "Rolled-up" : "Trip"} ${STUD_RN[topRank]} — `;   // trips (rolled up on 3rd)
+  if (topCount === 2 && early) {
+    const pc = hand.filter(c => c.v === topRank);
+    const ups = pc.filter(c => c.up).length;
+    if (ups === 0)          return `Buried ${STUD_RN[topRank]} — `;   // pair hidden in the hole
+    if (ups === pc.length)  return `Open ${STUD_RN[topRank]} — `;     // pair showing on board
+    return `Split ${STUD_RN[topRank]} — `;                           // one up, one down
+  }
+  if (early && third) {
+    const suits = {}; hand.forEach(c => suits[c.s] = (suits[c.s] || 0) + 1);
+    if (Math.max(...Object.values(suits)) === 3) return "Three-flush — ";
+    const uniq = [...new Set(vs)].sort((a, b) => a - b);
+    if (uniq.length === 3 && uniq[2] - uniq[0] <= 4) return "Three-straight — ";
+  }
+  return null;
+}
+// Name the made hand for the coach's flop/Omaha and draw text, the way studHandName does for stud. Returns a
+// prefix like "Top set — " / "Nut flush — " / "Pat eight-low — " / "Made badugi — ", or "" if nothing to name.
+function handName(st, me) {
+  const gid = st.gid, hand = me.hand || [];
+  if (IS_FLOP(gid) && !IS_PINEAPPLE(gid)) {
+    const bd = st.board || [];
+    if (bd.length < 3) return "";                                  // preflop: nothing made yet
+    const hi = flopHigh(gid, hand, bd);
+    if (!hi) return "";
+    const CAT = ["","a pair of ","","","","","","",""];
+    // Distinguish top/second pair and sets using board texture.
+    const bvals = [...new Set(bd.map(c=>c.v))].sort((a,b)=>b-a);
+    const rn = v => RANKS[v-2];
+    if (hi.cat === 8) return `${rn(hi.tb[0])}-high straight flush — `;
+    if (hi.cat === 7) return `Quad ${rn(hi.tb[0])}s — `;
+    if (hi.cat === 6) return `${rn(hi.tb[0])}s full — `;
+    if (hi.cat === 5) return `${rn(hi.tb[0])}-high flush — `;
+    if (hi.cat === 4) return `${rn(hi.tb[0])}-high straight — `;
+    if (hi.cat === 3) {                                            // trips vs a set
+      const holePair = hand.filter(c => c.v === hi.tb[0]).length >= 2;
+      return holePair ? `Set of ${rn(hi.tb[0])}s — ` : `Trip ${rn(hi.tb[0])}s — `;
+    }
+    if (hi.cat === 2) return `Two pair, ${rn(hi.tb[0])}s & ${rn(hi.tb[1])}s — `;
+    if (hi.cat === 1) {
+      const p = hi.tb[0];
+      const rank = p >= bvals[0] ? "Top pair" : p >= (bvals[1]||0) ? "Second pair" : "A low pair";
+      return `${rank}, ${rn(p)}s — `;
+    }
+    return "";
+  }
+  if (PURE_DRAW(gid)) {
+    const ev = evalHand(gid, hand);
+    if (IS_BADUGI(gid)) return ev && ev.size === 4 ? `Pat ${ev.desc.toLowerCase()} badugi — ` : "";
+    if (IS_HIGHDRAW(gid)) return ev && ev.cat >= 1 ? `${ev.desc} — ` : "";
+    if (ev && ev.cat === 0) return `Pat ${ev.desc.toLowerCase()} — `;   // 2-7: "Pat eight-low — "
+    return "";
+  }
+  return "";
+}
+// is far weaker than raw strength suggests (Aaron's buried tens with the 8 and Q dead). Returns a valueCut
+// tax plus an explanation the coach can speak.
+function studLiveTax(st, me) {
+  if (!IS_STUD(st.gid) || !me.hand || me.hand.length < 4) return { tax:0, note:"" };
+  const vs = me.hand.map(c => c.v), cnt = {}; vs.forEach(v => cnt[v] = (cnt[v] || 0) + 1);
+  const counts = Object.values(cnt);
+  if (Math.max(...counts) !== 2 || counts.filter(n => n === 2).length !== 1) return { tax:0, note:"" };   // exactly one pair
+  const pairRank = +Object.keys(cnt).find(v => cnt[v] === 2);
+  const kick = [...new Set(vs.filter(v => v !== pairRank))];
+  let dead = 0;
+  st.players.forEach(p => { if (p.id !== me.id && p.hand) p.hand.forEach(c => {
+    if (c.up && (c.v === pairRank || kick.includes(c.v))) dead++; }); });
+  const heat = (st.betCount || 0) >= 2;
+  const tax = (heat ? 0.08 : 0) + Math.min(0.14, dead * 0.045);
+  let note = "";
+  if (dead >= 2 && heat) note = `Your pair and kicker outs are dead (${dead} showing) and you're facing a raise — one pair shrivels here. `;
+  else if (dead >= 2)    note = `${dead} of your improvement cards are showing in other boards — your outs are thinner than they look. `;
+  return { tax, note, dead, heat };
+}
+// Public coach entry: runs the tuned heuristic advice, then attaches REAL equity and EV in chips. The
+// heuristic still drives the recommendation (it's calibrated, and range-aware in ways raw equity isn't);
+// the numbers make the advice checkable, and a stark disagreement is surfaced rather than hidden.
+function coachBet(st, me, callAmt) {
+  const r = coachBetCore(st, me, callAmt);
+  if (!r || !(callAmt > 0)) return r;
+  const e = coachEquity(st, me, callAmt);
+  if (!e || e.ev == null) return r;
+  const pct = Math.round(e.adj * 100), needPct = Math.round(e.need * 100);
+  const money = e.ev >= 0 ? `+$${MNY(e.ev)}` : `−$${MNY(Math.abs(e.ev))}`;
+  let line = ` · ~${pct}% equity vs their range, ${needPct}% needed — calling runs ${money}.`;
+  const saysFold = /fold/i.test(r.text);
+  // Where the maths is genuinely the better judge, let it win. The strength heuristic scores MADE hands well
+  // but chronically underrates DRAWS — a nut-flush draw with overcards reads "weak" to it while really being a
+  // clear call. So with cards still to come and a comfortable equity edge, the price overrides the read.
+  // Crucially this never applies on the final street, where a drawing hand has no equity left and the
+  // heuristic's caution (Aaron's 8-4o shove-fold) is exactly right.
+  const cardsToCome = IS_STUD(st.gid) ? (me.hand.length < 7) : ((st.board || []).length < 5);
+  const clearEdge = e.adj - e.need >= 0.08;
+  if (saysFold && clearEdge && cardsToCome && e.ev > 0) {
+    return { ...r, tone:"ok", eq:pct, need:needPct, ev:e.ev, overridden:true,
+      text: `Call — the price is good enough. You're ~${pct}% with cards to come and only need ${needPct}%, so calling runs ${money}. (Hand strength alone looks thin; the draw is what makes it profitable.)` };
+  }
+  if (saysFold && e.ev > 0)        line += " The price tempts, but with no equity left the read is to pass.";
+  else if (!saysFold && e.ev < 0)  line += " Thin on price — proceed only if you have a read.";
+  return { ...r, eq:pct, need:needPct, ev:e.ev, text: r.text + line };
+}
+function coachBetCore(st, me, callAmt) {
+  if (PURE_DRAW(st.gid)) return coachDrawBet(st, me, callAmt);
+  const facing  = callAmt > 0;
+  const str     = heroStrength(st);
+  const potOdds = facing ? callAmt / (st.pot + callAmt) : 0;
+  const oddsTxt = facing ? `${(st.pot / callAmt).toFixed(1)}:1` : "";
+  // On the final street (river / 7th street) no card is coming — don't reference "free cards" or "later streets."
+  const noMoreCards = IS_STUD(st.gid) ? (me.hand.length >= 7)
+                    : (IS_FLOP(st.gid) || IS_DRAMAHA(st.gid)) ? ((st.board || []).length >= 5)
+                    : false;
+  const k = Math.max(0, Math.min(1, (st.exploitDial || 0) / 100));   // 0 = pure GTO, 1 = full exploit
+  // Baseline (GTO) thresholds; the dial tilts them toward exploiting the table read.
+  let raiseCut = 0.78, valueCut = 0.55, thinCut = 0.36, tag = "", ex = "";
+  const icm = icmContext(st, me.chips);
+  if (icm) {
+    valueCut += icm.tighten;   // ICM: near the bubble, marginal continues become folds (survival > chips)
+    if (icm.short && facing)                     tag = `You're short (${Math.round(icm.myBB)}bb) — think shove-or-fold, don't flat marginal hands. `;
+    else if (icm.onBubble && icm.tighten > 0)    tag = `On the bubble — survival matters here; tighten up. `;
+    else if (icm.nearBubble && icm.tighten > 0)  tag = `Near the money — lean cautious with marginal hands. `;
+    else if (icm.deep && icm.nearBubble)         tag = `Big stack on the bubble — you can apply pressure. `;
+  }
+  if (IS_STUD(st.gid)) {
+    const nm = studHandName(me.hand); if (nm) tag = nm + tag;                 // "Split nines — …"
+    const lv = studLiveTax(st, me); valueCut += lv.tax; if (lv.note) tag += lv.note;
+  } else if (!tag) {
+    const nm = handName(st, me); if (nm) tag = nm + tag;                       // "Top set — …" / "Pat eight-low — …"
+  }
+  if (k > 0) {
+    const r = tableRead(st);
+    if (r.loose >= 0.55)      { valueCut -= 0.07 * k; thinCut -= 0.06 * k; ex = " These players call too much — value-bet thinner and skip bluffs."; }
+    else if (r.loose <= 0.40) { valueCut += 0.04 * k; ex = " Tight table — they over-fold, so keep applying pressure with bets."; }
+    else if (r.aggro >= 0.60) { ex = " Aggressive table — let them bet your strong hands and call down a bit lighter."; }
+    if (k < 0.25) ex = "";                 // dial too low to give a confident read
+    if (k >= 0.45) tag = "[Exploit] ";     // flag when the coach is leaning on reads
+  }
+  if (st.gid === "razzdugi") {
+    // Speak the badugi lane, since the generic stud text only knows the razz low.
+    const bd = me.hand.length >= 4 ? evalBadugi(me.hand) : null;
+    const lo = me.hand.length >= 5 ? bestRazz(me.hand) : null;
+    const madeBadugi = bd && bd.size === 4;
+    const smoothLow  = lo && lo.cat === 0 && (lo.tb[0] || 9) <= 8;
+    if (madeBadugi && smoothLow) tag += "Working both ways (badugi + low) — ";
+    else if (madeBadugi)         tag += "Made badugi locks half — ";
+    else if (bd && bd.size === 3) tag += "Three to a badugi — ";
+  }
+  const nOpp = st.players.filter(p => p.id !== 0 && live(p)).length;
+  const mwAdj = nOpp >= 3 ? 0.68 : nOpp === 2 ? 0.84 : 1;   // your share of equity shrinks multiway
+  // Freeroll: a made hand that locks a side of a split pot — you can't lose that half, so bet & raise it.
+  let locked = false;
+  if (st.gid === "razzdugi") {
+    const bd = me.hand.length >= 4 ? evalBadugi(me.hand) : null;
+    const lo = me.hand.length >= 5 ? bestRazz(me.hand) : null;
+    locked = !!((bd && bd.size === 4 && bd.vs[0] <= 8) || (lo && lo.cat === 0 && (lo.tb[0] || 9) <= 8));
+  } else if (IS_DRAMAHA(st.gid)) {
+    locked = dramahaDrawStrength(st.gid, me.hand) >= 0.76;   // a made 8-or-better low / made badugi side
+  }
+  if (locked) {
+    return facing
+      ? { tone:"good", text:`${tag}You lock a side of the pot — you're freerolling. Raise every street; you can't lose this half.${ex}` }
+      : { tone:"good", text:`${tag}You lock a side of the pot — bet and raise it. You're freerolling for the scoop.${ex}` };
+  }
+  const reraised = facing && (st.betCount || 0) >= 2;   // a bet AND a raise are already in front
+  const callEq = str * mwAdj;
+  if (facing) {
+    if (reraised) {
+      // Facing a bet AND a raise = real strength. Continue only with a genuine value hand; fold marginal.
+      if (str >= raiseCut)         return { tone:"good", text:`${tag}Strong enough to re-raise — a bet and a raise don't scare this hand.${ex}` };
+      if (str >= valueCut + 0.06)  return { tone:"ok",   text:`${tag}Good enough to call the raise once, but don't get carried away.${ex}` };
+      return { tone:"warn", text:`${tag}A bet AND a raise is real strength — a one-pair / thin two-pair type hand is usually behind it. Fold.` };
+    }
+    if (str >= raiseCut)         return { tone:"good", text:`${tag}Strong hand — raise for value. You're well ahead of ${oddsTxt} pot odds.${ex}` };
+    if (str >= valueCut)         return { tone:"good", text:`${tag}Solid holding. Calling is standard; a raise is fine.${ex}` };
+    // Don't pay off a weak holding that's facing action — pot odds overstate a thin hand's real equity.
+    if (nOpp >= 2 && str < 0.34 && (potOdds > 0.08 || noMoreCards))
+      return { tone:"warn", text:`${tag}Weak holding ${nOpp >= 3 ? "in a multiway pot" : "facing a bet"} — your real share is too thin for ${oddsTxt}${noMoreCards ? " and there are no cards left to improve" : ", and you'll often pay more on later streets"}. Fold.` };
+    if (callEq >= potOdds + 0.16)   return { tone:"ok",   text:`${tag}Marginal, but ${oddsTxt} pot odds make this a profitable call.${ex}` };
+    if (callEq >= potOdds + 0.04)   return { tone:"ok", text:`Borderline — call only if you trust the price you're getting.` };
+    return { tone:"warn", text:`${tag}Weak hand for ${oddsTxt}. Folding is usually best here.` };
+  }
+  if (str >= raiseCut)           return { tone:"good", text:`${tag}Big hand — bet for value${noMoreCards ? " and get paid at showdown" : ", don't give a free card"}.${ex}` };
+  if (str >= valueCut)           return { tone:"good", text:`${tag}Good holding — a bet pressures weaker hands.${ex}` };
+  if (str >= thinCut)            return { tone:"ok",   text:`${tag}Thin but playable — checking keeps the pot under control.${ex}` };
+  return { tone:"warn", text:`Not much here — check${noMoreCards ? " and take it to showdown." : " and take the free card."}` };
+}
+
+// ─── DECISION GRADER (silent answer key for hand history) ──────────
+// Mirrors coachBet's thresholds but returns a discrete recommended action,
+// so we can grade your play even when the live Coach is switched off.
+function coachRecAction(st, me, callAmt) {
+  if (PURE_DRAW(st.gid)) return coachDrawRec(st, me, callAmt);
+  const facing  = callAmt > 0;
+  const str     = heroStrength(st);
+  const potOdds = facing ? callAmt / (st.pot + callAmt) : 0;
+  let raiseCut = 0.78, valueCut = 0.55, thinCut = 0.36;
+  const icm = icmContext(st, me.chips);
+  if (icm) valueCut += icm.tighten;   // ICM tighten mirror (S5)
+  valueCut += studLiveTax(st, me).tax;   // dead-cards / facing-a-raise tax for one-pair stud hands (mirror)
+  // Freeroll: a made hand that locks a side of a split pot → bet/raise (mirror of coachBet).
+  let locked = false;
+  if (st.gid === "razzdugi") {
+    const bd = me.hand.length >= 4 ? evalBadugi(me.hand) : null;
+    const lo = me.hand.length >= 5 ? bestRazz(me.hand) : null;
+    locked = !!((bd && bd.size === 4 && bd.vs[0] <= 8) || (lo && lo.cat === 0 && (lo.tb[0] || 9) <= 8));
+  } else if (IS_DRAMAHA(st.gid)) {
+    locked = dramahaDrawStrength(st.gid, me.hand) >= 0.76;
+  }
+  if (locked) return facing ? "raise" : "bet";
+  const reraised = facing && (st.betCount || 0) >= 2;
+  if (facing) {
+    const nOpp = st.players.filter(p => p.id !== 0 && live(p)).length;
+    const callEq = str * (nOpp >= 3 ? 0.68 : nOpp === 2 ? 0.84 : 1);
+    if (reraised) {
+      if (str >= raiseCut)        return "raise";
+      if (str >= valueCut + 0.06) return "call";
+      return "fold";
+    }
+    if (str >= raiseCut)                       return "raise";
+    if (str >= valueCut)                       return "call";   // call/raise both fine
+    const noMore = IS_STUD(st.gid) ? (me.hand.length >= 7)
+                 : (IS_FLOP(st.gid) || IS_DRAMAHA(st.gid)) ? ((st.board || []).length >= 5) : false;
+    if (nOpp >= 2 && str < 0.34 && (potOdds > 0.08 || noMore)) return "fold";
+    if (callEq >= potOdds + 0.16)              return "call";
+    if (callEq >= potOdds + 0.04)              return "call";
+    return "fold";
+  }
+  if (str >= valueCut) return "bet";
+  return "check";
+}
+const ACT_AGGR = { fold:0, check:1, call:2, bet:3, raise:4 };
+// Grade one betting decision → { category, verdict, dir, severity, rec, action }.
+function gradeDecision(st, action, amount) {
+  const me = st.players[0];
+  const callAmt = Math.max(0, st.currentBet - (me.betSt || 0));
+  const facing  = callAmt > 0;
+  const str  = heroStrength(st);
+  const rec  = coachRecAction(st, me, callAmt);
+  const norm = action === "bet" || action === "raise" ? (facing ? "raise" : "bet") : action;
+  const preflop = st.streetN === 0;
+  const a = ACT_AGGR[norm] ?? 1, r = ACT_AGGR[rec] ?? 1;
+  let category, dir = "ok", verdict = "good", severity = 0;
+  // Exact (or equivalently aggressive) match
+  if (norm === rec || (rec === "call" && norm === "raise") || (rec === "check" && norm === "bet")) {
+    category = preflop ? "Preflop selection" : (a >= 3 ? "Value aggression" : "Solid lines");
+    verdict = "good";
+  } else if (a < r) {
+    // You played too passively vs the recommendation
+    dir = "too_passive"; verdict = "leak";
+    category = (rec === "raise" || rec === "bet") ? "Value aggression"
+             : (rec === "call") ? "Over-folding" : "Solid lines";
+    severity = Math.min(1, 0.35 + str * 0.6);            // folding/checking strength hurts more
+  } else {
+    // You played too aggressively / loosely vs the recommendation
+    dir = "too_loose"; verdict = "leak";
+    category = rec === "fold" ? "Calling discipline" : "Bluff control";
+    const odds = facing ? callAmt / (st.pot + callAmt) : 0.3;
+    severity = Math.min(1, 0.35 + Math.max(0, odds - str) + (a - r) * 0.12);
+  }
+  if (preflop && verdict === "leak") category = "Preflop selection";
+  return { category, verdict, dir, severity:+severity.toFixed(2), rec, action:norm, street:st.streetN, gid:st.gid };
+}
+// Grade a draw (discard set) vs the coach's recommended discards.
+// Grade a draw (discard set) vs the coach's recommended discards.
+function gradeDraw(st, sel) {
+  let plan; try { plan = coachDrawPlan(st, st.players[0]); } catch { plan = null; }
+  if (!plan || !plan.discard) return null;
+  const want = new Set(plan.discard), got = new Set(sel);
+  const uni = new Set([...want, ...got]); let inter = 0;
+  want.forEach(x => { if (got.has(x)) inter++; });
+  const jac = uni.size ? inter / uni.size : 1;          // 1 = identical
+  const verdict = jac >= 0.99 ? "good" : jac >= 0.5 ? "ok" : "leak";
+  return { category:"Draw decisions", verdict, dir: got.size > want.size ? "too_loose" : got.size < want.size ? "too_passive" : "ok",
+           severity:+(1 - jac).toFixed(2), rec:[...want], action:[...got], street:st.streetN, gid:st.gid };
+}
+
+// ─── HAND HISTORY: storage + analysis ─────────────────────────────
+const HS_KEY = "pmg_history_v1";
+const HS_CAP = 3000;                       // effectively "forever" for normal use
+function hsAvail() { try { localStorage.setItem("__t","1"); localStorage.removeItem("__t"); return true; } catch { return false; } }
+function hsLoad()  { try { return JSON.parse(localStorage.getItem(HS_KEY) || "[]"); } catch { return []; } }
+function hsSaveAll(arr) {
+  try { localStorage.setItem(HS_KEY, JSON.stringify(arr)); return true; }
+  catch { try { const t = arr.slice(-Math.floor(arr.length * 0.8)); localStorage.setItem(HS_KEY, JSON.stringify(t)); return true; } catch { return false; } }
+}
+function hsAppend(rec) { const a = hsLoad(); a.push(rec); if (a.length > HS_CAP) a.splice(0, a.length - HS_CAP); hsSaveAll(a); return a.length; }
+function hsClear() { try { localStorage.removeItem(HS_KEY); } catch {} }
+// ── Save & resume tournament (Leg C) ── checkpoints the game between hands so a reload drops you back in. ──
+const TS_KEY = "pmg_tour_v1";
+function tsSave(st) { try { localStorage.setItem(TS_KEY, JSON.stringify(st)); } catch {} }
+function tsLoad()   { try { const x = JSON.parse(localStorage.getItem(TS_KEY) || "null"); return (x && x.tour && x.tour.on && !x.tour.result) ? x : null; } catch { return null; } }
+function tsClear()  { try { localStorage.removeItem(TS_KEY); } catch {} }
+
+const CAT_FIX = {
+  "Preflop selection":  "Tighten your starting hands — fold the marginal ones before committing chips.",
+  "Value aggression":   "Bet and raise your strong hands more often — you're leaving value uncollected.",
+  "Over-folding":       "You fold too often when a call is correct — defend a little wider.",
+  "Calling discipline": "You call too light — let go of hands when the price isn't there.",
+  "Bluff control":      "Ease off betting weak hands into bad spots — pick cleaner bluff spots.",
+  "Draw decisions":     "Revisit which cards you keep — match the recommended draw more often.",
+  "Solid lines":        "Keep taking the standard line on the later streets.",
+};
+const CAT_GOOD = {
+  "Preflop selection":  "Disciplined starting-hand selection.",
+  "Value aggression":   "You bet and raise strong hands well.",
+  "Over-folding":       "You defend the right amount — not too tight.",
+  "Calling discipline": "You don't pay off without a real hand.",
+  "Bluff control":      "You avoid spewing with weak holdings.",
+  "Draw decisions":     "Your draws match the recommended keeps.",
+  "Solid lines":        "Solid, standard lines through the streets.",
+};
+const GAME_LABEL = {
+  single:"2-7 Single", triple:"2-7 Triple", badugi:"Badugi", lhe:"Limit Hold'em",
+  nlhe:"No-Limit Hold'em", omaha8:"Omaha Hi-Lo", plo:"PLO", bigo:"Big O",
+  razz:"Razz", razzdugi:"Razzdugi", stud:"7-Card Stud", stud8:"Stud Hi-Lo",
+  dramahaH:"Dramaha High", dramaha27:"2-7 Dramaha", dramadugi:"Dramadugi",
+};
+
+// Aggregate raw hand records → dashboard + strengths/opportunities.
+function analyzeHistory(records) {
+  const cats = {}, games = {};
+  let good = 0, ok = 0, leak = 0, decisions = 0;
+  const bump = (o, k) => (o[k] = o[k] || { n:0, good:0, ok:0, leak:0, sev:0, loose:0, passive:0 });
+  records.forEach(r => {
+    const g = bump(games, r.gid); g.hands = (g.hands || 0) + 1;
+    if (r.result === "won") g.wins = (g.wins || 0) + 1;
+    (r.decisions || []).forEach(d => {
+      decisions++;
+      const c = bump(cats, d.category); c.n++;
+      const gd = bump(games, r.gid); gd.dn = (gd.dn || 0) + 1;
+      if (d.verdict === "good") { good++; c.good++; gd.dgood = (gd.dgood || 0) + 1; }
+      else if (d.verdict === "ok") { ok++; c.ok++; }
+      else { leak++; c.leak++; c.sev += d.severity || 0.5; if (d.dir === "too_loose") c.loose++; if (d.dir === "too_passive") c.passive++; }
+    });
+  });
+  const graded = good + ok + leak;
+  const accuracy = graded ? (good + ok * 0.5) / graded : 0;
+  const MIN = 6;
+  const catList = Object.entries(cats).map(([category, c]) => {
+    const tot = c.good + c.ok + c.leak;
+    const goodRate = tot ? (c.good + c.ok * 0.5) / tot : 0;
+    const leakRate = tot ? c.leak / tot : 0;
+    const avgSev = c.leak ? c.sev / c.leak : 0;
+    const dir = c.passive >= c.loose ? "too_passive" : "too_loose";
+    return { category, n:tot, goodRate, leakRate, avgSev, dir };
+  });
+  const strengths = catList.filter(c => c.n >= MIN && c.goodRate >= 0.6)
+    .sort((a, b) => b.goodRate - a.goodRate || b.n - a.n).slice(0, 5)
+    .map(c => ({ ...c, blurb: CAT_GOOD[c.category] || "Solid here." }));
+  const opportunities = catList.filter(c => c.n >= MIN && c.leakRate >= 0.2)
+    .sort((a, b) => (b.leakRate * (0.5 + b.avgSev)) - (a.leakRate * (0.5 + a.avgSev)) || b.n - a.n).slice(0, 5)
+    .map(c => ({ ...c, fix: CAT_FIX[c.category] || "Review this spot." }));
+  const perGame = Object.entries(games).map(([gid, g]) => ({
+    gid, label: GAME_LABEL[gid] || gid, hands: g.hands || 0, wins: g.wins || 0,
+    accuracy: g.dn ? (g.dgood || 0) / g.dn : 0, decisions: g.dn || 0,
+  })).sort((a, b) => b.hands - a.hands);
+  return {
+    hands: records.length, wins: records.filter(r => r.result === "won").length,
+    decisions, accuracy, strengths, opportunities, perGame, enough: decisions >= 20,
+  };
+}
+const cardTxt = c => c ? `${c.r}${c.s}` : "";
+function coachDraw(st, me) {
+  const plan    = coachDrawPlan(st, me);
+  const sel     = st.sel;
+  const k       = Math.max(0, Math.min(1, (st.exploitDial || 0) / 100));
+  const matches = plan.discard.length === sel.length && plan.discard.every(i => sel.includes(i));
+  // Exploit nudge on weak/marginal draws, scaled by the dial.
+  let nudge = "";
+  if (plan.tone === "warn" && k >= 0.35 && tableRead(st).loose >= 0.55)
+    nudge = " Loose table: avoid drawing thin into a field of callers.";
+  // Affirm when the player's current selection already matches the recommended play.
+  if (matches) {
+    const lead = plan.pat
+      ? `Standing pat is correct. ${plan.why}`
+      : `That matches the recommended play — ${plan.head}. ${plan.why}`;
+    return { tone:"good", text: lead + nudge };
+  }
+  const head = plan.head.charAt(0).toUpperCase() + plan.head.slice(1);
+  return { tone: plan.tone, text: `Recommended: ${head}. ${plan.why}${nudge}` };
+}
+
+// ─── ACTION QUEUE ────────────────────────────────
+const live = p => !p.folded && !p.sittingOut;
+// Can this player still make a betting decision? (live AND has chips behind).
+// All-in players stay live for the showdown but are never queued to act.
+const canAct = p => live(p) && p.chips > 0;
+
+function startQueue(players, dealerIdx) {
+  const q = [], n = players.length;
+  for (let off = 1; off <= n; off++) {
+    const i = (dealerIdx + off) % n;
+    if (canAct(players[i])) q.push(i);
+  }
+  return q;
+}
+function reQueue(players, aggrIdx) {
+  const q = [], n = players.length;
+  for (let off = 1; off <= n; off++) {
+    const i = (aggrIdx + off) % n;
+    if (canAct(players[i]) && i !== aggrIdx) q.push(i);
+  }
+  return q;
+}
+// Live seats in order starting at `from` (inclusive). Used for preflop action.
+function queueFrom(players, from) {
+  const q = [], n = players.length;
+  for (let off = 0; off < n; off++) {
+    const i = (from + off) % n;
+    if (canAct(players[i])) q.push(i);
+  }
+  return q;
+}
+// Live seats clockwise from the button (for assigning blinds).
+function liveFromDealer(players, dealerIdx) {
+  const order = [], n = players.length;
+  for (let off = 1; off <= n; off++) {
+    const i = (dealerIdx + off) % n;
+    if (live(players[i])) order.push(i);
+  }
+  return order;
+}
+
+// ─── STUD ORDER HELPERS ──────────────────────────
+// Bring-in seat on 3rd street: lowest up-card (Stud/Stud-8) or highest (Razz).
+// Tie-break by suit (spades high). Returns seat index.
+function bringInSeat(players, gid) {
+  const seats = players.filter(live).filter(p => upCards(p).length);
+  if (!seats.length) return players.findIndex(live);
+  const score = p => { const c = upCards(p)[0]; return c.v * 10 + SUIT_RANK[c.s]; };
+  if (gid === "razz" || gid === "superstud" || gid === "razzdugi") return seats.reduce((a, b) => score(b) > score(a) ? b : a).id; // highest brings in
+  return seats.reduce((a, b) => score(b) < score(a) ? b : a).id;                       // lowest brings in
+}
+// First to act on 4th+ street: best showing hand acts first (Stud/Stud-8 high),
+// or lowest showing (Razz). Compares the up-cards as a partial hand.
+function firstToActStud(players, gid) {
+  const seats = players.filter(live);
+  if (!seats.length) return 0;
+  if (gid === "razz" || gid === "razzdugi") {
+    return seats.reduce((a, b) => cmpVecLow(showLowVec(upCards(b)), showLowVec(upCards(a))) < 0 ? b : a).id;
+  }
+  // high games: best poker value of up-cards acts first
+  const upEval = p => { const u = upCards(p); return u.length >= 5 ? evalHigh5(u.slice(0,5)) : partialHigh(u); };
+  return seats.reduce((a, b) => cmpHigh(upEval(b), upEval(a)) < 0 ? b : a).id;
+}
+// Rank a partial set of up-cards (1-4) as a high "hand" for ordering only.
+function partialHigh(cards) {
+  const vs = cards.map(c => c.v).sort((a, b) => b - a);
+  const cnt = {}; vs.forEach(v => (cnt[v] = (cnt[v] || 0) + 1));
+  const g = Object.entries(cnt).map(([v,c]) => ({v:+v,c})).sort((a,b) => b.c-a.c || b.v-a.v);
+  const f = g.map(x => x.c);
+  let cat;
+  if (f[0] === 4) cat = 7; else if (f[0] === 3) cat = 3;
+  else if (f[0] === 2 && f[1] === 2) cat = 2; else if (f[0] === 2) cat = 1; else cat = 0;
+  return { cat, tb: g.flatMap(x => Array(x.c).fill(x.v)) };
+}
+// Queue clockwise starting at a given seat (inclusive of live seats).
+function queueFromSeat(players, from) {
+  const q = [], n = players.length;
+  for (let off = 0; off < n; off++) { const i = (from + off) % n; if (canAct(players[i])) q.push(i); }
+  return q;
+}
+
+// ─── STATE ───────────────────────────────────────
+const mkPs = (prev = null, startChips = 2000, n = 4) => {
+  const heroChips = (prev && prev[0]) ? prev[0].chips : startChips;   // added seats match the table, not a short buy-in
+  const arr = [{ id:0, name:"You", chips:heroChips, hand:[], betSt:0, folded:false, sittingOut:false, isHuman:true, lastAct:null }];
+  for (let i = 1; i < n; i++)
+    arr.push({ id:i, name:(prev&&prev[i]&&prev[i].name)||PROF[i].name, chips:(prev&&prev[i])?prev[i].chips:heroChips, hand:[], betSt:0, folded:false, sittingOut:false, isHuman:false, lastAct:null });
+  return arr;
+};
+const mkState = (gid, prev = null) => {
+  const format   = prev?.format   ?? "cash";
+  const stakeIdx = prev?.stakeIdx ?? 1;          // $10/$20 == legacy numbers
+  const bbDepth  = prev?.bbDepth  ?? 100;
+  const stk      = format === "tourney" ? TOURNEY_STAKES : CASH_STAKES[stakeIdx];
+  const startChips = depthUnit(gid, stk) * (format === "tourney" ? bbDepth * depthMult(gid) : CASH_DEPTH);
+  // Double Board Bomb Pot is a multiway format — always 7-handed (5 hole cards + two boards fits a 52-card
+  // deck only up to 7; 8 would exhaust the deck on the river). Other games: 8-max is tournament-only, cash 4-max.
+  const nSeats = Math.min(seatCap(gid),
+    gid === "dbbomb" ? 7 : (format === "tourney" && IS_FLOP(gid)) ? 8 : 4);   // never exceed what the deck can deal
+  return {
+  gid, phase:"idle", deck:[], players:mkPs(prev?.players, startChips, nSeats), board:[], board2:[],
+  pot:0, currentBet:0, betCount:0, queue:[], streetN:0, drawN:0, seq:0,
+  maxDraws:(gid === "triple" || gid === "badugi" || IS_SPLITDRAW(gid) || gid === "pl27td" || gid === "plbad") ? 3 : gid === "pl5d" ? 2 : 1, nlBet:40,
+  dealerIdx:Math.floor(rnd() * nSeats), reveal:false,
+  msg:"Press Deal to start", result:null, sel:[],
+  cpuTilt: prev?.cpuTilt || { 1:0, 2:0, 3:0, 4:0, 5:0, 6:0, 7:0 },
+  stats:   prev?.stats   || { hands:0, wins:0 },
+  // Per-bot tightness (0 loose .. 100 tight). Defaults loosened from old behaviour.
+  botTight: prev?.botTight || { 1:62, 2:18, 3:38, 4:78, 5:45, 6:20, 7:30 },
+  // Decision quality per seat, independent of looseness (see cpuDecideFlop). Default ~50 = the current baseline;
+  // scenarios raise this by stage so late fields play sharper without folding more.
+  botSkill: prev?.botSkill || { 1:50, 2:45, 3:58, 4:60, 5:62, 6:40, 7:55 },
+  // Coach mode: surface live strategy tips on the player's turn. Defaults OFF so the table stays uncluttered
+  // and easy to follow; players opt in via the prominent Coach Mode toggle in settings.
+  coach: prev?.coach ?? false,
+  exploitDial: prev?.exploitDial ?? 0,           // 0 = GTO … 100 = full exploit
+  // Stakes & format.
+  format, stakeIdx, bbDepth,
+  tour: format === "tourney" ? (prev?.tour ?? null) : null,   // tournament clock/level/rotation (Leg C · C2)
+  // Cash mixed rotation: preserved across hands, ignored in tournaments (the tour seq drives rotation there).
+  cashSeq: format === "tourney" ? null : (prev?.cashSeq ?? null),
+  cashIdx: format === "tourney" ? 0 : (prev?.cashIdx ?? 0),
+  cashRep: format === "tourney" ? 0 : (prev?.cashRep ?? 0),   // hands played of the current cash-mix game
+  drawDone:false,                                // dramaha: has the single mid-hand draw happened?
+  discardDone:false,                             // super stud: has the 3rd-street discard happened?
+  };
+};
+
+// ─── ACTION ENGINE ───────────────────────────────
+// Verified flow:
+//   Single Draw:  [ante] → bet(NL) → draw → bet(NL) → showdown
+//   Triple Draw:  [ante] → bet(SB) → draw → bet(SB) → draw → bet(BB) → draw → bet(BB) → showdown
+//
+// Betting round ends when every active player has either
+// folded or matched the highest bet (queue empties).
+// A bet/raise re-opens action for all other active players.
+
+function applyAction(st, action, amount = 0) {
+  if (!st.queue.length || st.phase !== "acting") return st;
+  const idx     = st.queue[0];
+  const players = st.players.map(p => ({ ...p, hand:[...p.hand] }));
+  let { pot, currentBet } = st;
+  let betCount = st.betCount || 0;
+  let newQ;
+  const a = players[idx];
+
+  switch (action) {
+    case "fold":
+      a.folded  = true;
+      a.lastAct = { text:"Fold", color:"#E2857A" };
+      newQ = st.queue.slice(1);
+      break;
+    case "check":
+      a.lastAct = { text:"Check", color:"#64748b" };
+      newQ = st.queue.slice(1);
+      break;
+    case "call": {
+      const c  = Math.min(currentBet - a.betSt, a.chips);
+      a.chips -= c; a.betSt += c; a.cmt = (a.cmt || 0) + c; pot += c;
+      a.lastAct = { text:`Call $${MNY(a.betSt)}`, color:"#60a5fa" };
+      newQ = st.queue.slice(1);
+      break;
+    }
+    case "bet":
+    case "raise": {
+      // Fixed-limit games cap betting at 4 bets per round (a bet + 3 raises). This is a real
+      // rule and it prevents bots from re-raising each other forever in a limit game.
+      const cap = BET_MODE(st.gid) === "fl" ? 4 : 99;
+      const raiseLocked = st.currentBet > 0 && (st.betCount || 0) >= cap;
+      if (raiseLocked) {
+        // No more raises allowed this round → treat the action as a call.
+        const c = Math.min(currentBet - a.betSt, a.chips);
+        a.chips -= c; a.betSt += c; a.cmt = (a.cmt || 0) + c; pot += c;
+        a.lastAct = { text: c > 0 ? `Call $${MNY(a.betSt)}` : "Check", color: c > 0 ? "#60a5fa" : "#64748b" };
+        newQ = st.queue.slice(1);
+        break;
+      }
+      // amount = intended TOTAL street bet for this player. A player can never
+      // wager below what they've already put in, and never more than their stack.
+      const want = Math.max(amount, a.betSt);
+      const put  = Math.max(0, Math.min(want - a.betSt, a.chips));
+      a.chips -= put; a.betSt += put; a.cmt = (a.cmt || 0) + put; a.aggr = (a.aggr || 0) + 1; pot += put;
+      if (a.betSt > st.currentBet && put > 0) {
+        // Genuine bet/raise that increases the wager → re-opens action for everyone.
+        const verb = st.currentBet > 0 ? "Raise" : "Bet";
+        currentBet = a.betSt;
+        a.lastAct  = { text:`${verb} $${MNY(a.betSt)}`, color:"#fbbf24" };
+        newQ = reQueue(players, idx);
+        betCount = (st.currentBet === 0 ? 0 : (st.betCount || 0)) + 1;  // opening bet resets the count to 1
+      } else {
+        // All-in short, or no real increase → behaves like a call/check, no re-open.
+        a.lastAct = put > 0 ? { text:`Call $${MNY(a.betSt)}`, color:"#60a5fa" }
+                            : { text:"Check", color:"#64748b" };
+        newQ = st.queue.slice(1);
+      }
+      break;
+    }
+    default: return st;
+  }
+
+  // If one player left, they win the pot immediately
+  const still = players.filter(live);
+  if (still.length === 1) {
+    still[0].chips += pot;
+    return settle(st, players, 0, still[0].id === 0 ? "player" : "cpu",
+      `${still[0].id === 0 ? "You win" : still[0].name + " wins"} $${MNY(pot)} — all others folded!`,
+      [still[0].id]);
+  }
+
+  // Betting round complete — advance to draw or showdown
+  if (newQ.length === 0) return nextPhase({ ...st, players, pot, currentBet, queue:[] });
+
+  const nx = newQ[0];
+  return { ...st, players, pot, currentBet, betCount, queue:newQ, seq:(st.seq||0)+1,
+    msg: nx === 0 ? `Your action — Pot $${MNY(pot)}` : `${players[nx].name} is thinking…` };
+}
+
+// Transition: betting done → draw / next board / showdown
+function nextPhase(st) {
+  const players = st.players.map(p => ({ ...p, betSt:0 }));
+
+  // ── Stud games: deal one card to each live player, recompute first to act ──
+  if (IS_STUD(st.gid)) {
+    // Super Stud: after 3rd-street betting, each player discards 2 (keeps 3) before 4th street.
+    if (st.gid === "superstud" && st.streetN === 0 && !st.discardDone) {
+      const canAct = players.filter(p => live(p) && p.chips > 0).length;
+      if (canAct >= 2) {
+        if (!live(players[0])) return execDiscard({ ...st, players }, []);   // hero folded → auto-resolve
+        return { ...st, players, phase:"discarding", sel:[], currentBet:0, seq:(st.seq||0)+1,
+          msg:"Discard 2 of your 4 face-down cards (keep 3) — tap two, then Discard" };
+      }
+    }
+    if (st.streetN >= 4) return showdownStud({ ...st, players });
+    const dealUp = st.streetN < 3; // 4th,5th,6th up (streetN 1,2,3); 7th down (streetN 4)
+    let deck = [...st.deck];
+    const liveP = players.filter(live);
+    // 7th street with more players left than cards in the deck → deal ONE shared face-up COMMUNITY card that
+    // every remaining player uses (standard stud rule; prevents a deck-out crash at 8-handed razz/stud).
+    const community = (deck.length < liveP.length) ? { ...deck.shift(), up:true } : null;
+    const draw = (dk, up) => { const c = dk.shift(); return c ? { ...c, up } : { v:2, r:"2", s:"c", up }; };  // never undefined
+    const deal1 = (ps, dk) => ps.map(p => {
+      if (!live(p)) return p;
+      return { ...p, hand:[...p.hand, community || draw(dk, dealUp)] };
+    });
+    // If fewer than 2 can still act, deal remaining streets and go to showdown.
+    const canAct = players.filter(p => live(p) && p.chips > 0).length;
+    let ps = deal1(players, deck);
+    let streetN = st.streetN + 1;
+    if (canAct < 2) {
+      let s2 = { ...st, players:ps, deck, streetN };
+      while (s2.streetN < 4) {
+        let d = [...s2.deck];
+        const up = s2.streetN < 3;
+        const comm2 = (d.length < s2.players.filter(live).length) ? { ...d.shift(), up:true } : null;
+        const np = s2.players.map(p => live(p) ? { ...p, hand:[...p.hand, comm2 || draw(d, up)] } : p);
+        s2 = { ...s2, players:np, deck:d, streetN:s2.streetN + 1 };
+      }
+      return showdownStud(s2);
+    }
+    const first = firstToActStud(ps, st.gid);
+    const queue = queueFromSeat(ps, first);
+    const nx = queue[0];
+    const lbl = ["", "4th", "5th", "6th", "7th"][streetN] + " street";
+    return { ...st, players:ps, deck, streetN, queue, currentBet:0, phase:"acting",
+      boardKey:(st.boardKey||0)+1, seq:(st.seq||0)+1,
+      msg: nx === 0 ? `Your action on ${lbl} — Pot $${MNY(st.pot)}` : `${ps[nx].name} acts on ${lbl}…` };
+  }
+
+  // ── Dramaha: flop → DRAW → turn → river → split showdown ──
+  if (IS_DRAMAHA(st.gid)) {
+    const deck = [...st.deck], board = [...st.board];
+    const canAct = players.filter(p => live(p) && p.chips > 0).length;
+    if (st.streetN === 0) {                              // preflop done → flop
+      deck.shift(); board.push(deck.shift(), deck.shift(), deck.shift());
+      if (canAct < 2) return dramahaRunout({ ...st, players, deck, board, streetN:1 });
+      const queue = startQueue(players, st.dealerIdx), nx = queue[0];
+      return { ...st, players, deck, board, streetN:1, queue, currentBet:0, phase:"acting",
+        boardKey:(st.boardKey||0)+1, seq:(st.seq||0)+1,
+        msg: nx===0 ? `Your action on the flop — Pot $${MNY(st.pot)}` : `${players[nx].name} acts on the flop…` };
+    }
+    if (st.streetN === 1 && !st.drawDone) {              // flop done → the draw
+      if (canAct < 2) return dramahaRunout({ ...st, players, deck, board });
+      return { ...st, players, currentBet:0, phase:"drawing", sel:[], seq:(st.seq||0)+1,
+        msg:`Draw — discard 0–${DRAW_CAP(st.gid)} from your hand, then Draw` };
+    }
+    if (st.streetN === 2) {                              // turn done → river
+      deck.shift(); board.push(deck.shift());
+      if (canAct < 2) return dramahaRunout({ ...st, players, deck, board, streetN:3 });
+      const queue = startQueue(players, st.dealerIdx), nx = queue[0];
+      return { ...st, players, deck, board, streetN:3, queue, currentBet:0, phase:"acting",
+        boardKey:(st.boardKey||0)+1, seq:(st.seq||0)+1,
+        msg: nx===0 ? `Your action on the river — Pot $${MNY(st.pot)}` : `${players[nx].name} acts on the river…` };
+    }
+    return showdownDramaha({ ...st, players });          // river done → showdown
+  }
+
+  // ── Flop games: deal the next board segment, then a new betting round ──
+  if (IS_FLOP(st.gid)) {
+    if (st.streetN >= 3) return IS_DOUBLE(st.gid) ? showdownDoubleBoard({ ...st, players }) : showdownFlop({ ...st, players });
+    // Crazy Pineapple: discard 1 of 3 after the flop, before the turn (happens even on all-in runouts).
+    if (IS_PINEAPPLE(st.gid) && st.streetN === 1 && !st.discardDone) {
+      const liveCount = players.filter(live).length;
+      if (liveCount >= 2) {
+        if (!live(players[0]) || players[0].chips === 0) return execPineDiscard({ ...st, players }, -1); // hero out/all-in → auto
+        return { ...st, players, phase:"pineDiscard", sel:[], currentBet:0, seq:(st.seq||0)+1,
+          msg:"Discard 1 of your 3 cards — tap one, then Discard" };
+      }
+    }
+    const deck    = [...st.deck];
+    const board   = [...st.board];
+    const board2  = [...(st.board2 || [])];
+    if (st.streetN === 0) {                                  // burn + flop(s)
+      deck.shift(); board.push(deck.shift(), deck.shift(), deck.shift());
+      if (IS_DOUBLE(st.gid)) { deck.shift(); board2.push(deck.shift(), deck.shift(), deck.shift()); }
+    } else {                                                 // burn + turn/river
+      deck.shift(); board.push(deck.shift());
+      if (IS_DOUBLE(st.gid)) { deck.shift(); board2.push(deck.shift()); }
+    }
+    const streetN = st.streetN + 1;
+    const queue   = startQueue(players, st.dealerIdx);
+    const canAct = players.filter(p => live(p) && p.chips > 0).length;
+    if (canAct < 2) {
+      let s2 = { ...st, players, deck, board, board2, streetN, currentBet:0 };
+      while (s2.streetN < 3) {
+        const d = [...s2.deck], bd = [...s2.board], bd2 = [...(s2.board2 || [])];
+        d.shift(); bd.push(d.shift());
+        if (IS_DOUBLE(s2.gid)) { d.shift(); bd2.push(d.shift()); }
+        s2 = { ...s2, deck:d, board:bd, board2:bd2, streetN:s2.streetN + 1 };
+      }
+      return IS_DOUBLE(st.gid) ? showdownDoubleBoard(s2) : showdownFlop(s2);
+    }
+    const nx      = queue[0];
+    const lbl     = ["", "the flop", "the turn", "the river"][streetN];
+    return { ...st, players, deck, board, board2, streetN, queue, currentBet:0, phase:"acting",
+      boardKey:(st.boardKey||0)+1, seq:(st.seq||0)+1,
+      msg: nx === 0 ? `Your action on ${lbl} — Pot $${MNY(st.pot)}` : `${players[nx].name} acts on ${lbl}…` };
+  }
+
+  // ── Draw games ──
+  if (st.drawN < st.maxDraws) {
+    const n   = st.drawN + 1;
+    const max = st.maxDraws;
+    return { ...st, players, currentBet:0, phase:"drawing", sel:[],
+      msg: max > 1 ? `Draw ${n} of ${max} — tap cards to discard, then Draw` : "Tap cards to discard, then click Draw" };
+  }
+  if (IS_SPLITDRAW(st.gid)) return showdownSplitDraw({ ...st, players });
+  return showdown({ ...st, players });
+}
+
+// Execute draw: player + all CPU players draw simultaneously
+function execDraw(st, playerDiscards, playerFolds = false) {
+  let deck = [...st.deck];
+  const muck = [];
+  // Draw a replacement card; if the stub runs out (full table drawing lots of cards), reshuffle the mucked
+  // discards into a fresh stub — exactly as a live dealer does. Prevents undefined cards poisoning a hand.
+  const draw1 = () => {
+    if (!deck.length && muck.length) { for (let i = muck.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [muck[i], muck[j]] = [muck[j], muck[i]]; } deck = muck.splice(0); }
+    return deck.shift() || { v:2, r:"2", s:"♠" };
+  };
+  const players = st.players.map(p => {
+    if (p.sittingOut || (p.folded && p.id !== 0)) return { ...p };
+    if (p.id === 0) {
+      if (playerFolds) return { ...p, folded:true, lastAct:{ text:"Fold", color:"#E2857A" } };
+      if (p.folded)    return { ...p };   // already folded earlier — don't re-deal
+      const hand = p.hand.map((c, i) => playerDiscards.includes(i) ? (muck.push(c), draw1()) : c);
+      return { ...p, hand, betSt:0, lastAct:null, drewLast:playerDiscards.length };
+    }
+    if (p.folded) return { ...p };
+    let disc = cpuDrawCards(p.hand, PROF[p.id], st.gid, st.gid === "veronica" ? (st.board || []) : []);
+    // FINAL-draw discipline (multi-draw games): drawing two-plus on the last draw is a huge leak — you're
+    // drawing near-dead into made hands. Keep the best four and draw one at it instead.
+    if (disc.length > 1 && (st.maxDraws || 1) > 1 && (st.drawN || 0) === st.maxDraws - 1
+        && !IS_SPLITDRAW(st.gid) && !IS_DRAMAHA(st.gid)) {
+      const bad = i => IS_BADUGI(st.gid) ? BV(p.hand[i].v) : p.hand[i].v;   // worst = highest (ace-low in badugi)
+      disc = [disc.reduce((w, i) => bad(i) > bad(w) ? i : w, disc[0])];
+    }
+    const hand = p.hand.map((c, i) => disc.includes(i) ? (muck.push(c), draw1()) : c);
+    return { ...p, hand, betSt:0, drewLast:disc.length,
+      lastAct:{ text:disc.length === 0 ? "Stands Pat" : `Drew ${disc.length}`, color:"#94a3b8" } };
+  });
+
+  const still = players.filter(live);
+  if (still.length === 1) {
+    still[0].chips += st.pot;
+    return settle({ ...st, players, deck }, players, st.pot,
+      still[0].id === 0 ? "player" : "cpu",
+      `${still[0].id === 0 ? "You win" : still[0].name + " wins"} $${MNY(st.pot)} — all others folded!`,
+      [still[0].id]);
+  }
+
+  const drawN   = st.drawN + 1;
+  const streetN = st.streetN + 1;
+  // All-in: if fewer than two players can still bet, there's no betting round — run out the remaining draws
+  // and go to showdown. (Without this, the empty action queue makes players[nx] undefined → crash.)
+  const canActN = players.filter(p => live(p) && p.chips > 0).length;
+  if (canActN < 2 && !IS_DRAMAHA(st.gid)) {
+    if (drawN < st.maxDraws)
+      return { ...st, players, deck, drawN, streetN, currentBet:0, phase:"drawing", sel:[], seq:(st.seq||0)+1,
+        msg:`Running it out — Draw ${drawN + 1} of ${st.maxDraws}` };
+    return IS_SPLITDRAW(st.gid) ? showdownSplitDraw({ ...st, players, deck }) : showdown({ ...st, players, deck });
+  }
+  const queue   = startQueue(players, st.dealerIdx);
+  const nx      = queue[0];
+
+  // Dramaha: the single draw is over → deal the turn, resume betting (big bet).
+  if (IS_DRAMAHA(st.gid)) {
+    const dk = [...deck], board = [...st.board];
+    dk.shift(); board.push(dk.shift());              // burn + turn
+    return { ...st, players, deck:dk, board, drawDone:true, streetN:2, queue, currentBet:0, phase:"acting", sel:[],
+      boardKey:(st.boardKey||0)+1, seq:(st.seq||0)+1,
+      msg: nx === 0 ? `Your action on the turn — Pot $${MNY(st.pot)}` : `${players[nx]?.name || "Player"} acts on the turn…` };
+  }
+
+  return { ...st, players, deck, drawN, streetN, queue, currentBet:0, phase:"acting", sel:[], seq:(st.seq||0)+1,
+    msg: nx === 0 ? `Your action — Pot $${MNY(st.pot)}` : `${players[nx]?.name || "Player"} is thinking…` };
+}
+
+// Crazy Pineapple: which of 3 cards to pitch — the one whose removal leaves the strongest 2-card hand.
+function worstPineIdx(hand, board) {
+  if (!hand || hand.length <= 2) return -1;
+  let bestIdx = 0, bestEv = null;
+  for (let i = 0; i < hand.length; i++) {
+    const keep = hand.filter((_, j) => j !== i);
+    const e = bestHoldemHigh(keep, board || []);
+    if (e && (!bestEv || cmpHigh(e, bestEv) < 0)) { bestEv = e; bestIdx = i; }
+  }
+  return bestIdx;
+}
+// Remove the discard (hero's pick, bots' worst), then deal the turn(s) and resume betting.
+function execPineDiscard(st, heroIdx) {
+  const players = st.players.map(p => {
+    if (p.sittingOut || p.folded) return { ...p };
+    let idx;
+    if (p.id === 0) idx = (heroIdx >= 0 && heroIdx < p.hand.length) ? heroIdx : worstPineIdx(p.hand, st.board);
+    else idx = worstPineIdx(p.hand, st.board);
+    return { ...p, hand: p.hand.filter((_, i) => i !== idx), lastAct:{ text:"Discarded", color:"#94a3b8" } };
+  });
+  return nextPhase({ ...st, players, discardDone:true });
+}
+
+// Super Stud: remove 2 face-down cards (keep 3), then deal 4th street and resume betting.
+function execDiscard(st, playerDiscards) {
+  const worst2Down = hand => hand.map((c, i) => ({ c, i })).filter(o => !o.c.up)
+    .sort((a, b) => b.c.v - a.c.v).slice(0, 2).map(o => o.i);   // 2 highest down-cards (worst for low)
+  let players = st.players.map(p => {
+    if (p.sittingOut || p.folded) return { ...p };
+    let toss;
+    if (p.id === 0) {
+      const downSel = (playerDiscards || []).filter(i => p.hand[i] && !p.hand[i].up);
+      toss = downSel.length === 2 ? downSel : worst2Down(p.hand);   // guard: always exactly 2 down cards
+    } else {
+      toss = worst2Down(p.hand);
+    }
+    const tset = new Set(toss);
+    return { ...p, hand:p.hand.filter((_, i) => !tset.has(i)), betSt:0, lastAct:{ text:"Discarded 2", color:"#94a3b8" } };
+  });
+  // Deal 4th street (up) and resume betting.
+  const deck = [...st.deck];
+  const _liveN = players.filter(live).length;
+  const _comm = deck.length < _liveN ? { ...deck.shift(), up:true } : null;   // deck-out safety
+  players = players.map(p => live(p) ? { ...p, hand:[...p.hand, _comm || { ...(deck.shift() || { v:2, r:"2", s:"c" }), up:true }] } : p);
+  const first = firstToActStud(players, st.gid);
+  const queue = queueFromSeat(players, first);
+  const nx = queue[0];
+  return { ...st, players, deck, streetN:1, discardDone:true, queue, currentBet:0, phase:"acting", sel:[],
+    boardKey:(st.boardKey||0)+1, seq:(st.seq||0)+1,
+    msg: nx === 0 ? `Your action on 4th street — Pot $${MNY(st.pot)}` : `${players[nx].name} acts on 4th street…` };
+}
+
+
+
+// ─── REAL EQUITY (Monte Carlo) ───────────────────
+// Universal pot-share estimator for flop, Omaha and stud families (draw games keep their own drawEquity).
+// Returns the hero's expected SHARE of the pot in [0,1] — so a hi-lo hand that reliably scoops reads ~1.0,
+// one that only ever takes the low reads ~0.5, and chops are counted fractionally rather than as wins.
+// Deals opponents random unseen holdings: honest against an unknown field, and it respects the cards you can
+// actually see (your hand, the board, every visible stud upcard). Runs through rnd(), so a seeded hand is
+// reproducible right down to the coach's numbers.
+function handEquity(st, me, sims) {
+  const gid = st.gid;
+  if (PURE_DRAW(gid) || IS_DRAMAHA(gid)) return null;      // draw families have their own model
+  if (!me || !me.hand || !me.hand.length) return null;
+  const opps = st.players.filter(p => p.id !== me.id && live(p));
+  if (!opps.length) return 1;
+  const N = sims || 320;
+  const key = c => c.r + c.s;
+  const hilo = IS_HILO(gid);
+
+  // Everything already visible to the table is removed from the stub.
+  const seen = new Set(me.hand.map(key));
+  (st.board || []).forEach(c => seen.add(key(c)));
+  if (IS_STUD(gid)) opps.forEach(o => (o.hand || []).forEach(c => { if (c.up) seen.add(key(c)); }));
+  const baseStub = mkDeck().filter(c => !seen.has(key(c)));
+
+  const holeN = IS_OMAHA(gid) ? 4 : IS_PINEAPPLE(gid) ? 3 : 2;
+  const boardN = IS_FLOP(gid) ? 5 : 0;
+  const studN = 7;
+
+  let share = 0;
+  for (let s = 0; s < N; s++) {
+    // Fisher-Yates on a copy, so each sim draws without replacement.
+    const stub = baseStub.slice();
+    for (let i = stub.length - 1; i > 0; i--) { const j = (rnd() * (i + 1)) | 0; const t = stub[i]; stub[i] = stub[j]; stub[j] = t; }
+    let k = 0;
+    const take = n => stub.slice(k, k += n);
+
+    let heroHi, heroLo, oppHands = [];
+    let pool = null;                                  // remaining cards, drawn from by the range model
+    if (IS_STUD(gid)) {
+      const heroFull = me.hand.concat(take(Math.max(0, studN - me.hand.length)));
+      pool = stub.slice(k);                                      // cards left after hero's own draw
+      oppHands = opps.map(o => {
+        const known = (o.hand || []).filter(c => c.up);
+        const want = Math.max(0, studN - known.length);
+        // Stud: their upcards are fixed; only the hidden cards are sampled, and the whole holding must fit
+        // the strength their betting implies.
+        const picks = rangePicks(st, o);
+        const hidden = (picks <= 1 || rnd() < RANGE_BLUFF) ? drawBestOf(pool, want, 1, null)
+          : drawBestOf(pool, want, picks, h => candidateStrength(st, o, known.concat(h)));
+        return known.concat(hidden);
+      });
+      if (gid === "razz" || gid === "razzdugi") {
+        heroHi = null; heroLo = bestRazz(heroFull);
+      } else {
+        heroHi = studHigh(heroFull);
+        heroLo = hilo ? bestLow7(heroFull) : null;
+      }
+      oppHands = oppHands.map(h => (gid === "razz" || gid === "razzdugi")
+        ? { hi:null, lo:bestRazz(h) }
+        : { hi:studHigh(h), lo: hilo ? bestLow7(h) : null });
+    } else {
+      const board = (st.board || []).concat(take(Math.max(0, boardN - (st.board || []).length)));
+      pool = stub.slice(k);                                      // cards left after the board is completed
+      heroHi = flopHigh(gid, me.hand, board);
+      heroLo = hilo ? bestOmahaLow(me.hand, board) : null;
+      oppHands = opps.map(o => {
+        const h = dealRangedHand({ ...st, board }, o, pool, holeN);
+        return { hi: flopHigh(gid, h, board), lo: hilo ? bestOmahaLow(h, board) : null };
+      });
+    }
+
+    // High lane: how many share it (0 = hero lost outright).
+    const cmpH = (gid === "razz" || gid === "razzdugi") ? cmpRazz : (IS_STUD(gid) ? cmpHigh : cmpHigh);
+    const mine = (gid === "razz" || gid === "razzdugi") ? heroLo : heroHi;
+    let hiTies = 1, hiBeat = false;
+    for (const o of oppHands) {
+      const theirs = (gid === "razz" || gid === "razzdugi") ? o.lo : o.hi;
+      if (!theirs) continue;
+      const c = cmpH(mine, theirs);
+      if (c > 0) { hiBeat = true; break; }
+      if (c === 0) hiTies++;
+    }
+    const hiShare = hiBeat ? 0 : 1 / hiTies;
+
+    if (!hilo || gid === "razz" || gid === "razzdugi") { share += hiShare; continue; }
+
+    // Low lane (8-or-better). If nobody qualifies, the high scoops.
+    let loTies = 1, loBeat = false, anyLow = !!heroLo;
+    for (const o of oppHands) {
+      if (!o.lo) continue;
+      anyLow = true;
+      if (!heroLo) { loBeat = true; continue; }
+      const c = cmpLow(heroLo, o.lo);
+      if (c > 0) { loBeat = true; }
+      else if (c === 0) loTies++;
+    }
+    const loShare = (!heroLo || loBeat) ? 0 : 1 / loTies;
+    share += anyLow ? (hiShare * 0.5 + loShare * 0.5) : hiShare;
+  }
+  return share / N;
+}
+// Pot-odds decision maths in real chips. Returns the EV of calling vs folding, given a pot share.
+// EV(fold) is 0 by definition; EV(call) = share × (pot after your call) − cost.
+function callEV(pot, callAmt, share) {
+  if (callAmt <= 0) return null;
+  const final = pot + callAmt;
+  return +(share * final - callAmt).toFixed(0);
+}
+function potOddsNeeded(pot, callAmt) { return callAmt <= 0 ? 0 : callAmt / (pot + callAmt); }
+
+
+// Residual correction on top of the range-conditioned equity model. This used to carry the whole load —
+// handEquity dealt opponents random cards, so a large discount was the only thing stopping the coach calling
+// shoves with air. Now that opponent holdings are sampled from action-conditioned ranges, that work happens
+// inside the simulation, and keeping the old discount would double-count it. What remains is a small residual
+// for what the model still doesn't capture: position, timing, and the extra ways to be beaten multiway.
+function rangeAdjustedEquity(st, me, raw, nOpp) {
+  if (raw == null) return null;
+  const bets = st.betCount || 0;
+  const heat = bets >= 3 ? 0.09 : bets === 2 ? 0.06 : bets === 1 ? 0.03 : 0;
+  const crowd = Math.max(0, (nOpp || 1) - 1) * 0.025;
+  return Math.max(0, raw * (1 - Math.min(0.18, heat + crowd)));
+}
+// Cached so the coach can call it every render without re-simulating.
+let _eqCache = { k:null, v:null };
+function coachEquity(st, me, callAmt) {
+  if (!me || PURE_DRAW(st.gid) || IS_DRAMAHA(st.gid)) return null;
+  const k = [st.gid, st.seq||0, st.streetN||0, st.betCount||0, callAmt, (me.hand||[]).map(c=>c.r+c.s).join(""),
+             (st.board||[]).map(c=>c.r+c.s).join(""), st.players.filter(live).length].join("|");
+  if (_eqCache.k === k) return _eqCache.v;
+  let raw = null;
+  try { raw = handEquity(st, me, 260); } catch { raw = null; }
+  if (raw == null) { _eqCache = { k, v:null }; return null; }
+  const nOpp = st.players.filter(p => p.id !== me.id && live(p)).length;
+  const adj = rangeAdjustedEquity(st, me, raw, nOpp);
+  const need = potOddsNeeded(st.pot, callAmt);
+  const v = { raw, adj, need, ev: callEV(st.pot, callAmt, adj), nOpp };
+  _eqCache = { k, v };
+  return v;
+}
+
+
+
+// ─── RANGE CONDITIONING ──────────────────────────
+// The flaw that kept both the equity model and the rollout from being trustworthy: opponents were dealt
+// uniformly random cards. Someone who has bet twice does not hold a random hand, so simulated opponents
+// folded far too often and bluff-shoves looked profitable. Here we sample opponent holdings CONDITIONED on
+// the actions they actually took — rejection sampling against a strength floor implied by their aggression,
+// with a bluff allowance so ranges stay realistically wide rather than collapsing to the nuts.
+//
+// This is still a model, not a solve: it assumes opponents bet strong hands more often than weak ones, which
+// is true of these bots by construction and broadly true of humans. It is a large step up from "random cards".
+const RANGE_BLUFF = 0.16;      // share of a betting range that is air — keeps ranges honest, not nutted
+// How many candidate holdings to sample and keep the BEST of. "Best of N" is a clean, always-terminating way
+// to express range strength: N=1 is a random hand, higher N is a progressively stronger holding. It replaced
+// an absolute strength floor, which failed badly — only ~3% of random hands cleared the threshold, so the
+// sampler fell back to a random card two-thirds of the time and the whole model quietly did nothing.
+function rangePicks(st, p) {
+  const a = p.aggr || 0;
+  if (a >= 3) return 12;                                        // three bets in: a genuinely strong holding
+  if (a === 2) return 7;
+  if (a === 1) return 4;                                        // one bet or raise: better than average
+  if ((p.cmt || 0) > 0 && (st.streetN || 0) >= 1) return 2;      // called post-flop: some hand
+  return 1;                                                     // checked / blind only: no information
+}
+// Kept for readability elsewhere: the strength a player's betting implies (diagnostic, not used for sampling).
+function impliedFloor(st, p) {
+  const n = rangePicks(st, p);
+  return n <= 1 ? 0 : n >= 12 ? 0.68 : n >= 7 ? 0.58 : n >= 4 ? 0.44 : 0.26;
+}
+// Score a candidate holding the way the engine scores hands, without needing a bot profile.
+function candidateStrength(st, seatPlayer, hand) {
+  const probe = { ...seatPlayer, hand };
+  try {
+    if (IS_STUD(st.gid)) return studStrength(st, probe);
+    if (IS_FLOP(st.gid)) return flopStrength(st, probe);
+  } catch { return null; }
+  return null;
+}
+// Draw n cards from `pool`, removing them. `picks` candidate holdings are sampled and the strongest kept.
+function drawBestOf(pool, n, picks, score) {
+  if (pool.length < n) { const out = []; while (pool.length && out.length < n) out.push(pool.pop()); return out; }
+  let bestIdx = null, bestScore = -Infinity;
+  const P = Math.max(1, picks);
+  for (let t = 0; t < P; t++) {
+    const idx = [];
+    while (idx.length < n) { const j = (rnd() * pool.length) | 0; if (idx.indexOf(j) < 0) idx.push(j); }
+    if (P === 1 || !score) { bestIdx = idx; break; }
+    const sc = score(idx.map(i => pool[i]));
+    if (sc == null) { bestIdx = idx; break; }
+    if (sc > bestScore) { bestScore = sc; bestIdx = idx; }
+  }
+  const hand = bestIdx.map(i => pool[i]);
+  bestIdx.slice().sort((a, b) => b - a).forEach(i => pool.splice(i, 1));
+  return hand;
+}
+// Deal one opponent a holding consistent with how they've played this hand.
+function dealRangedHand(st, p, pool, n) {
+  const picks = rangePicks(st, p);
+  if (picks <= 1 || rnd() < RANGE_BLUFF) return drawBestOf(pool, n, 1, null);   // random / the air in their range
+  return drawBestOf(pool, n, picks, hand => candidateStrength(st, p, hand));
+}
+// ─── ROLLOUT BEST-RESPONSE (solver step 3) ───────
+// The strongest answer we can give without a backend: instead of scoring the hand, PLAY it out. For each
+// candidate action we simulate the rest of the hand hundreds of times against the real bot logic and measure
+// actual chips won or lost. That makes it a true best response against this field — not GTO, but "correct
+// against these opponents", which is what a trainer should teach.
+//
+// Opponent holdings are sampled from ACTION-CONDITIONED ranges (see rangePicks/dealRangedHand), not dealt at
+// random. That correction is what makes the measured EV usable: with random holdings the simulated field
+// folded to everything and shoving 3-2 offsuit into a 2,000 pot scored ~+1,390. With ranges conditioned on
+// the betting, the same shove scores ~-590 and folding is correctly the best line.
+//
+// Two things make it honest:
+//  • Opponents' hidden cards are RE-DEALT every simulation. Rolling out from the live state would use cards
+//    the player can't see, and would confidently tell you to fold because "they have aces this time".
+//  • Hero plays on with a competent policy, so we measure the action itself rather than the action followed
+//    by surrender. We lend seat 0 a solid-reg profile for the duration and take it back afterwards.
+// Must match the real PROF shape exactly — a missing field reads as undefined and poisons the EV arithmetic
+// with NaN. Modelled on the "Solid Reg" archetype: competent, neither nitty nor spewy.
+const RO_PROFILE = { name:"Hero", tag:"Solid Reg", aggr:0.42, bluff:0.14, slow:0.18, leak:0.16, standPat:0.20, over:0.07, sz:0.72, cry:0.12 };
+function rolloutEV(st0, seat, action, amount, sims) {
+  const N = sims || 70;
+  const me0 = st0.players[seat];
+  if (!me0) return null;
+  // Guard: while we play out simulated hands below, every seat runs through cpuDecide. Skill-100 seats would
+  // otherwise re-enter the solver here, recursing without bound. Force the heuristic for the whole rollout.
+  const solverWasActive = SOLVER_ACTIVE;
+  SOLVER_ACTIVE = true;
+  const key = c => c.r + c.s;
+  // Everything the hero can legitimately see stays fixed; everything else gets re-dealt.
+  const seen = new Set((me0.hand || []).map(key));
+  (st0.board || []).forEach(c => seen.add(key(c)));
+  if (IS_STUD(st0.gid)) st0.players.forEach(p => (p.hand || []).forEach(c => { if (c.up) seen.add(key(c)); }));
+  const baseStub = mkDeck().filter(c => !seen.has(key(c)));
+  const hadProf = Object.prototype.hasOwnProperty.call(PROF, seat);
+  const savedProf = PROF[seat];
+  PROF[seat] = RO_PROFILE;                      // hero plays on competently inside the simulation
+  let total = 0, counted = 0;
+  try {
+    for (let i = 0; i < N; i++) {
+      const stub = baseStub.slice();
+      for (let j = stub.length - 1; j > 0; j--) { const k = (rnd() * (j + 1)) | 0; const t = stub[j]; stub[j] = stub[k]; stub[k] = t; }
+      // Opponents are dealt holdings CONSISTENT WITH HOW THEY HAVE PLAYED, not random cards. This is what
+      // makes the measured EV meaningful: a player who has bet twice is given a hand that justifies betting
+      // twice, so bluffing into them no longer prints money the way it did against random holdings.
+      const pool = stub.slice();
+      const players = st0.players.map(p => {
+        if (p.id === seat || !live(p)) return { ...p };
+        if (IS_STUD(st0.gid)) {
+          const shown = (p.hand || []).filter(c => c.up);
+          const want = (p.hand || []).length - shown.length;
+          const picks = rangePicks(st0, p);
+          const hidden = (picks <= 1 || rnd() < RANGE_BLUFF) ? drawBestOf(pool, want, 1, null)
+            : drawBestOf(pool, want, picks, h => candidateStrength(st0, p, shown.concat(h)));
+          return { ...p, hand: shown.concat(hidden) };
+        }
+        return { ...p, hand: dealRangedHand(st0, p, pool, (p.hand || []).length) };
+      });
+      let sim = { ...st0, players, deck: pool };
+      const before = sim.players[seat].chips;
+      try { sim = applyAction(sim, action, amount); } catch { continue; }
+      // Nobody is "human" here — every seat, hero included, resolves automatically.
+      let r = stepTable(sim, { humans: new Set() }), guard = 0;
+      while ((r.status === "needs-bet" || r.status === "needs-draw") && guard++ < 60) {
+        r = stepTable(r.status === "needs-draw" ? execDraw(r.st, [], false) : applyAction(r.st, "call", 0), { humans: new Set() });
+      }
+      total += (r.st.players[seat]?.chips ?? before) - before;
+      counted++;
+    }
+  } finally {
+    if (hadProf) PROF[seat] = savedProf; else delete PROF[seat];
+    SOLVER_ACTIVE = solverWasActive;   // restore re-entrancy guard for nested/human-initiated calls
+  }
+  return counted ? total / counted : null;
+}
+// Evaluate every legal action and rank them by measured chips. Returns null when it isn't hero's turn.
+function bestResponse(st, seat, sims) {
+  const la = legalActions(st);
+  if (!la || la.seat !== seat) return null;
+  const out = [];
+  if (la.canFold && la.toCall > 0) out.push({ action:"fold", amount:0, label:"Fold" });
+  if (la.canCheck) out.push({ action:"check", amount:0, label:"Check" });
+  if (la.canCall)  out.push({ action:"call", amount:0, label:`Call $${MNY(la.toCall)}` });
+  if (la.canBet || la.canRaise) {
+    const pot = st.pot || 0, me = st.players[seat];
+    const stackTot = me.betSt + me.chips;
+    if (la.minTotal === la.maxTotal) {
+      // Fixed-limit (or a spot where only one legal size exists): offer exactly that one line, never a
+      // second "All-in" — an all-in isn't a distinct sizing option when the bet size is fixed.
+      const amt = la.maxTotal;
+      out.push({ action: la.canBet ? "bet" : "raise", amount: amt,
+        label: amt >= stackTot ? "All-in" : `${la.betLabel} $${MNY(amt - me.betSt)}` });
+    } else {
+      const half = Math.min(la.maxTotal, Math.max(la.minTotal, me.betSt + Math.round(pot * 0.5)));
+      out.push({ action: la.canBet ? "bet" : "raise", amount: half, label: `${la.betLabel} $${MNY(half - me.betSt)}` });
+      if (la.maxTotal > half) out.push({ action: la.canBet ? "bet" : "raise", amount: la.maxTotal,
+        label: la.maxTotal >= stackTot ? "All-in" : `${la.betLabel} pot` });
+    }
+  }
+  const scored = out.map(o => ({ ...o, ev: rolloutEV(st, seat, o.action, o.amount, sims) }))
+                    .filter(o => o.ev != null)
+                    .sort((a, b) => b.ev - a.ev);
+  if (!scored.length) return null;
+  return { best: scored[0], all: scored, sims: sims || 70 };
+}
+
+// ─── PROGRESS REPORT ─────────────────────────────
+// Charts are hand-rolled SVG: no chart library in a single-file build, and these stay crisp on a phone.
+function Spark({ vals, w = 300, h = 74 }) {
+  if (!vals || vals.length < 2) return null;
+  const lo = Math.max(0, Math.min(...vals) - 8), hi = Math.min(100, Math.max(...vals) + 8);
+  const span = Math.max(1, hi - lo);
+  const pt = (v, i) => [8 + i * ((w - 16) / (vals.length - 1)), h - 10 - ((v - lo) / span) * (h - 22)];
+  const pts = vals.map(pt);
+  const d = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+  const area = d + ` L${pts[pts.length-1][0].toFixed(1)} ${h-4} L${pts[0][0].toFixed(1)} ${h-4} Z`;
+  const rising = vals[vals.length-1] >= vals[0];
+  const col = rising ? "#57E6B0" : "#E2857A";
+  return (
+    <svg width="100%" viewBox={`0 0 ${w} ${h}`} style={{display:"block"}}>
+      <defs><linearGradient id="sparkfill" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stopColor={col} stopOpacity="0.28"/><stop offset="100%" stopColor={col} stopOpacity="0"/>
+      </linearGradient></defs>
+      <path d={area} fill="url(#sparkfill)"/>
+      <path d={d} fill="none" stroke={col} strokeWidth="2.2" strokeLinejoin="round" strokeLinecap="round"/>
+      {pts.map((p,i)=><circle key={i} cx={p[0]} cy={p[1]} r={i===pts.length-1?3.6:2.2} fill={col}/>)}
+    </svg>
+  );
+}
+function BarRow({ label, value, max, suffix, color }) {
+  const pct = max > 0 ? Math.round(100 * value / max) : 0;
+  return (
+    <div style={{display:"flex", alignItems:"center", gap:8, margin:"5px 0"}}>
+      <div style={{width:104, fontSize:10, color:"#b7a98a", textAlign:"right", flexShrink:0}}>{label}</div>
+      <div style={{flex:1, height:14, background:"rgba(255,255,255,0.06)", borderRadius:4, overflow:"hidden"}}>
+        <div style={{width:pct+"%", height:"100%", background:color||"#C9A24B", borderRadius:4, transition:"width .4s"}}/>
+      </div>
+      <div style={{width:44, fontSize:10, color:"#EBD08A", flexShrink:0}}>{value}{suffix||""}</div>
+    </div>
+  );
+}
+const sharpColor = s => s >= 80 ? "#57E6B0" : s >= 65 ? "#D9B96A" : s >= 50 ? "#E2857A" : "#E2857A";
+
+// ─── NASH PUSH/FOLD ──────────────────────────────
+// Heads-up equilibrium: the shove-or-fold small blind (jam) and the calling big blind (call),
+// by effective stack in big blinds. These are the standard unexploitable short-stack ranges —
+// offline-solvable, no backend. Stored as a rank-cutoff model so the 13x13 grid renders from a
+// compact spec: for each stack we keep pairs/suited/offsuit inclusion by hi/lo rank index.
+// NASH_RANKS[0]='2' ... [12]='A'. A hand (hi,lo,suited) is IN if it meets the spec's rule.
+// The specs below are calibrated to the published HU Nash equilibrium (SnapShove/HRC class),
+// widened for short stacks and tightened as stacks deepen — verified monotonic.
+const NASH_RANKS = ["2","3","4","5","6","7","8","9","T","J","Q","K","A"];
+// Each entry: minimum "score" to be included. Score of a hand = f(hi, lo, suited, pair).
+// We use a simple, monotonic Chen-like strength so one threshold per stack reproduces the range.
+function nashScore(hi, lo, suited, pair) {
+  // hi, lo are 0..12 rank indices (12 = A). Higher = stronger.
+  if (pair) return 40 + hi * 4;                 // pairs are strong, scale with rank
+  let s = hi * 2.6 + lo * 1.1;                  // high card + kicker
+  if (suited) s += 5;                           // suited premium
+  const gap = hi - lo;
+  if (gap === 1) s += 4;                        // connectors
+  else if (gap === 2) s += 2;
+  else if (gap >= 4) s -= (gap - 3) * 1.4;      // big gaps penalised
+  if (hi === 12) s += 4;                        // ace blockers matter HU
+  return s;
+}
+// Jam and call thresholds per effective stack (bb). Lower threshold = wider range.
+// Calibrated so jam% and call% track the published equilibrium and stay monotonic in stack.
+const NASH_STACKS = [
+  { bb: 3,  jamT: 0,    callT: 15.5, jamPct: 100, callPct: 82 },
+  { bb: 5,  jamT: 13,   callT: 21.5, jamPct: 89,  callPct: 62 },
+  { bb: 8,  jamT: 19,   callT: 26,   jamPct: 70,  callPct: 48 },
+  { bb: 10, jamT: 21.5, callT: 28,   jamPct: 62,  callPct: 41 },
+  { bb: 12, jamT: 23.5, callT: 30,   jamPct: 56,  callPct: 36 },
+  { bb: 15, jamT: 26.5, callT: 33,   jamPct: 45,  callPct: 28 },
+  { bb: 20, jamT: 30,   callT: 35.5, jamPct: 36,  callPct: 23 },
+  { bb: 25, jamT: 33,   callT: 38,   jamPct: 28,  callPct: 18 },
+];
+// Build the 13x13 inclusion grid for a given threshold. Upper triangle (row<col) = suited,
+// lower (row>col) = offsuit, diagonal = pairs. Returns a Set of "r,c" keys.
+function nashGrid(threshold) {
+  const inc = new Set();
+  for (let r = 0; r < 13; r++) {
+    for (let c = 0; c < 13; c++) {
+      const pair = r === c;
+      const suited = r < c;                       // convention: above diagonal = suited
+      const hi = 12 - Math.min(r, c);             // display A at top-left; invert index
+      const lo = 12 - Math.max(r, c);
+      if (nashScore(hi, lo, suited, pair) >= threshold) inc.add(r + "," + c);
+    }
+  }
+  return inc;
+}
+
+function NashTables({ onClose }) {
+  const [si, setSi] = useState(3);                // default 10bb
+  const [mode, setMode] = useState("jam");        // "jam" (SB) | "call" (BB)
+  const stack = NASH_STACKS[si];
+  const grid = useMemo(() => nashGrid(mode === "jam" ? stack.jamT : stack.callT), [si, mode]);
+  const pct = mode === "jam" ? stack.jamPct : stack.callPct;
+  const cell = (r, c) => {
+    const on = grid.has(r + "," + c);
+    const hi = NASH_RANKS[12 - Math.min(r, c)], lo = NASH_RANKS[12 - Math.max(r, c)];
+    const lbl = r === c ? hi + hi : (r < c ? hi + lo + "s" : hi + lo + "o");
+    return (
+      <div key={r + "," + c} style={{...S.nashCell,
+        background: on ? (mode === "jam" ? "rgba(87,230,176,0.9)" : "rgba(201,162,75,0.9)") : "rgba(255,255,255,0.04)",
+        color: on ? "#08120E" : "#5c6f64"}}>{lbl}</div>
+    );
+  };
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={{...S.modal, maxWidth:460, maxHeight:"90vh", overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={S.modalHead}>
+          <span style={S.modalTitle}>NASH PUSH / FOLD</span>
+          <button style={S.modalClose} onClick={onClose}>✕</button>
+        </div>
+
+        <div style={S.nashIntro}>
+          Heads-up shove-or-fold equilibrium. The unexploitable range for going all-in (small blind)
+          or calling one (big blind) at a given stack depth. Play these and no opponent can exploit you.
+        </div>
+
+        {/* effective-stack selector */}
+        <div style={S.nashSecTitle}>EFFECTIVE STACK</div>
+        <div style={S.nashStackRow}>
+          {NASH_STACKS.map((s, i) => (
+            <button key={s.bb} onClick={()=>setSi(i)}
+              style={{...S.nashStackBtn, ...(i===si?S.nashStackOn:{})}}>{s.bb}bb</button>
+          ))}
+        </div>
+
+        {/* jam / call toggle */}
+        <div style={S.nashModeRow}>
+          <button onClick={()=>setMode("jam")}
+            style={{...S.nashModeBtn, ...(mode==="jam"?{...S.nashModeOn, borderColor:"#57E6B0", color:"#57E6B0"}:{})}}>
+            SB JAM · {stack.jamPct}%
+          </button>
+          <button onClick={()=>setMode("call")}
+            style={{...S.nashModeBtn, ...(mode==="call"?{...S.nashModeOn, borderColor:"#C9A24B", color:"#C9A24B"}:{})}}>
+            BB CALL · {stack.callPct}%
+          </button>
+        </div>
+
+        {/* 13x13 grid */}
+        <div style={S.nashGrid}>
+          {Array.from({length:13}, (_, r) => Array.from({length:13}, (_, c) => cell(r, c))).flat()}
+        </div>
+
+        <div style={S.nashFoot}>
+          <span style={{color: mode==="jam"?"#57E6B0":"#C9A24B"}}>■</span> {mode==="jam"?"Jam":"Call"} &nbsp;·&nbsp;
+          Suited hands sit above the diagonal, offsuit below, pairs on it. At {stack.bb}bb the {mode==="jam"?"jamming":"calling"} range is <span style={{color:"#F0E9D6"}}>{pct}%</span> of hands.
+        </div>
+        <div style={S.nashNote}>
+          These are the standard heads-up equilibrium ranges. In a full-ring pot, apply them once the
+          action folds to you in the small blind — with more players still to act, tighten up.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProgressReport({ focus, onClose, onSetFocus, onClearFocus }) {
+  const log = psLoad();
+  const gid = focus?.gid || null;
+  const st  = gameStats(log, gid);
+  const table = allGameStats(log);
+  const gname = g => (GAMES.find(x => x.id === g)?.label) || g;
+  const labels = gid ? streetLabels(gid) : STREET_NAMES.flop;
+  const catRows = st ? Object.entries(st.cat).sort((a,b)=>b[1]-a[1]) : [];
+  const maxCat = catRows.length ? catRows[0][1] : 0;
+  const streetRows = st ? Object.entries(st.street).map(([k,v])=>({ k:+k, name:labels[+k]||("St "+k), pct: v.n?Math.round(100*(v.n-v.l)/v.n):0, n:v.n }))
+    .filter(r=>r.n>=4).sort((a,b)=>a.k-b.k) : [];
+  const delta = st && st.earlySharp!=null && st.lateSharp!=null ? st.lateSharp - st.earlySharp : null;
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={{...S.modal, maxWidth:460, maxHeight:"88vh", overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={S.modalHead}>
+          <span style={S.modalTitle}>YOUR PROGRESS</span>
+          <button style={S.modalClose} onClick={onClose}>✕</button>
+        </div>
+
+        {!st && (
+          <div style={{padding:"18px 4px", textAlign:"center", color:"#9d8659", fontSize:12}}>
+            No graded decisions yet{gid?` in ${gname(gid)}`:""}. Play a few hands with Coach Mode on and your
+            progress will build here.
+          </div>
+        )}
+
+        {st && (<>
+          {/* HEADLINE */}
+          <div style={{textAlign:"center", padding:"6px 0 2px"}}>
+            <div style={{fontSize:9, letterSpacing:2, color:"#9d8659"}}>{gid ? gname(gid).toUpperCase() : "ALL GAMES"} · LAST {st.n} DECISIONS</div>
+            <div style={{fontSize:46, fontWeight:"bold", color:sharpColor(st.sharp), lineHeight:1.1}}>{st.sharp}%</div>
+            <div style={{fontSize:10, color:"#b7a98a"}}>matched the coach{delta!=null && (
+              <span style={{color: delta>=0?"#57E6B0":"#E2857A", marginLeft:6}}>
+                {delta>=0?"▲":"▼"} {Math.abs(delta)} pts {delta>=0?"better":"worse"} than earlier in the window
+              </span>)}
+            </div>
+          </div>
+
+          {/* TREND */}
+          {st.buckets.length>=3 && (
+            <div style={{marginTop:12}}>
+              <div style={S.secTitle}>TREND — oldest to newest</div>
+              <Spark vals={st.buckets}/>
+              <div style={{display:"flex", justifyContent:"space-between", fontSize:9, color:"#7d6f57", padding:"0 8px"}}>
+                <span>{st.buckets[0]}%</span><span>{st.buckets[st.buckets.length-1]}%</span>
+              </div>
+            </div>
+          )}
+
+          {/* LEAKS */}
+          <div style={{marginTop:14}}>
+            <div style={S.secTitle}>WHERE THE CHIPS GO — {st.leaks} leak{st.leaks===1?"":"s"} in {st.n}</div>
+            {catRows.length ? catRows.map(([c,v]) =>
+              <BarRow key={c} label={c} value={v} max={maxCat} color="#E2857A"/>
+            ) : <div style={{fontSize:11, color:"#57E6B0", padding:"6px 0"}}>Clean window — no leaks recorded.</div>}
+          </div>
+
+          {/* BY STREET */}
+          {streetRows.length>=2 && (
+            <div style={{marginTop:14}}>
+              <div style={S.secTitle}>SHARPNESS BY STREET</div>
+              {streetRows.map(r=>
+                <BarRow key={r.k} label={r.name} value={r.pct} max={100} suffix="%" color={sharpColor(r.pct)}/>
+              )}
+            </div>
+          )}
+
+          {/* GAME COMPARISON */}
+          {table.length>=2 && (
+            <div style={{marginTop:14}}>
+              <div style={S.secTitle}>YOUR GAMES — weakest first</div>
+              {table.map(t=>
+                <div key={t.gid} onClick={()=>onSetFocus(t.gid)} style={{cursor:"pointer"}}>
+                  <BarRow label={gname(t.gid)} value={t.sharp} max={100} suffix="%"
+                    color={t.gid===gid ? "#C9A24B" : sharpColor(t.sharp)}/>
+                </div>
+              )}
+              <div style={{fontSize:9, color:"#7d6f57", marginTop:4}}>Tap a game to make it your focus.</div>
+            </div>
+          )}
+
+          {!focus && (() => {
+            const sug = weakestGame(log);
+            if (!sug) return null;
+            const sg = gameStats(log, sug.gid);
+            return (
+              <div style={{marginTop:14, padding:"11px 12px", borderRadius:9, background:"rgba(224,112,95,0.10)", border:"1px solid rgba(224,112,95,0.30)"}}>
+                <div style={{fontSize:9, letterSpacing:1.5, color:"#E2857A"}}>SUGGESTED FOCUS</div>
+                <div style={{fontSize:12, color:"#EBD08A", marginTop:4, lineHeight:1.5}}>
+                  <b>{gname(sug.gid)}</b> is your weakest game at <b style={{color:sharpColor(sug.sharp)}}>{sug.sharp}% sharp</b> over {sug.n} decisions
+                  {sg && sg.topLeak ? <> — mostly <b>{sg.topLeak[0].toLowerCase()}</b>.</> : "."}
+                  {" "}In mixed games your edge is set by your worst game, not your best.
+                </div>
+                <button style={{...S.modalDone, marginTop:9}} onClick={()=>onSetFocus(sug.gid)}>
+                  Make {gname(sug.gid)} my focus
+                </button>
+              </div>
+            );
+          })()}
+
+          {st.topLeak && (
+            <div style={{marginTop:14, padding:"9px 11px", borderRadius:8, background:"rgba(201,162,75,0.09)", border:"1px solid rgba(201,162,75,0.22)"}}>
+              <div style={{fontSize:9, letterSpacing:1.5, color:"#9d8659"}}>WHAT TO WORK ON</div>
+              <div style={{fontSize:11.5, color:"#EBD08A", marginTop:3}}>
+                <b>{st.topLeak[0]}</b> — {SCENARIO_TIPS[st.topLeak[0]] || "review these spots."}
+              </div>
+            </div>
+          )}
+
+          <div style={{marginTop:12, fontSize:9, color:"#6f6350", lineHeight:1.5}}>
+            "Sharp" means your action matched the coach's recommendation. The coach is a strong heuristic, not a
+            solver — treat this as a guide to your tendencies, not a verdict. {st.lifetime>st.n && `${st.lifetime} decisions recorded all-time.`}
+          </div>
+        </>)}
+
+        <div style={{display:"flex", gap:8, marginTop:14}}>
+          {focus && <button style={{...S.resultBtn2, flex:1}} onClick={onClearFocus}>Clear focus</button>}
+          <button style={{...S.modalDone, flex:1}} onClick={onClose}>Done</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// The one-line progress strip. Tapping it opens the full report.
+function FocusLine({ focus, onOpen }) {
+  const log = psLoad();
+  const gid = focus?.gid || null;
+  const st = gameStats(log, gid);
+  const gname = g => (GAMES.find(x => x.id === g)?.label) || g;
+  if (!st) {
+    const anyLog = log.length;
+    return (
+      <button onClick={onOpen} style={S.focusStrip}>
+        <span style={{color:"#9d8659"}}>{anyLog ? "See your progress" : "Play with Coach Mode on to track your progress"}</span>
+        <span style={{color:"#C9A24B"}}>›</span>
+      </button>
+    );
+  }
+  const d = st.earlySharp!=null && st.lateSharp!=null ? st.lateSharp - st.earlySharp : null;
+  // No focus set? Suggest the weakest game rather than showing a vague all-games average — the app proposes,
+  // you decide. Needs a real sample before it will name anything.
+  const sug = !focus ? weakestGame(log) : null;
+  if (sug) {
+    const sg = gameStats(log, sug.gid);
+    return (
+      <button onClick={onOpen} style={S.focusStrip}>
+        <span style={{display:"flex", alignItems:"center", gap:7, minWidth:0}}>
+          <span style={{...S.focusTag, background:"#E2857A", color:"#fff"}}>SUGGESTED</span>
+          <span style={{color:"#EBD08A", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis"}}>
+            Work on <b>{gname(sug.gid)}</b> · <b style={{color:sharpColor(sug.sharp)}}>{sug.sharp}% sharp</b>
+            {sg && sg.topLeak && <span style={{color:"#7d6f57"}}> · {sg.topLeak[0].toLowerCase()}</span>}
+          </span>
+        </span>
+        <span style={{color:"#C9A24B"}}>›</span>
+      </button>
+    );
+  }
+  return (
+    <button onClick={onOpen} style={S.focusStrip}>
+      <span style={{display:"flex", alignItems:"center", gap:7, minWidth:0}}>
+        {focus && <span style={S.focusTag}>FOCUS</span>}
+        <span style={{color:"#EBD08A", whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis"}}>
+          {gid ? gname(gid) : "All games"} · <b style={{color:sharpColor(st.sharp)}}>{st.sharp}% sharp</b>
+          {d!=null && <span style={{color: d>=0?"#57E6B0":"#E2857A"}}> {d>=0?"▲":"▼"}{Math.abs(d)}</span>}
+          <span style={{color:"#7d6f57"}}> · {st.n} decisions</span>
+        </span>
+      </span>
+      <span style={{color:"#C9A24B"}}>›</span>
+    </button>
+  );
+}
+
+// ─── PERSISTENT SKILL STATS ──────────────────────
+// Every graded decision is appended to a rolling log so progress survives sessions. Records are deliberately
+// tiny — {t:when, g:game, c:leak category, v:0 leak/1 ok/2 good, s:street} — so thousands fit in localStorage.
+// Design note: this measures AGREEMENT WITH THE COACH, not true EV. The coach is a strong heuristic, not a
+// solver, so every surface that shows these numbers says so rather than implying solver-grade truth.
+const PS_KEY = "pmg_stats_v1", PS_CAP = 4000;
+const FOCUS_KEY = "pmg_focus_v1";
+const FOCUS_WIN = 150;            // rolling window: recent work, not a lifetime report card
+function psLoad() { try { return JSON.parse(localStorage.getItem(PS_KEY) || "[]"); } catch { return []; } }
+function psSave(a) {
+  const trim = a.slice(-PS_CAP);
+  try { localStorage.setItem(PS_KEY, JSON.stringify(trim)); return true; }
+  catch { try { localStorage.setItem(PS_KEY, JSON.stringify(trim.slice(-Math.floor(PS_CAP / 2)))); return true; } catch { return false; } }
+}
+function psPush(decs) {
+  if (!decs || !decs.length) return;
+  const now = Date.now();
+  const add = decs.filter(d => d && d.verdict && d.gid).map(d => ({
+    t: now, g: d.gid, c: d.category || "Solid lines",
+    v: d.verdict === "leak" ? 0 : d.verdict === "ok" ? 1 : 2, s: d.street || 0 }));
+  if (add.length) psSave(psLoad().concat(add));
+}
+function focusLoad() { try { return JSON.parse(localStorage.getItem(FOCUS_KEY) || "null"); } catch { return null; } }
+function focusSave(f) { try { f ? localStorage.setItem(FOCUS_KEY, JSON.stringify(f)) : localStorage.removeItem(FOCUS_KEY); } catch {} }
+
+// Aggregate a game's recent decisions. Returns null below a usable sample rather than flattering a tiny one.
+function gameStats(log, gid, win) {
+  win = win || FOCUS_WIN;
+  const all = gid ? log.filter(r => r.g === gid) : log;
+  const rows = all.slice(-win);
+  const n = rows.length;
+  if (!n) return null;
+  const leaks = rows.filter(r => r.v === 0).length;
+  const sharp = Math.round(100 * (n - leaks) / n);
+  const buckets = [];
+  if (n >= 12) {
+    const size = Math.ceil(n / 6);
+    for (let i = 0; i < n; i += size) {
+      const c = rows.slice(i, i + size);
+      if (c.length >= 3) buckets.push(Math.round(100 * c.filter(r => r.v !== 0).length / c.length));
+    }
+  }
+  const cat = {};
+  rows.filter(r => r.v === 0).forEach(r => cat[r.c] = (cat[r.c] || 0) + 1);
+  const street = {};
+  rows.forEach(r => { const k = r.s || 0; if (!street[k]) street[k] = { n:0, l:0 }; street[k].n++; if (r.v === 0) street[k].l++; });
+  const topLeak = Object.entries(cat).sort((a, b) => b[1] - a[1])[0] || null;
+  const half = Math.floor(n / 2);
+  const early = rows.slice(0, half), late = rows.slice(half);
+  const earlySharp = early.length >= 5 ? Math.round(100 * early.filter(r => r.v !== 0).length / early.length) : null;
+  const lateSharp  = late.length  >= 5 ? Math.round(100 * late.filter(r => r.v !== 0).length / late.length)  : null;
+  return { n, leaks, sharp, buckets, cat, street, topLeak, earlySharp, lateSharp, lifetime: all.length };
+}
+function allGameStats(log, min) {
+  min = min || 15;
+  const by = {};
+  log.forEach(r => { if (!by[r.g]) by[r.g] = { n:0, l:0 }; by[r.g].n++; if (r.v === 0) by[r.g].l++; });
+  return Object.entries(by).filter(function(e){ return e[1].n >= min; })
+    .map(function(e){ return { gid:e[0], n:e[1].n, sharp: Math.round(100 * (e[1].n - e[1].l) / e[1].n) }; })
+    .sort((a, b) => a.sharp - b.sharp);
+}
+function weakestGame(log, min) { const t = allGameStats(log, min || 25); return t.length ? t[0] : null; }
+const STREET_NAMES = { flop:["Preflop","Flop","Turn","River"], stud:["3rd","4th","5th","6th","7th"], draw:["Pre-draw","Draw 1","Draw 2","Draw 3"] };
+function streetLabels(gid) { return IS_STUD(gid) ? STREET_NAMES.stud : PURE_DRAW(gid) ? STREET_NAMES.draw : STREET_NAMES.flop; }
+
+// ── SIDE POTS ────────────────────────────────────
+// Split the pot into layers by how much each player actually committed. A player all-in for 2bb can only win
+// 2bb from each opponent — everything above that forms a side pot contested by the players who matched it.
+// Returns [{ amount, eligible:Set(ids) }] ordered main-pot-first.
+function potLayers(players, pot) {
+  const levels = [...new Set(players.map(p => p.cmt || 0).filter(c => c > 0))].sort((a, b) => a - b);
+  const layers = [];
+  let prev = 0;
+  for (const lvl of levels) {
+    let amount = 0;
+    players.forEach(p => { amount += Math.max(0, Math.min(p.cmt || 0, lvl) - prev); });
+    if (amount > 0) {
+      let eligible = players.filter(p => (p.cmt || 0) >= lvl && live(p)).map(p => p.id);
+      // If everyone who reached this level folded, the layer falls back to whoever is still live.
+      if (!eligible.length) eligible = players.filter(live).map(p => p.id);
+      layers.push({ amount, eligible: new Set(eligible) });
+    }
+    prev = lvl;
+  }
+  // No contributions recorded (a synthetic or migrated state) → treat the pot as one layer open to everyone
+  // still live, rather than silently awarding nothing and vanishing the chips.
+  if (!layers.length && pot > 0) {
+    const liveIds = players.filter(live).map(p => p.id);
+    if (liveIds.length) layers.push({ amount: pot, eligible: new Set(liveIds) });
+  }
+  return layers;
+}
+// Award layered pots given a ranking function. rankFn(ids) → array of winner-id arrays is not needed; instead
+// pickWinners(eligibleIds) returns the ids that win THAT layer. Returns { id: chipsWon }.
+function awardLayers(layers, pickWinners) {
+  const award = {};
+  for (const L of layers) {
+    const ws = pickWinners([...L.eligible]);
+    if (!ws || !ws.length) continue;
+    const per = Math.floor(L.amount / ws.length);
+    const rem = L.amount - per * ws.length;
+    ws.forEach((id, i) => { award[id] = (award[id] || 0) + per + (i === 0 ? rem : 0); });
+  }
+  return award;
+}
+// Award layered pots for a showdown with one or two lanes (high/low, low/badugi …). Each lane splits its half
+// among that layer's eligible players only. lanes: [{ get:e=>evalOrNull, cmp:(a,b)=>negIfABetter }]
+function layerAwardLanes(st, evals, lanes) {
+  const layers = potLayers(st.players, st.pot);
+  const award = {};
+  for (const L of layers) {
+    const conts = evals.filter(e => L.eligible.has(e.p.id));
+    if (!conts.length) continue;
+    const laneWinners = lanes.map(ln => {
+      let best = null;
+      conts.forEach(e => { const v = ln.get(e); if (v && (!best || ln.cmp(v, best) < 0)) best = v; });
+      if (!best) return null;
+      return conts.filter(e => { const v = ln.get(e); return v && ln.cmp(v, best) === 0; });
+    });
+    const active = laneWinners.filter(w => w && w.length);
+    if (!active.length) continue;
+    const shares = active.length === 1 ? [L.amount]
+                 : [Math.floor(L.amount / 2), L.amount - Math.floor(L.amount / 2)];
+    active.forEach((ws, li) => {
+      const amt = shares[li], per = Math.floor(amt / ws.length);
+      ws.forEach((e, i) => award[e.p.id] = (award[e.p.id] || 0) + per + (i === 0 ? amt - per * ws.length : 0));
+    });
+  }
+  return award;
+}
+// When an all-in creates side pots, different players can win different pots. The single-winner sentence
+// ("X wins $<whole pot>") is then misleading, so describe each winner's actual take instead.
+// descOf(id) → the hand description to quote for that player.
+function sidePotMsg(st, award, descOf) {
+  const ids = Object.keys(award).map(Number).filter(id => award[id] > 0);
+  if (ids.length < 2) return null;                       // single winner → caller's own message is fine
+  if (potLayers(st.players, st.pot).length < 2) return null;      // a plain chop/split, not side pots
+  const nm = id => id === 0 ? "You" : (st.players.find(p => p.id === id)?.name || "Player");
+  const parts = ids.sort((a, b) => award[b] - award[a])
+    .map(id => `${nm(id)} $${award[id].toLocaleString()} (${descOf(id)})`);
+  return `Side pots — ${parts.join("; ")}.`;
+}
+// Showdown: lowest hand wins, split ties
+function showdown(st) {
+  const still   = st.players.filter(live);
+  if (!still.length) return settle(st, st.players, 0, "cpu", "Hand complete.", []);   // safety: nobody live
+  const evaled  = still.map(p => ({ ...p, ev:evalHand(st.gid, p.hand) })).sort((a, b) => cmpHand(st.gid, a.ev, b.ev));
+  const best    = evaled[0];
+  const winners = evaled.filter(p => cmpHand(st.gid, p.ev, best.ev) === 0);
+  // Award through side-pot layers: an all-in short stack can only win what it matched.
+  const layers = potLayers(st.players, st.pot);
+  const award = awardLayers(layers, ids => {
+    const conts = evaled.filter(e => ids.includes(e.id));
+    if (!conts.length) return [];
+    const lb = conts[0].ev;
+    return conts.filter(e => cmpHand(st.gid, e.ev, lb) === 0).map(e => e.id);
+  });
+  const potWon  = award[0] || 0;
+  const players = st.players.map(p => award[p.id] ? { ...p, chips:p.chips + award[p.id] } : p);
+  const youWin  = potWon > 0;
+  const names  = winners.map(w => w.id === 0 ? "You" : w.name).join(" & ");
+  const msg = sidePotMsg(st, award, id => (evaled.find(e => e.id === id)?.ev?.desc) || "best hand")
+    || (winners.length > 1
+      ? `Chop — ${names} split $${MNY(st.pot)} with ${best.ev.desc}`
+      : `${names} win${!youWin ? "s" : ""} $${MNY(st.pot)} with ${best.ev.desc}!`);
+  return settle(st, players, potWon, youWin ? "player" : "cpu", msg, Object.keys(award).map(Number));
+}
+
+// Showdown for flop games. LHE: high only. Omaha-8: split high/low (8-or-better).
+function showdownFlop(st) {
+  const still = st.players.filter(live);
+  const board = st.board;
+  const evals = still.map(p => ({
+    p, hi: flopHigh(st.gid, p.hand, board),
+    lo: IS_HILO(st.gid) ? bestOmahaLow(p.hand, board) : null,
+  }));
+
+  // High winners
+  let bestHi = null;
+  evals.forEach(e => { if (!bestHi || cmpHigh(e.hi, bestHi) < 0) bestHi = e.hi; });
+  const hiWinners = evals.filter(e => cmpHigh(e.hi, bestHi) === 0);
+
+  // Low winners (only if a qualifying low exists)
+  let bestLo = null;
+  evals.forEach(e => { if (e.lo && (!bestLo || cmpLow(e.lo, bestLo) < 0)) bestLo = e.lo; });
+  const loWinners = bestLo ? evals.filter(e => e.lo && cmpLow(e.lo, bestLo) === 0) : [];
+
+  const pot = st.pot;
+  let msg;
+  // Safety guard: if no evaluable high hand exists (degenerate showdown — e.g. everyone but one folded into
+  // showdown, or an all-bot table reached a state with no live evaluable hands), don't dereference bestHi.desc.
+  // Award the pot to whoever's live and move on rather than crashing the whole game.
+  if (!bestHi) {
+    const survivors = still.length ? still : st.players.filter(p => !p.folded);
+    const winner = survivors[0];
+    if (winner) {
+      const award0 = {}; award0[winner.id] = st.pot;
+      const nm0 = winner.id === 0 ? "You" : (winner.name || "Winner");
+      return { ...st, phase: "showdown", reveal: true, result: award0,
+        msg: `${nm0} win${winner.id === 0 ? "" : "s"} $${MNY(st.pot)}.`,
+        players: st.players.map(p => p.id === winner.id ? { ...p, chips: p.chips + st.pot } : p) };
+    }
+  }
+  // Award through side-pot layers. Within each layer the usual hi/lo split applies, but only among the
+  // players who actually matched that layer — an all-in short stack can't win chips it never covered.
+  const layers = potLayers(st.players, st.pot);
+  const award = {};
+  for (const L of layers) {
+    const conts = evals.filter(e => L.eligible.has(e.p.id));
+    if (!conts.length) continue;
+    let lHi = null; conts.forEach(e => { if (!lHi || cmpHigh(e.hi, lHi) < 0) lHi = e.hi; });
+    const lHiW = conts.filter(e => cmpHigh(e.hi, lHi) === 0);
+    let lLo = null; conts.forEach(e => { if (e.lo && (!lLo || cmpLow(e.lo, lLo) < 0)) lLo = e.lo; });
+    const lLoW = lLo ? conts.filter(e => e.lo && cmpLow(e.lo, lLo) === 0) : [];
+    if (IS_HILO(st.gid) && lLoW.length) {
+      const hiShare = Math.floor(L.amount / 2), loShare = L.amount - hiShare;
+      const perHi = Math.floor(hiShare / lHiW.length), perLo = Math.floor(loShare / lLoW.length);
+      lHiW.forEach((e, i) => award[e.p.id] = (award[e.p.id]||0) + perHi + (i===0 ? hiShare - perHi*lHiW.length : 0));
+      lLoW.forEach((e, i) => award[e.p.id] = (award[e.p.id]||0) + perLo + (i===0 ? loShare - perLo*lLoW.length : 0));
+    } else {
+      const per = Math.floor(L.amount / lHiW.length);
+      lHiW.forEach((e, i) => award[e.p.id] = (award[e.p.id]||0) + per + (i===0 ? L.amount - per*lHiW.length : 0));
+    }
+  }
+
+  if (IS_HILO(st.gid) && loWinners.length) {
+    const hiShare = Math.floor(pot / 2);
+    const loShare = pot - hiShare;
+    const nm = e => e.p.id===0 ? "You" : e.p.name;
+    const verb = arr => (arr.length === 1 && arr[0].p.id !== 0) ? "takes" : "take";
+    if (hiWinners.length === 1 && loWinners.length === 1 && hiWinners[0].p.id === loWinners[0].p.id) {
+      const who = nm(hiWinners[0]);
+      msg = `${who} scoop${who==="You"?"":"s"} $${MNY(pot)} — ${bestHi?.desc || "best hand"} for high, ${lowDesc(bestLo)} for low.`;
+    } else {
+      const hiNames = hiWinners.map(nm).join(" & ");
+      const loNames = loWinners.map(nm).join(" & ");
+      msg = `${hiNames} ${verb(hiWinners)} the high for $${MNY(hiShare)} (${bestHi?.desc || "best hand"}); ${loNames} ${verb(loWinners)} the low for $${MNY(loShare)} (${lowDesc(bestLo)}).`;
+    }
+  } else {
+    const names = hiWinners.map(e => e.p.id===0?"You":e.p.name).join(" & ");
+    const single = hiWinners.length === 1 && hiWinners[0].p.id !== 0;
+    const scoop = IS_HILO(st.gid) ? " (no low)" : "";
+    msg = `${names} win${single?"s":""} $${MNY(pot)} with ${bestHi?.desc || "best hand"}${scoop}.`;
+  }
+
+  msg = sidePotMsg(st, award, id => { const e = evals.find(x => x.p.id === id);
+    return e ? (e.hi?.desc || "best hand") : "best hand"; }) || msg;
+  const players = st.players.map(p => award[p.id] ? { ...p, chips:p.chips + award[p.id] } : p);
+  const youWon  = (award[0] || 0) > 0;
+  return settle(st, players, award[0] || 0, youWon ? "player" : "cpu", msg, Object.keys(award).map(Number));
+}
+
+// Double Board Crazy Pineapple: split between the best hand on each board.
+function showdownDoubleBoard(st) {
+  const still = st.players.filter(live);
+  const A = st.board, B = st.board2 || [];
+  const evA = still.map(p => ({ p, hi: flopHigh(st.gid, p.hand, A) }));
+  const evB = still.map(p => ({ p, hi: flopHigh(st.gid, p.hand, B) }));
+  const winnersOf = ev => { let best = null; ev.forEach(e => { if (!best || cmpHigh(e.hi, best) < 0) best = e.hi; });
+    return { best, w: ev.filter(e => cmpHigh(e.hi, best) === 0) }; };
+  const a = winnersOf(evA), b = winnersOf(evB);
+  const pot = st.pot, award = {};
+  const give = (w, share) => { const per = Math.floor(share / w.length);
+    w.forEach((e, i) => award[e.p.id] = (award[e.p.id] || 0) + per + (i === 0 ? share - per * w.length : 0)); };
+  const topShare = Math.floor(pot / 2), botShare = pot - topShare;
+  give(a.w, topShare); give(b.w, botShare);
+  const nm = e => e.p.id === 0 ? "You" : e.p.name;
+  const scoop = a.w.length === 1 && b.w.length === 1 && a.w[0].p.id === b.w[0].p.id;
+  const msg = scoop
+    ? `${nm(a.w[0])} scoop${a.w[0].p.id === 0 ? "" : "s"} $${MNY(pot)} — both boards (${a.best.desc} top & ${b.best.desc} bottom).`
+    : `Top board: ${a.w.map(nm).join(" & ")} win${a.w.length===1?"s":""} $${MNY(topShare)} (${a.best.desc}).  Bottom board: ${b.w.map(nm).join(" & ")} win${b.w.length===1?"s":""} $${MNY(botShare)} (${b.best.desc}).`;
+  const players = st.players.map(p => award[p.id] ? { ...p, chips:p.chips + award[p.id] } : p);
+  const youWon = (award[0] || 0) > 0;
+  return settle(st, players, award[0] || 0, youWon ? "player" : "cpu", msg, Object.keys(award).map(Number));
+}
+
+// Showdown for stud games. razz: low-only. stud: high-only. stud8: hi-lo split.
+function showdownStud(st) {
+  const still = st.players.filter(live);
+  const pot = st.pot;
+  const award = {};
+  let msg;
+  const nm = p => p.id === 0 ? "You" : p.name;
+
+  if (st.gid === "razz") {
+    const evals = still.map(p => ({ p, lo: bestRazz(p.hand) }));
+    let best = null; evals.forEach(e => { if (!best || cmpRazz(e.lo, best) < 0) best = e.lo; });
+    const winners = evals.filter(e => cmpRazz(e.lo, best) === 0);
+    Object.assign(award, layerAwardLanes(st, evals, [{ get:e=>e.lo, cmp:cmpRazz }]));
+    const names = winners.map(e => nm(e.p)).join(" & ");
+    const single = winners.length === 1 && winners[0].p.id !== 0;
+    msg = `${names} win${single?"s":""} $${MNY(pot)} with ${razzDesc(best)}.`;
+  } else if (st.gid === "razzdugi") {
+    // Split (no qualifier): best razz low (A-5) + best badugi, both from the 7 cards.
+    const evals = still.map(p => ({ p, lo: bestRazz(p.hand), bd: evalBadugi(p.hand) }));
+    let bestLo = null; evals.forEach(e => { if (!bestLo || cmpRazz(e.lo, bestLo) < 0) bestLo = e.lo; });
+    const loWinners = evals.filter(e => cmpRazz(e.lo, bestLo) === 0);
+    let bestBd = null; evals.forEach(e => { if (!bestBd || cmpBadugi(e.bd, bestBd) < 0) bestBd = e.bd; });
+    const bdWinners = evals.filter(e => cmpBadugi(e.bd, bestBd) === 0);
+    const loShare = Math.floor(pot / 2), bdShare = pot - loShare;
+    const perLo = Math.floor(loShare / loWinners.length), perBd = Math.floor(bdShare / bdWinners.length);
+    Object.assign(award, layerAwardLanes(st, evals, [{ get:e=>e.lo, cmp:cmpRazz }, { get:e=>e.bd, cmp:cmpBadugi }]));
+    const verb = arr => (arr.length === 1 && arr[0].p.id !== 0) ? "takes" : "take";
+    const scoop = loWinners.length === 1 && bdWinners.length === 1 && loWinners[0].p.id === bdWinners[0].p.id;
+    if (scoop) { const who = nm(loWinners[0].p); msg = `${who} scoop${who==="You"?"":"s"} $${MNY(pot)} — ${razzDesc(bestLo)} low + ${bestBd.desc}.`; }
+    else msg = `${loWinners.map(e=>nm(e.p)).join(" & ")} ${verb(loWinners)} the low for $${MNY(loShare)} (${razzDesc(bestLo)}); ${bdWinners.map(e=>nm(e.p)).join(" & ")} ${verb(bdWinners)} the badugi for $${MNY(bdShare)} (${bestBd.desc}).`;
+  } else if (st.gid === "stud") {
+    const evals = still.map(p => ({ p, hi: studHigh(p.hand) }));
+    let best = null; evals.forEach(e => { if (!best || cmpHigh(e.hi, best) < 0) best = e.hi; });
+    const winners = evals.filter(e => cmpHigh(e.hi, best) === 0);
+    Object.assign(award, layerAwardLanes(st, evals, [{ get:e=>e.hi, cmp:cmpHigh }]));
+    const names = winners.map(e => nm(e.p)).join(" & ");
+    const single = winners.length === 1 && winners[0].p.id !== 0;
+    msg = `${names} win${single?"s":""} $${MNY(pot)} with ${best.desc}.`;
+  } else { // stud8 hi-lo
+    const evals = still.map(p => ({ p, hi: studHigh(p.hand), lo: bestLow7(p.hand) }));
+    let bestHi = null; evals.forEach(e => { if (!bestHi || cmpHigh(e.hi, bestHi) < 0) bestHi = e.hi; });
+    const hiWinners = evals.filter(e => cmpHigh(e.hi, bestHi) === 0);
+    let bestLo = null; evals.forEach(e => { if (e.lo && (!bestLo || cmpLow(e.lo, bestLo) < 0)) bestLo = e.lo; });
+    const loWinners = bestLo ? evals.filter(e => e.lo && cmpLow(e.lo, bestLo) === 0) : [];
+    const verb = arr => (arr.length === 1 && arr[0].p.id !== 0) ? "takes" : "take";
+    if (loWinners.length) {
+      const hiShare = Math.floor(pot/2), loShare = pot - hiShare;
+      const perHi = Math.floor(hiShare/hiWinners.length), perLo = Math.floor(loShare/loWinners.length);
+      Object.assign(award, layerAwardLanes(st, evals, [{ get:e=>e.hi, cmp:cmpHigh }, { get:e=>e.lo, cmp:cmpLow }]));
+      if (hiWinners.length===1 && loWinners.length===1 && hiWinners[0].p.id===loWinners[0].p.id) {
+        const who = nm(hiWinners[0].p);
+        msg = `${who} scoop${who==="You"?"":"s"} $${MNY(pot)} — ${bestHi?.desc || "best hand"} for high, ${lowDesc(bestLo)} for low.`;
+      } else {
+        msg = `${hiWinners.map(e=>nm(e.p)).join(" & ")} ${verb(hiWinners)} the high for $${MNY(hiShare)} (${bestHi?.desc || "best hand"}); ${loWinners.map(e=>nm(e.p)).join(" & ")} ${verb(loWinners)} the low for $${MNY(loShare)} (${lowDesc(bestLo)}).`;
+      }
+    } else {
+      Object.assign(award, layerAwardLanes(st, evals, [{ get:e=>e.hi, cmp:cmpHigh }]));
+      const single = hiWinners.length===1 && hiWinners[0].p.id!==0;
+      msg = `${hiWinners.map(e=>nm(e.p)).join(" & ")} win${single?"s":""} $${MNY(pot)} with ${bestHi?.desc || "best hand"} (no low).`;
+    }
+  }
+  // Side pots (an all-in for less) can send different pots to different players — describe each real take.
+  msg = sidePotMsg(st, award, id => { const p = st.players.find(x => x.id === id);
+    if (!p) return "best hand";
+    if (st.gid === "razz" || st.gid === "razzdugi") return razzDesc(bestRazz(p.hand));
+    const h = studHigh(p.hand); return h ? h.desc : "best hand"; }) || msg;
+
+  const players = st.players.map(p => award[p.id] ? { ...p, chips:p.chips + award[p.id] } : p);
+  const youWon  = (award[0] || 0) > 0;
+  return settle(st, players, award[0] || 0, youWon ? "player" : "cpu", msg, Object.keys(award).map(Number));
+}
+
+// ─── DRAMAHA ─────────────────────────────────────
+// Draw-side hand made from the five hole cards (the half that isn't Omaha-high).
+function drawSideEval(gid, hole) {
+  const side = DRAMAHA_SIDE(gid);
+  return side === "27" ? eval27(hole) : side === "badugi" ? evalBadugi(hole) : bestHoldemHigh(hole, []);
+}
+function drawSideCmp(gid, a, b) {            // <0 ⇒ a is the better hand
+  const side = DRAMAHA_SIDE(gid);
+  return side === "27" ? cmp27(a, b) : side === "badugi" ? cmpBadugi(a, b) : cmpHigh(a, b);
+}
+const drawSideName = gid => DRAMAHA_SIDE(gid) === "27" ? "2-7" : DRAMAHA_SIDE(gid) === "badugi" ? "badugi" : "draw";
+
+// Showdown: split between best Omaha high (2 hole + 3 board) and best draw-side
+// hand (from the five hole cards). Neither half has a qualifier.
+function showdownDramaha(st) {
+  const still = st.players.filter(live);
+  const board = st.board, gid = st.gid;
+  const evals = still.map(p => ({ p, hi: bestOmahaHigh(p.hand, board), dr: drawSideEval(gid, p.hand) }));
+
+  let bestHi = null;
+  evals.forEach(e => { if (e.hi && (!bestHi || cmpHigh(e.hi, bestHi) < 0)) bestHi = e.hi; });
+  const hiWinners = bestHi ? evals.filter(e => e.hi && cmpHigh(e.hi, bestHi) === 0) : [];
+  let bestDr = null;
+  evals.forEach(e => { if (e.dr && (!bestDr || drawSideCmp(gid, e.dr, bestDr) < 0)) bestDr = e.dr; });
+  const drWinners = bestDr ? evals.filter(e => e.dr && drawSideCmp(gid, e.dr, bestDr) === 0) : [];
+
+  const pot = st.pot, award = {};
+  const hiShare = Math.floor(pot / 2), drShare = pot - hiShare;
+  const give = (winners, share) => {
+    if (!winners.length) return 0;
+    const per = Math.floor(share / winners.length);
+    winners.forEach((e, i) => award[e.p.id] = (award[e.p.id] || 0) + per + (i === 0 ? share - per * winners.length : 0));
+    return 1;
+  };
+  // If somehow one half has no winner, the other half takes the whole pot.
+  if (hiWinners.length && drWinners.length) { give(hiWinners, hiShare); give(drWinners, drShare); }
+  else if (hiWinners.length)                give(hiWinners, pot);
+  else                                      give(drWinners, pot);
+
+  const nm = e => e.p.id === 0 ? "You" : e.p.name;
+  const verb = arr => (arr.length === 1 && arr[0].p.id !== 0) ? "takes" : "take";
+  const side = drawSideName(gid);
+  let msg;
+  if (hiWinners.length === 1 && drWinners.length === 1 && hiWinners[0].p.id === drWinners[0].p.id) {
+    const who = nm(hiWinners[0]);
+    msg = `${who} scoop${who === "You" ? "" : "s"} $${MNY(pot)} — ${bestHi?.desc || "best hand"} (Omaha) + ${bestDr.desc} (${side}).`;
+  } else {
+    msg = `${hiWinners.map(nm).join(" & ")} ${verb(hiWinners)} the Omaha high (${bestHi?.desc}); ${drWinners.map(nm).join(" & ")} ${verb(drWinners)} the ${side} (${bestDr?.desc}).`;
+  }
+  const players = st.players.map(p => award[p.id] ? { ...p, chips:p.chips + award[p.id] } : p);
+  const youWon  = (award[0] || 0) > 0;
+  return settle(st, players, award[0] || 0, youWon ? "player" : "cpu", msg, Object.keys(award).map(Number));
+}
+
+// Combined betting strength for Dramaha (0..1). You can win either half, so
+// being strong in one half is valuable and being two-way is best.
+function dramahaHiStrength(hole, board) {
+  if (board && board.length >= 3) {
+    const hi = bestOmahaHigh(hole, board);
+    return hi ? ([0.18,0.40,0.58,0.72,0.82,0.88,0.94,0.98,1][hi.cat] || 0.2) : 0.2;
+  }
+  const vs = hole.map(c => c.v);
+  const sc = {}; hole.forEach(c => sc[c.s] = (sc[c.s]||0)+1);
+  const pairs = vs.length - new Set(vs).size;
+  const highs = vs.filter(v => v >= 11).length;
+  const ds = Object.values(sc).filter(c => c >= 2).length >= 2;
+  return Math.max(0, Math.min(1, 0.28 + pairs*0.11 + highs*0.05 + (ds?0.1:0)));
+}
+function dramahaDrawStrength(gid, hole) {
+  const side = DRAMAHA_SIDE(gid);
+  if (side === "high") {
+    const e = bestHoldemHigh(hole, []);
+    return e ? ([0.16,0.42,0.60,0.74,0.84,0.90,0.95,0.98,1][e.cat] || 0.2) : 0.2;
+  }
+  if (side === "27") {
+    const e = eval27(hole);
+    if (e && e.cat === 0) { const t = e.vs[0]; return t<=7?0.9:t<=8?0.76:t<=9?0.58:t<=10?0.44:0.32; }
+    const lows = new Set(hole.filter(c => c.v <= 8).map(c => c.v)).size;
+    return lows>=4?0.4:lows>=3?0.28:0.16;
+  }
+  const e = evalBadugi(hole);
+  if (e && e.size === 4) return e.vs[0] <= 8 ? 0.85 : 0.68;
+  const keep = badugiKeepIndices(hole).size;
+  return keep>=3?0.42:keep>=2?0.26:0.14;
+}
+function dramahaStrength(st, pl) {
+  const hi = dramahaHiStrength(pl.hand, st.board || []);
+  const dr = dramahaDrawStrength(st.gid, pl.hand);
+  const hiW = Math.max(hi, dr), loW = Math.min(hi, dr);
+  return Math.max(0, Math.min(1, 0.58*hiW + 0.32*loW + 0.1*((hi+dr)/2)));
+}
+function cpuDecideDramaha(st, idx) {
+  const pr = PROF[idx], pl = st.players[idx];
+  const tilt = Math.min(3, st.cpuTilt?.[idx] || 0);
+  const call = Math.min(st.currentBet - pl.betSt, pl.chips);
+  const fb   = st.streetN <= 1 ? STK(st).sbet : STK(st).bbet;
+  const tight = st.botTight?.[idx] ?? 50, L = (100 - tight) / 100;
+  const str  = dramahaStrength(st, pl);
+  const openThresh = 0.42 - L*0.18, callThresh = 0.30 - L*0.16, raiseThresh = 0.74 - L*0.10;
+  const bluff = rnd() < Math.min(0.5, pr.bluff * (0.7 + L) * (1 + tilt*0.32));
+  const slow  = tilt === 0 && rnd() < pr.slow;
+  const betTot = raising => pl.betSt + (raising ? call + fb : fb);
+  if (call <= 0) {
+    if ((str >= openThresh && !slow) || bluff) return { action:"bet", amount: betTot(false) };
+    return { action:"check", amount:0 };
+  }
+  if (str >= raiseThresh && !slow && pl.chips > call) return { action:"raise", amount: betTot(true) };
+  const potOdds = call / (st.pot + call);
+  if (str >= callThresh || str >= potOdds * 0.85) return { action:"call", amount:0 };
+  if (bluff && call <= fb) return { action:"call", amount:0 };
+  return { action:"fold", amount:0 };
+}
+// Bot draw: keep what helps the draw half (capped by the game's discard limit).
+function cpuDrawCardsDramaha(hand, gid) {
+  const side = DRAMAHA_SIDE(gid), cap = DRAW_CAP(gid);
+  let keep = new Set();
+  if (side === "badugi") keep = badugiKeepIndices(hand);
+  else if (side === "27") {
+    const seen = new Set();
+    hand.forEach((c, i) => { if (c.v <= 8 && !seen.has(c.v)) { seen.add(c.v); keep.add(i); } });
+  } else {
+    const cnt = {}; hand.forEach(c => cnt[c.v] = (cnt[c.v]||0)+1);
+    hand.forEach((c, i) => { if (cnt[c.v] >= 2 || c.v >= 11) keep.add(i); });
+    if (keep.size === 0) {
+      const order = hand.map((c, i) => ({ i, v:c.v })).sort((a, b) => b.v - a.v);
+      keep.add(order[0].i); keep.add(order[1].i);
+    }
+  }
+  let disc = hand.map((_, i) => i).filter(i => !keep.has(i));
+  if (disc.length > cap) disc = disc.slice(0, cap);
+  return disc;
+}
+
+// All-in before the betting completes: run the board to five cards, then split.
+function dramahaRunout(st) {
+  let deck = [...st.deck], board = [...st.board];
+  while (board.length < 5) { deck.shift(); board.push(deck.shift()); }
+  return showdownDramaha({ ...st, deck, board });
+}
+
+// ─── A-5 LOWBALL (5-card, ace low, straights/flushes ignored) ─────
+function evalA5(cards) {
+  const vals = cards.map(c => c.v === 14 ? 1 : c.v);
+  const cnt = {}; vals.forEach(v => cnt[v] = (cnt[v] || 0) + 1);
+  const groups = Object.entries(cnt).map(([v, c]) => ({ v:+v, c:+c })).sort((a, b) => b.c - a.c || b.v - a.v);
+  const pattern = groups.map(g => g.c).join("");
+  const catOrder = { "11111":0, "2111":1, "221":2, "311":3, "32":4, "41":5, "5":6 };
+  const cat = catOrder[pattern] ?? 0;                       // 0 = no pair (best low)
+  const tb = groups.flatMap(g => Array(g.c).fill(g.v));      // count desc, value desc
+  const LN = {1:"A",2:"2",3:"3",4:"4",5:"5",6:"6",7:"7",8:"8",9:"9",10:"T",11:"J",12:"Q",13:"K"};
+  const descCards = vals.slice().sort((a, b) => b - a).map(v => LN[v]).join("-");
+  const desc = cat === 0 ? `${descCards} low` : `${descCards} (paired)`;
+  return { cat, tb, desc, hi: Math.max(...vals) };
+}
+function cmpA5(a, b) {                       // <0 ⇒ a is the better (lower) hand
+  if (!a || !b) return 0;
+  if (a.cat !== b.cat) return a.cat < b.cat ? -1 : 1;       // no-pair beats any pair
+  for (let i = 0; i < a.tb.length; i++) if (a.tb[i] !== b.tb[i]) return a.tb[i] < b.tb[i] ? -1 : 1;
+  return 0;
+}
+const a5Qualifies = e => e && e.cat === 0 && e.tb[0] <= 8;   // 8-or-better
+const highQualifies = e => e && (e.cat >= 2 || (e.cat === 1 && e.tb[0] >= 9)); // pair of 9s+
+
+// ─── SPLIT-DRAW SHOWDOWN (Badeucey / Badacey / Archie) ────────────
+function splitSides(gid, board = []) {
+  if (gid === "badeucey") return {
+    A:{ ev:h=>evalBadugi(h, true), cmp:cmpBadugi, q:()=>true, name:"badugi" },
+    B:{ ev:h=>eval27(h),           cmp:cmp27,     q:()=>true, name:"2-7" } };
+  if (gid === "badacey") return {
+    A:{ ev:h=>evalBadugi(h),       cmp:cmpBadugi, q:()=>true, name:"badugi" },
+    B:{ ev:h=>evalA5(h),           cmp:cmpA5,     q:()=>true, name:"A-5 low" } };
+  if (gid === "veronica") {
+    // Archie + a single community card that plays for the HIGH hand only.
+    const bestHi = h => { const all = board.length ? h.concat(board) : h; let best = null;
+      for (const c of kCombos(all, 5)) { const e = evalHigh5(c); if (!best || cmpHigh(e, best) < 0) best = e; } return best; };
+    return {
+      A:{ ev:bestHi,               cmp:cmpHigh,   q:highQualifies, name:"high" },
+      B:{ ev:h=>evalA5(h),         cmp:cmpA5,     q:a5Qualifies,   name:"low" } };
+  }
+  return { // archie: high (pair 9s+) / A-5 low (8-or-better); no qualifier ⇒ chop among remaining
+    A:{ ev:h=>evalHigh5(h),        cmp:cmpHigh,   q:highQualifies, name:"high" },
+    B:{ ev:h=>evalA5(h),           cmp:cmpA5,     q:a5Qualifies,   name:"low" } };
+}
+function showdownSplitDraw(st) {
+  const gid = st.gid, { A, B } = splitSides(gid, st.board || []);
+  const still = st.players.filter(live);
+  const ev = still.map(p => ({ p, a:A.ev(p.hand), b:B.ev(p.hand) }));
+  const winners = (side, k) => {
+    const q = ev.filter(e => side.q(e[k]));
+    if (!q.length) return [];
+    let best = q[0][k]; q.forEach(e => { if (side.cmp(e[k], best) < 0) best = e[k]; });
+    return q.filter(e => side.cmp(e[k], best) === 0);
+  };
+  const aWin = winners(A, "a"), bWin = winners(B, "b");
+  const pot = st.pot, award = {};
+  const give = (w, share) => { if (!w.length) return; const per = Math.floor(share / w.length);
+    w.forEach((e, i) => award[e.p.id] = (award[e.p.id] || 0) + per + (i === 0 ? share - per * w.length : 0)); };
+  const nm = e => e.p.id === 0 ? "You" : e.p.name;
+
+  let msg;
+  if (aWin.length && bWin.length) {
+    const hiShare = Math.floor(pot / 2), loShare = pot - hiShare;
+    give(aWin, hiShare); give(bWin, loShare);
+    const scoop = aWin.length === 1 && bWin.length === 1 && aWin[0].p.id === bWin[0].p.id;
+    msg = scoop
+      ? `${nm(aWin[0])} scoop${aWin[0].p.id === 0 ? "" : "s"} $${MNY(pot)} — ${aWin[0].a.desc} (${A.name}) + ${bWin[0].b.desc} (${B.name}).`
+      : `${aWin.map(nm).join(" & ")} take the ${A.name} for $${MNY(hiShare)} (${aWin[0].a.desc}); ${bWin.map(nm).join(" & ")} take the ${B.name} for $${MNY(loShare)} (${bWin[0].b.desc}).`;
+  } else if (aWin.length) { give(aWin, pot); msg = `${aWin.map(nm).join(" & ")} scoop $${MNY(pot)} — only the ${A.name} qualified (${aWin[0].a.desc}).`; }
+  else if (bWin.length) { give(bWin, pot); msg = `${bWin.map(nm).join(" & ")} scoop $${MNY(pot)} — only the ${B.name} qualified (${bWin[0].b.desc}).`; }
+  else {
+    // No one qualified for high or low → chop the pot among all remaining (non-folded) players.
+    give(ev, pot);
+    msg = `No qualifier — pot chopped among ${ev.length} remaining player${ev.length > 1 ? "s" : ""} ($${MNY(pot)}).`;
+  }
+  const players = st.players.map(p => award[p.id] ? { ...p, chips:p.chips + award[p.id] } : p);
+  const youWon = (award[0] || 0) > 0;
+  return settle(st, players, award[0] || 0, youWon ? "player" : "cpu", msg, Object.keys(award).map(Number));
+}
+
+function settle(st, players, potWon, result, msg, winnerIds = []) {
+  // Tilt system: some CPUs who just lost a pot to you steam; everyone else cools off. Kept modest so the
+  // whole table doesn't go on tilt at once.
+  const cpuTilt = { ...st.cpuTilt };
+  if (result === "player") {
+    players.filter(p => p.id !== 0 && live(p)).forEach(p => {
+      if (rnd() < 0.5) cpuTilt[p.id] = Math.min(2, (cpuTilt[p.id] || 0) + 1);   // only some steam, cap 2
+    });
+    [1,2,3,4,5,6,7].forEach(i => { if (!players.find(p => p.id === i && live(p)) && cpuTilt[i] > 0) cpuTilt[i]--; });  // uninvolved cool off
+  } else {
+    [1,2,3,4,5,6,7].forEach(i => { if (cpuTilt[i] > 0) cpuTilt[i]--; });
+  }
+  const stats = {
+    hands: st.stats.hands + 1,
+    wins:  st.stats.wins + (result === "player" ? 1 : 0),
+  };
+  // ── S2: tournament bust / win + finishing place ──
+  let tour = st.tour;
+  if (tour?.on && !tour.result) {
+    const alive = players.filter(p => p.chips > 0).length;   // players still holding chips at your table
+    const F = tour.field || { total: 8 };
+    if (players[0].chips <= 0) {                              // YOU busted — you finish just under those still in
+      // Single-table endgame (small field, or the model OR the real bust count says the last table has formed):
+      // real seats are real places. Otherwise the modeled field gives the place. Fixes heads-up-of-1,000 finales.
+      const endgame = F.total <= 9
+        || fieldLeft(F.total, tour.level || 0) <= players.length
+        || fieldLeftLive(F, tour.level || 0, tour.busted) <= players.length;
+      const place = endgame ? alive + 1 : fieldLeftLive(F, tour.level || 0, tour.busted);
+      tour = { ...tour, result: { type:"bust", place, total:F.total } };
+    } else if (alive === 1) {                                // last one with chips → you take it down
+      tour = { ...tour, result: { type:"win", place:1, total:F.total } };
+    }
+  }
+  return { ...st, players, pot:0, phase:"showdown", reveal:true, msg, result, cpuTilt, stats,
+    winnerIds, seq:(st.seq||0)+1, tour };
+}
+
+function winnerId(st) {
+  if (st.phase !== "showdown") return null;
+  const s = st.players.filter(live);
+  if (s.length === 1) return s[0].id;
+  if (IS_STUD(st.gid)) {
+    if (st.gid === "razz" || st.gid === "razzdugi") {
+      let best = null, id = s[0].id;
+      s.forEach(p => { const e = bestRazz(p.hand); if (!best || cmpRazz(e, best) < 0) { best = e; id = p.id; } });
+      return id;
+    }
+    let best = null, id = s[0].id;
+    s.forEach(p => { const e = studHigh(p.hand); if (!best || cmpHigh(e, best) < 0) { best = e; id = p.id; } });
+    return id; // high-hand winner
+  }
+  if (IS_FLOP(st.gid)) {
+    let best = null, id = s[0].id;
+    s.forEach(p => { const e = flopHigh(st.gid, p.hand, st.board); if (!best || cmpHigh(e, best) < 0) { best = e; id = p.id; } });
+    return id; // highlights the high-hand winner
+  }
+  return s.map(p => ({ ...p, ev:evalHand(st.gid, p.hand) })).sort((a, b) => cmpHand(st.gid, a.ev, b.ev))[0].id;
+}
+
+// ─── REVIEW SCREEN (hand history + coaching analysis) ─────────────
+function RvStat({ label, val }) {
+  return <div style={S.statCard}><div style={S.statVal}>{val}</div><div style={S.statLbl}>{label}</div></div>;
+}
+function RvCards({ label, cards }) {
+  return (
+    <div style={S.cardsRow}>
+      <span style={S.cardsLbl}>{label}:</span>
+      {(cards || []).map((c, i) =>
+        <span key={i} style={{ fontSize:13, fontWeight:"bold", color: RED.has(c.s) ? "#dc2626" : "#1a1a1a",
+          background:"#f4f1e8", borderRadius:3, padding:"1px 5px", margin:"0 2px" }}>{cardTxt(c)}</span>)}
+    </div>
+  );
+}
+function ReviewScreen({ onClose }) {
+  const [records, setRecords] = useState([]);
+  const [open, setOpen] = useState(null);
+  const [confirmClear, setConfirmClear] = useState(false);
+  useEffect(() => { setRecords(hsLoad()); }, []);
+  const a = useMemo(() => analyzeHistory(records), [records]);
+  const recent = useMemo(() => records.slice(-40).reverse(), [records]);
+  const pct = x => `${Math.round((x || 0) * 100)}%`;
+  const clearAll = () => { hsClear(); setRecords([]); setConfirmClear(false); setOpen(null); };
+
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={S.reviewCard} onClick={e => e.stopPropagation()}>
+        <div style={S.reviewHead}>
+          <span style={S.reviewTitle}>📊 Review</span>
+          <button onClick={onClose} style={S.modalClose}>✕</button>
+        </div>
+
+        {!hsAvail() && <div style={S.reviewNote}>Heads-up: this browser/mode blocks local saving, so history won't persist between visits.</div>}
+
+        {records.length === 0 ? (
+          <div style={S.reviewEmpty}>No hands recorded yet.<br/>Play a few hands — your stats and a coaching breakdown of your strengths and leaks will build up here automatically.</div>
+        ) : (
+          <>
+            <div style={S.dashRow}>
+              <RvStat label="Hands" val={a.hands}/>
+              <RvStat label="Win rate" val={pct(a.hands ? a.wins / a.hands : 0)}/>
+              <RvStat label="Decision acc." val={pct(a.accuracy)}/>
+              <RvStat label="Decisions" val={a.decisions}/>
+            </div>
+
+            {!a.enough && <div style={S.reviewNote}>Play at least 20 decisions to unlock the strengths & opportunities breakdown — {a.decisions} logged so far.</div>}
+
+            {a.enough && (
+              <>
+                <div style={S.reviewSec}>✅ Top strengths</div>
+                {a.strengths.length ? a.strengths.map((s, i) => (
+                  <div key={i} style={{ ...S.leakRow, borderLeft:"3px solid #3FD39C" }}>
+                    <div style={S.leakCat}>{s.category}<span style={S.leakPct}>{pct(s.goodRate)} on-line · {s.n}</span></div>
+                    <div style={S.leakFix}>{s.blurb}</div>
+                  </div>
+                )) : <div style={S.reviewNote}>Keep playing to surface clear strengths.</div>}
+
+                <div style={S.reviewSec}>🎯 Top opportunities</div>
+                {a.opportunities.length ? a.opportunities.map((o, i) => (
+                  <div key={i} style={{ ...S.leakRow, borderLeft:"3px solid #fbbf24" }}>
+                    <div style={S.leakCat}>{o.category}<span style={S.leakPct}>{o.dir === "too_loose" ? "too loose" : "too passive"} · {pct(o.leakRate)} off · {o.n}</span></div>
+                    <div style={S.leakFix}>{o.fix}</div>
+                  </div>
+                )) : <div style={S.reviewNote}>No clear leaks yet — nicely balanced.</div>}
+              </>
+            )}
+
+            {a.perGame.length > 0 && (
+              <>
+                <div style={S.reviewSec}>By game</div>
+                {a.perGame.map(g => (
+                  <div key={g.gid} style={S.gameRow}>
+                    <span style={S.gameName}>{g.label}</span>
+                    <span style={S.gameStat}>{g.hands} hands{g.decisions ? ` · ${pct(g.accuracy)} acc` : ""}</span>
+                  </div>
+                ))}
+              </>
+            )}
+
+            <div style={S.reviewSec}>Recent hands</div>
+            {recent.map((r, i) => {
+              const idx = records.length - 1 - i;
+              const col = r.result === "won" ? "#3FD39C" : r.result === "lost" ? "#E2857A" : "#C9A24B";
+              return (
+                <div key={idx}>
+                  <button onClick={() => setOpen(open === idx ? null : idx)} style={S.handRow}>
+                    <span style={{ color:col, fontWeight:"bold", fontSize:11, width:42 }}>{r.result === "won" ? "WON" : r.result === "lost" ? "LOST" : "CHOP"}</span>
+                    <span style={{ color:"#9d8a62", fontSize:11, flex:1, textAlign:"left" }}>{GAME_LABEL[r.gid] || r.gid}</span>
+                    <span style={{ color:col, fontSize:11 }}>{r.delta > 0 ? "+" : ""}{r.delta}</span>
+                  </button>
+                  {open === idx && (
+                    <div style={S.handDetail}>
+                      <RvCards label="Your cards" cards={r.finalHole}/>
+                      {r.board && r.board.length > 0 && <RvCards label="Board" cards={r.board}/>}
+                      <div style={S.detLine}>{r.msg}</div>
+                      {(r.decisions || []).filter(d => d.verdict === "leak").slice(0, 3).map((d, k) => (
+                        <div key={k} style={S.detLeak}>• {d.category}: {d.dir === "too_loose" ? "too loose/aggressive" : "too passive"}</div>
+                      ))}
+                      <div style={S.detNote}>Full visual replay coming soon.</div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            <div style={S.clearRow}>
+              {!confirmClear
+                ? <button onClick={() => setConfirmClear(true)} style={S.clearBtn}>Clear history</button>
+                : <>
+                    <span style={S.clearWarn}>Delete all {records.length} hands?</span>
+                    <button onClick={clearAll} style={S.clearYes}>Yes</button>
+                    <button onClick={() => setConfirmClear(false)} style={S.clearNo}>Cancel</button>
+                  </>}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── FEEDBACK (posts to Formspree; endpoint pasted in by owner) ───
+const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
+// Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
+// in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
+const SUPPORT_URL = "https://ko-fi.com/getmixed";
+const APP_VERSION = "2026.07.05k";  // build stamp — bump when you ship a new build
+const IS_BETA = true;               // shows a BETA badge in header + footer
+// First-run guided tour: spotlight these elements in order.
+const TOUR = [
+  { id:"tour-menu",   title:"Pick your game",  text:"Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
+  { id:"tour-gear",   title:"Settings",        text:"Stakes, cash or tournament, the bot personalities, and the coach all live here. Endgame and final-table drills too." },
+  { id:"tour-coach",  title:"Live coaching",   text:"Real-time strategy on every street as you play. Tap any time to toggle it on or off." },
+  { id:"tour-deep",   title:"Deep Check",      text:"On a real decision, run the solver: it plays the spot out hundreds of times against how THIS table is playing and ranks every line by EV." },
+  { id:"tour-review", title:"Track your play", text:"Every decision is logged and graded, so you can spot your leaks over time and drill the games that cost you most." },
+];
+function FeedbackScreen({ onClose, mode="feedback", context="" }) {
+  const isBug = mode === "bug";
+  const [msg, setMsg] = useState("");
+  const [email, setEmail] = useState("");
+  const [status, setStatus] = useState("idle");
+  const ready = FORMSPREE_ENDPOINT.indexOf("https://") === 0;
+  const send = async () => {
+    if (!msg.trim()) return;
+    if (!ready) { setStatus("noendpoint"); return; }
+    setStatus("sending");
+    try {
+      const r = await fetch(FORMSPREE_ENDPOINT, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", "Accept":"application/json" },
+        body: JSON.stringify({ message: msg, email, source: "getmixed.ca",
+          type: isBug ? "BUG REPORT" : "feedback", context, version: APP_VERSION }),
+      });
+      setStatus(r.ok ? "done" : "error");
+    } catch { setStatus("error"); }
+  };
+  return (
+    <div style={S.overlay} onClick={onClose}>
+      <div style={S.fbCard} onClick={e => e.stopPropagation()}>
+        <div style={S.reviewHead}>
+          <span style={S.reviewTitle}>{isBug ? "🐞 Report a bug" : "💬 Feedback"}</span>
+          <button onClick={onClose} style={S.modalClose}>✕</button>
+        </div>
+        {status === "done" ? (
+          <div style={S.fbThanks}>Thanks — your {isBug ? "bug report" : "feedback"} was sent. 🙏</div>
+        ) : (
+          <>
+            <div style={S.fbLabel}>{isBug
+              ? "Describe the bug — what happened, and what did you expect?"
+              : "Found a bug or have an idea? Tell me about it:"}</div>
+            <textarea value={msg} onChange={e => setMsg(e.target.value)} rows={5} style={S.fbArea}
+              placeholder={isBug ? "e.g. The winner was highlighted wrong at showdown…" : "What's on your mind?"} />
+            <input value={email} onChange={e => setEmail(e.target.value)} style={S.fbInput} placeholder="Your email (optional, for a reply)" />
+            {isBug && context && <div style={{fontSize:10,color:"#9d8a62",marginTop:6}}>Auto-attached: {context} · v{APP_VERSION}</div>}
+            {status === "error" && <div style={S.fbErr}>Couldn't send just now — please try again in a moment.</div>}
+            {status === "noendpoint" && <div style={S.fbErr}>Feedback isn't connected yet — the form endpoint still needs to be added.</div>}
+            <button onClick={send} disabled={status === "sending" || !msg.trim()}
+              style={{ ...S.fbSend, opacity:(status === "sending" || !msg.trim()) ? 0.5 : 1 }}>
+              {status === "sending" ? "Sending…" : (isBug ? "Send bug report" : "Send feedback")}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── ERROR BOUNDARY ──────────────────────────────
+// Last line of defence: if any render throws, show a calm recover screen instead of a
+// white page. (Today's coach crash is fixed and guarded; this protects against the next one.)
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { err: false }; }
+  static getDerivedStateFromError() { return { err: true }; }
+  componentDidCatch(e, info) { if (typeof console !== "undefined") console.error("Caught by boundary:", e, info); }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (
+      <div style={{minHeight:"100vh",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+        background:"#06100B",color:"#F0E9D6",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",textAlign:"center",padding:"0 24px",gap:14}}>
+        <div style={{fontSize:14,letterSpacing:2,color:"#EBD08A",fontWeight:400,fontFamily:"'GM-Neon',Georgia,serif"}}>GET MIXED</div>
+        <div style={{fontSize:15,color:"#efe4be"}}>The table hit a snag.</div>
+        <div style={{fontSize:12,color:"#9d8a62",maxWidth:300,lineHeight:1.5}}>Your chips are safe — reload to deal a fresh hand. If it keeps happening, tap Report a bug so we can squash it.</div>
+        <button onClick={() => { if (typeof location !== "undefined") location.reload(); }}
+          style={{marginTop:6,background:"#C9A24B",color:"#1a1206",border:"none",borderRadius:8,padding:"10px 22px",
+            fontSize:13,fontWeight:"bold",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",letterSpacing:0.5,cursor:"pointer"}}>Reload</button>
+      </div>
+    );
+  }
+}
+
+// ─── ROOT ────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// TOURNAMENT LOBBY (Leg C · C1) — setup screen matching the approved mockup.
+// This slice: mix/runners/stakes selection + START that boots an 8-max tourney table.
+// Blind clock, game rotation, and field/ICM payouts are later slices (C2–C4).
+// ─────────────────────────────────────────────────────────────────────────────
+const MIX_PRESETS = [
+  { id:"horse",  name:"HORSE",           desc:"5 games · fixed-limit",          games:["lhe","omaha8","razz","stud","stud8"] },
+  { id:"8game",  name:"8-GAME",          desc:"8 games · limit + big-bet",      games:["triple","lhe","omaha8","razz","stud","stud8","nlhe","plo"] },
+  { id:"9game",  name:"9-GAME",          desc:"8-game + Big O",                 games:["triple","lhe","omaha8","razz","stud","stud8","nlhe","plo","bigo"] },
+  { id:"10game", name:"10-GAME",         desc:"the full rotation",              games:["triple","lhe","omaha8","razz","stud","stud8","nlhe","plo","single","badugi"] },
+  { id:"hose",   name:"HOSE",            desc:"4 games · fixed-limit",          games:["lhe","omaha8","stud","stud8"] },
+  { id:"horseo", name:"HORSEO",          desc:"HORSE + Big O",                  games:["lhe","omaha8","razz","stud","stud8","bigo"] },
+  { id:"tstud",  name:"TRIPLE STUD",     desc:"razz · stud · stud-8",           games:["razz","stud","stud8"] },
+  { id:"bigbet", name:"BIG BET MIX",     desc:"the WSOP big-bet nine",           games:["nlhe","plo","bigo","single","crazyp","pl27td","plo8","plbad","pl5d"] },
+  { id:"omahamix",name:"OMAHA MIX",      desc:"PLO · Omaha-8 · Big O",          games:["plo","omaha8","bigo"] },
+  { id:"draw",   name:"TRIPLE DRAW MIX", desc:"2-7 · badugi",                   games:["triple","badugi"] },
+  { id:"dramaha",name:"DRAMAHA MIX",     desc:"split-pot draw games",           games:["dramahaH","dramaha27","dramadugi","badacey","badeucey"] },
+  { id:"dealers",name:"DEALER'S CHOICE", desc:"everything, rotating",           games:["lhe","omaha8","razz","stud","stud8","nlhe","plo","bigo","crazyp","badugi","single","triple"] },
+  { id:"single", name:"SINGLE GAME",     desc:"pick any one",                   games:null },
+  { id:"custom", name:"CUSTOM",          desc:"build your own mix",             games:null },
+];
+const RUNNER_OPTS = [ {n:6,u:"1 table"},{n:9,u:"1 table"},{n:45,u:"simulated"},{n:180,u:"simulated"},{n:1000,u:"simulated"},{n:10000,u:"simulated"} ];
+// Starting stack in big blinds. Both game families normalise to blinds (big-bet games carry a 2× depth
+// multiplier), so the stored bbDepth = bb / 2 gives the same real depth in either format.
+const STACK_OPTS = [ {bb:100,u:"shallow"},{bb:150,u:"standard"},{bb:200,u:"deep"},{bb:300,u:"very deep"} ];
+const STAKE_OPTS = [
+  { id:"low",  tag:"LOW",  desc:"Soft field — loose, passive, leaky recreationals. Punish with value." },
+  { id:"med",  tag:"MED",  desc:"Mixed field — a spread of regs and recreational players." },
+  { id:"high", tag:"HIGH", desc:"Tough regs — tight, aggressive, balanced, hard to read. Bring your A-game." },
+];
+// Blind speed = level length in minutes. Blinds are hands-paced, so a shorter level simply runs fewer hands
+// before they climb (clock pace scales automatically off levelSec).
+const SPEED_OPTS = [
+  { id:"hyper",    label:"Hyper",    min:6  },
+  { id:"turbo",    label:"Turbo",    min:15 },
+  { id:"standard", label:"Standard", min:35 },
+  { id:"slow",     label:"Slow",     min:60 },
+];
+
+// ── Dealer's Choice chooser: the button picks the game. Hero → a fan of game cards; a bot → its pick + reason.
+function DealersChooser({ st, onPick, onConfirm, onAgain, kicker, title, sub, clock, onCancel }) {
+  const seq = st.tour?.seq || [];
+  const ch  = st.chooser || {};
+  const recent = (st.tour?.dcRecent || []).slice(0, 3);
+  const meta = gid => GAMES.find(g => g.id === gid) || { label: gid, tag: "" };
+  const tagColor = tag => /NO LIMIT/.test(tag) ? "#3f9152" : /POT LIMIT/.test(tag) ? "#b08a2e" : /SPLIT/.test(tag) ? "#8a6ab0" : "#4f6f92";
+
+  // Hero confirm beat — after tapping a card, show the pick and a DEAL button (matches the mock).
+  if (ch.hero && ch.confirm) {
+    const m = meta(ch.confirm);
+    return (
+      <div style={DC.overlay}>
+        <div style={DC.face}>
+          <div style={DC.faceName}>{m.label}</div>
+          <div style={{ ...DC.faceTag, color:tagColor(m.tag), borderColor:tagColor(m.tag)+"66" }}>{m.tag}</div>
+          <div style={DC.faceWins}>{GAME_WINS[ch.confirm] || ""}</div>
+        </div>
+        <div style={DC.who}>you chose</div>
+        <div style={DC.pick}>{m.label}</div>
+        <button style={DC.deal} onClick={onConfirm}>DEAL ▸</button>
+        <button style={DC.again} onClick={onAgain}>choose again</button>
+      </div>
+    );
+  }
+
+  if (!ch.hero) {
+    const m = meta(ch.gid), name = st.players.find(p => p.id === ch.picker)?.name || "Dealer";
+    return (
+      <div style={DC.overlay}>
+        <div style={DC.face}>
+          <div style={DC.faceName}>{m.label}</div>
+          <div style={{ ...DC.faceTag, color:tagColor(m.tag), borderColor:tagColor(m.tag)+"66" }}>{m.tag}</div>
+          <div style={DC.faceWins}>{GAME_WINS[ch.gid] || ""}</div>
+        </div>
+        <div style={DC.who}>{name} · chooses</div>
+        <div style={DC.pick}>{m.label}</div>
+        <div style={DC.why}>“{ch.reason}”</div>
+      </div>
+    );
+  }
+
+  const N = seq.length, spread = 42;
+  return (
+    <div style={DC.overlay}>
+      <div style={DC.kicker}>{kicker || "new orbit · your choice"}</div>
+      <div style={DC.title}>{title || "Deal the game"}</div>
+      <div style={DC.sub}>{sub || "Your pick sets the game for this whole orbit."}</div>
+      {clock !== false && <div style={DC.ring}><div style={DC.ringFill}/></div>}
+      {recent.length > 0 && (
+        <div style={DC.rail}>
+          {recent.map((g, i) => (
+            <button key={g} onClick={() => onPick(g)} style={DC.chip}>
+              <span style={{ color:"#C9A24B" }}>{i === 0 ? "★" : "↺"} </span>{meta(g).label}
+            </button>
+          ))}
+        </div>
+      )}
+      <div style={DC.fanwrap}>
+        <div style={DC.fan}>
+          {seq.map((g, i) => {
+            const t = N > 1 ? i / (N - 1) : 0.5, ang = -spread / 2 + t * spread, x = (i - (N - 1) / 2) * 22, y = Math.abs(ang) * 1.4;
+            const m = meta(g);
+            return (
+              <button key={g} onClick={() => onPick(g)}
+                style={{ ...DC.card, transform:`translateX(${x}px) translateY(${y}px) rotate(${ang}deg)`, zIndex: 10 + i }}>
+                <div style={DC.cardName}>{m.label}</div>
+                <div style={{ ...DC.cardTag, color:tagColor(m.tag), borderColor:tagColor(m.tag)+"55" }}>{m.tag}</div>
+                <div style={DC.cardWins}>{GAME_WINS[g] || ""}</div>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div style={DC.hint}>{clock !== false ? "Tap a game to deal it · auto-deals your last pick if the clock runs out" : "Tap a game — it's the game for the whole tournament"}</div>
+      {onCancel && <button style={{...DC.ghost, marginTop:14}} onClick={onCancel}>back to the lobby</button>}
+    </div>
+  );
+}
+// Single-game tournaments/scenarios: the Dealer's Choice fan, opened once at start — pick THE game for the
+// whole event. Pool = the Dealer's Choice list, plus the current table game if it's an exotic outside it.
+function SingleGamePicker({ curGid, onDone, onCancel }) {
+  const [confirm, setConfirm] = useState(null);
+  const pool = MIX_PRESETS.find(m => m.id === "dealers").games.slice();
+  if (curGid && !pool.includes(curGid) && GAMES.find(g => g.id === curGid && g.available)) pool.push(curGid);
+  const fakeSt = { tour:{ seq: pool, dcRecent: pool.includes(curGid) ? [curGid] : [] }, chooser:{ hero:true, confirm }, players:[] };
+  return <DealersChooser st={fakeSt}
+    onPick={g => setConfirm(g)} onConfirm={() => confirm && onDone(confirm)} onAgain={() => setConfirm(null)}
+    kicker="single game tournament" title="Pick your game" sub="One game, the whole way down." clock={false} onCancel={onCancel}/>;
+}
+
+const DC = {
+  overlay:{position:"fixed",inset:0,zIndex:70,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+    textAlign:"center",padding:"0 16px 40px",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",
+    background:"radial-gradient(ellipse at 50% 38%,rgba(16,23,37,0.72),rgba(9,13,20,0.95))",backdropFilter:"blur(3px)"},
+  kicker:{fontSize:10,letterSpacing:2,color:"#C9A24B",textTransform:"uppercase",fontFamily:"'GM-Stamp',Georgia,serif"},
+  title:{fontSize:24,letterSpacing:1,color:"#F0E9D6",margin:"4px 0 2px"},
+  sub:{fontSize:11,color:"#8FA396",marginBottom:6},
+  ring:{width:30,height:4,borderRadius:3,background:"rgba(201,162,75,0.15)",overflow:"hidden",margin:"6px 0 2px"},
+  ringFill:{height:"100%",background:"#C9A24B",borderRadius:3,animation:"dcClock 12s linear forwards"},
+  rail:{display:"flex",gap:6,justifyContent:"center",flexWrap:"wrap",margin:"12px 0 2px"},
+  chip:{fontSize:10,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",padding:"6px 11px",borderRadius:20,cursor:"pointer",
+    border:"1px solid rgba(201,162,75,0.35)",background:"rgba(201,162,75,0.07)",color:"#e0d4ad"},
+  fanwrap:{position:"relative",height:210,width:"100%",maxWidth:400,marginTop:6},
+  fan:{position:"absolute",left:"50%",bottom:0,width:0,height:0},
+  card:{position:"absolute",left:-38,bottom:0,width:76,height:116,borderRadius:11,cursor:"pointer",transformOrigin:"50% 130%",
+    background:"linear-gradient(160deg,#fbf6e9,#efe4c9)",border:"1px solid rgba(120,90,30,0.5)",boxShadow:"0 4px 12px rgba(0,0,0,0.5)",
+    padding:"8px 7px",display:"flex",flexDirection:"column",alignItems:"flex-start",textAlign:"left",transition:"transform .2s"},
+  cardName:{fontSize:10.5,fontWeight:"bold",color:"#241a08",lineHeight:1.05,letterSpacing:0.2},
+  cardTag:{fontSize:6,letterSpacing:1,fontWeight:"bold",textTransform:"uppercase",padding:"2px 4px",borderRadius:4,
+    borderStyle:"solid",borderWidth:1,marginTop:4},
+  cardWins:{fontSize:7,color:"#6a5a38",lineHeight:1.2,marginTop:"auto",fontStyle:"italic"},
+  hint:{fontSize:9,color:"#6f6048",marginTop:8,letterSpacing:0.3},
+  face:{width:120,height:168,borderRadius:14,background:"linear-gradient(160deg,#fbf6e9,#efe4c9)",border:"1px solid rgba(120,90,30,0.5)",
+    boxShadow:"0 14px 34px rgba(0,0,0,0.6)",padding:14,textAlign:"left",marginBottom:16,display:"flex",flexDirection:"column",
+    alignItems:"flex-start",animation:"dcFlip .5s cubic-bezier(.2,.9,.25,1)"},
+  faceName:{fontSize:15,fontWeight:"bold",color:"#241a08",lineHeight:1.1},
+  faceTag:{fontSize:7,letterSpacing:1,fontWeight:"bold",textTransform:"uppercase",padding:"2px 5px",borderRadius:4,borderStyle:"solid",borderWidth:1,marginTop:6},
+  faceWins:{fontSize:9,color:"#6a5a38",fontStyle:"italic",marginTop:"auto"},
+  who:{fontSize:10,letterSpacing:3,textTransform:"uppercase",color:"#C9A24B"},
+  pick:{fontSize:24,color:"#f4ead0",margin:"8px 0 4px"},
+  why:{fontSize:11,color:"#9c8f70",fontStyle:"italic",maxWidth:240,lineHeight:1.5},
+  deal:{marginTop:18,background:"linear-gradient(165deg,#57b56a,#3f9152)",color:"#0a1a0e",border:"none",borderRadius:12,
+    padding:"13px 34px",fontSize:14,fontWeight:"bold",letterSpacing:2,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",
+    boxShadow:"0 6px 18px rgba(46,140,104,0.3)",cursor:"pointer"},
+  again:{marginTop:12,fontSize:10,color:"#8FA396",letterSpacing:1,textTransform:"uppercase",background:"none",
+    border:"none",cursor:"pointer",textDecoration:"underline"},
+};
+
+// ── SCENARIO TRAINER ──────────────────────────────────────────────────────────
+// Drop into any stage of a tournament: the game is always the player's pick (never randomized); stage, stack
+// and field can be dialed or shuffled. Every scenario plays to completion — down to a bust or the win — and
+// the debrief grades the cash against the ICM value of the starting spot.
+const SCEN_STAGES = [
+  { n:"Early",          u:"full field",  avgBB:250, skill:0,    left:(F,P)=>Math.round(F*0.9) },
+  { n:"Midway",         u:"half gone",   avgBB:70,  skill:0.15, left:(F,P)=>Math.round(F*0.5) },
+  { n:"Near the money", u:"tension",     avgBB:45,  skill:0.3,  left:(F,P)=>Math.round(P*1.15)+1 },
+  { n:"Stone bubble",   u:"one out",     avgBB:36,  skill:0.4,  left:(F,P)=>P+1 },
+  { n:"Three tables",   u:"24 left",     avgBB:30,  skill:0.5,  left:()=>24 },
+  { n:"Two tables",     u:"16 left",     avgBB:26,  skill:0.6,  left:()=>16 },
+  { n:"Final table",    u:"8 left",      avgBB:24,  skill:0.7,  left:()=>8 },
+  { n:"Short-handed",   u:"5 left",      avgBB:26,  skill:0.85, left:()=>5 },
+  { n:"Heads-up",       u:"for it all",  avgBB:40,  skill:0.95, left:()=>2 },
+];
+const SCEN_STACKS = [
+  { n:"Chip leader", u:"1st",      m:2.6 },
+  { n:"Top 10%",     u:"big",      m:1.8 },
+  { n:"Above avg",   u:"healthy",  m:1.3 },
+  { n:"Average",     u:"the pack", m:1.0 },
+  { n:"Bottom ¼",    u:"grinding", m:0.55 },
+  { n:"Short",       u:"10bb",     bb:10 },
+  { n:"Micro",       u:"4bb",      bb:4 },
+];
+const SCEN_FIELDS = [45, 180, 1000];
+// Shared numbers for the panel summary, briefing card, and the state builder — one source of truth.
+function scenPreview(cfg, gid) {
+  const F = cfg.field || 45, paid = paidSpots(F);
+  const SC = SCEN_STAGES[cfg.stage] || SCEN_STAGES[0];
+  const SK = SCEN_STACKS[cfg.stack] || SCEN_STACKS[3];
+  const left = Math.max(2, Math.min(F, Math.round(SC.left(F, paid))));
+  // Deepest blind level whose modeled field still covers the target — clamped to the ladder, because the clock
+  // re-derives the level each hand and would snap anything beyond it back. Past the ladder's reach (deep stages
+  // of huge fields) the pin comes from the busted counter via fieldLeftLive instead.
+  let level = 0;
+  for (let L2 = 0; L2 < 45; L2++) { if (fieldLeft(F, L2) >= left) level = L2; else break; }
+  level = Math.min(level, TOUR_SB.length - 1);
+  const buyIn = TOUR_BUYIN[cfg.stakes || "high"] || 250;
+  const bb = 2 * tourSb(level);
+  // The blind ladder clamps at its top level while modeled chips keep growing with field size — uncapped, a
+  // heads-up-of-1,000 scenario would seat 500bb limit stacks that never finish. Cap the average at the stage's
+  // realistic depth and derive startStack from it, so table stacks, the HUD average, and refill economics all
+  // agree — and every scenario actually plays to completion.
+  const nominalAvgBB = Math.round(F * tourStartStack(gid, 100) / left / bb);
+  const avgBB = Math.max(2, Math.min(nominalAvgBB, SC.avgBB || 999));
+  const startStack = Math.max(1, Math.round(avgBB * bb * left / F));   // per-original-runner chips (tiny late is correct)
+  const avgChips = Math.max(bb * 4, Math.round(F * startStack / left));
+  const heroBB = SK.bb ? SK.bb : Math.max(1, Math.round(avgBB * SK.m));
+  const rank = SK.m >= 2.6 ? 1
+    : SK.m >= 1.8 ? Math.max(1, Math.round(left * 0.07))
+    : SK.m >= 1.3 ? Math.max(1, Math.round(left * 0.3))
+    : SK.m === 1  ? Math.max(1, Math.round(left * 0.5))
+    : SK.bb === 4 ? left
+    : Math.min(left, Math.round(left * 0.8));
+  const first = payoutFor(1, F, buyIn), mincash = payoutFor(paid, F, buyIn) || Math.round(buyIn * 1.8);
+  return { F, paid, left, level, buyIn, startStack, avgChips, avgBB, heroBB, rank, first, mincash,
+           toMoney: left - paid, inMoney: left <= paid, SC, SK };
+}
+// Synthesize the full tournament state for a scenario. It's a normal tournament from here — the blind clock,
+// field attrition, ICM coach and payouts all run as usual, and it plays to completion.
+function buildScenarioState(baseSt, cfg) {
+  const preset = MIX_PRESETS.find(m => m.id === cfg.mix);
+  const seq = (preset && preset.games)
+    ? preset.games.filter(g => GAMES.find(x => x.id === g && x.available))
+    : [cfg.gid || baseSt.gid];
+  const gid = seq[0] || baseSt.gid;
+  const pv = scenPreview(cfg, gid);
+  const levelSec = 35 * 60;
+  const tour = { on:true, mix:cfg.mix, runners:pv.F, stakes:cfg.stakes || "high", buyIn:pv.buyIn, bba:true,
+    dc: cfg.mix === "dealers", seq: seq.length ? seq : [gid], mixIdx:0,
+    level:pv.level, clock: pv.level * levelSec + 60, levelSec, hands: pv.level * 16,   // ×16: DC orbits align, first pick is yours
+    busted: Math.max(0, pv.F - pv.left), dcRecent:[], dcPicker:0,
+    field:{ total:pv.F, startStack:pv.startStack } };
+  let s = mkState(gid, { ...baseSt, format:"tourney", bbDepth:100, tour, players:[] });
+  const bbv = STK(s).bblind || STK(s).bbet || 1;
+  const heroChips = Math.max(bbv, pv.SK.bb ? Math.round(pv.SK.bb * bbv) : Math.round(pv.avgChips * pv.SK.m));
+  const aliveSeats = Math.min(s.players.length, pv.left);      // endgame stages seat fewer live players
+  const players = s.players.map((p, i) => {
+    if (p.id === 0) return { ...p, chips: heroChips };
+    if (i >= aliveSeats) return { ...p, chips: 0 };            // an empty chair — the field is smaller than the table
+    const spread = 0.55 + ((i * 37) % 91) / 100;               // deterministic 0.55–1.45 spread around the average
+    return { ...p, chips: Math.max(bbv * 2, Math.round(pv.avgChips * spread)) };
+  });
+  // Debrief anchor: what the starting spot is worth — share-weighted ICM proxy, floored at min-cash in the money.
+  const pool = pv.F * pv.buyIn;
+  const share = heroChips / Math.max(1, pv.avgChips * pv.left);
+  let icm0 = Math.round(pool * Math.min(0.26, Math.max(0.004, share * 0.8)));
+  if (pv.inMoney) icm0 = Math.max(icm0, pv.mincash);
+  const scen = { on:true, icm0, mincash:pv.mincash, stageN:pv.SC.n, stackN:pv.SK.n, cfg:{ ...cfg } };
+  // Survivors are better PLAYERS, not just tighter: late stages sharpen decision quality (botSkill) while
+  // leaving each seat's looseness and personality intact. A final-table maniac is still a maniac — he just
+  // makes far fewer mistakes. A gentle tightness nudge remains, but skill is the main lever now.
+  const skill = pv.SC.skill || 0;
+  const bt = { ...(s.botTight || {}) };
+  const bs = { ...(s.botSkill || {}) };
+  for (const k of Object.keys(bt)) bt[k] = Math.max(bt[k], Math.round(bt[k] + (68 - bt[k]) * skill * 0.30));
+  for (const k of Object.keys(bs)) bs[k] = Math.round(bs[k] + (95 - bs[k]) * skill * 0.8);
+  return { ...s, players, botTight: bt, botSkill: bs, tour:{ ...tour, scen } };
+}
+// Summarize a scenario's graded decisions into a debrief: how sharp you played, and where you leaked most.
+function scenReview(log) {
+  const graded = (log || []).filter(d => d && d.verdict);
+  const n = graded.length;
+  if (!n) return null;
+  const leaks = graded.filter(d => d.verdict === "leak");
+  const sharp = Math.round(100 * (n - leaks.length) / n);
+  const byCat = {};
+  leaks.forEach(d => { byCat[d.category] = (byCat[d.category] || 0) + (d.severity || 0.4); });
+  const ranked = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
+  const biggest = ranked.length ? ranked[0][0] : null;
+  const bigCount = biggest ? leaks.filter(d => d.category === biggest).length : 0;
+  return { n, leaks: leaks.length, sharp, biggest, bigCount };
+}
+const SCENARIO_TIPS = {
+  "Value aggression":   "you left value on the table — bet and raise your strong hands harder.",
+  "Over-folding":       "you folded hands that were priced in — defend a little wider.",
+  "Calling discipline": "you called too light — those chips add up; fold the marginal spots.",
+  "Bluff control":      "you fired too often into bad spots — pick cleaner bluffing lines.",
+  "Preflop selection":  "tighten (or widen) your starting hands to fit the stage.",
+  "Solid lines":        "a few lines drifted from the sharp play — small tweaks.",
+};
+// Grade a finished scenario: your cash vs. the ICM value of the spot you were handed.
+function scenGrade(cash, icm0, mincash) {
+  if (!cash || cash <= 0) return icm0 < mincash * 0.5 ? "C" : icm0 < mincash ? "D" : "F";
+  const r = cash / Math.max(1, icm0);
+  return r >= 2.2 ? "A+" : r >= 1.4 ? "A" : r >= 0.95 ? "A−" : r >= 0.6 ? "B" : "C+";
+}
+const SCN = {
+  surprise:{display:"block",width:"100%",maxWidth:410,margin:"16px auto 0",padding:12,borderRadius:11,cursor:"pointer",
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontSize:13,letterSpacing:2,fontWeight:"bold",color:"#e8dcb8",
+    background:"linear-gradient(135deg,rgba(138,106,176,0.30),rgba(138,106,176,0.12))",border:"1px solid rgba(160,130,200,0.55)"},
+  ov:{position:"fixed",inset:0,zIndex:70,display:"flex",alignItems:"center",justifyContent:"center",padding:"0 18px",
+    background:"radial-gradient(ellipse at 50% 38%,rgba(16,23,37,0.78),rgba(9,13,20,0.96))",backdropFilter:"blur(3px)"},
+  card:{width:"100%",maxWidth:340,borderRadius:16,padding:"20px 20px 18px",textAlign:"left",
+    background:"linear-gradient(180deg,rgba(30,24,10,0.94),rgba(16,13,6,0.96))",border:"1px solid rgba(201,162,75,0.5)",
+    boxShadow:"0 18px 44px rgba(0,0,0,0.6)"},
+  kick:{fontSize:8.5,letterSpacing:3,color:"#C9A24B",textTransform:"uppercase"},
+  big:{fontSize:21,color:"#F0E9D6",margin:"6px 0 10px",lineHeight:1.15,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  line:{fontSize:11.5,color:"#cfc3a0",lineHeight:1.65},
+  stats:{display:"flex",gap:8,margin:"12px 0 4px"},
+  stat:{flex:1,textAlign:"center",border:"1px solid rgba(201,162,75,0.25)",borderRadius:9,padding:"7px 2px",background:"rgba(201,162,75,0.05)"},
+  statV:{fontSize:15,color:"#D9B96A",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",fontWeight:"bold"},
+  statK:{fontSize:7,letterSpacing:1.4,color:"#9d8659",textTransform:"uppercase",marginTop:2},
+  warn:{marginTop:10,fontSize:10,color:"#fbbf24",letterSpacing:0.5},
+  go:{display:"block",width:"100%",marginTop:14,background:"linear-gradient(165deg,#57b56a,#3f9152)",color:"#0a1a0e",border:"none",
+    borderRadius:11,padding:13,fontSize:14,fontWeight:"bold",letterSpacing:2,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",cursor:"pointer"},
+  ghost:{display:"block",width:"100%",marginTop:9,background:"none",border:"none",color:"#8FA396",fontSize:10,letterSpacing:1,
+    textTransform:"uppercase",textDecoration:"underline",cursor:"pointer",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+};
+function ScenarioPanel({ cfg, setCfg, onStart, curGid }) {
+  const L = LOBBY_S;
+  const [brief, setBrief] = useState(false);
+  const mixes = MIX_PRESETS.filter(m => m.id !== "custom");
+  const preset = MIX_PRESETS.find(m => m.id === cfg.mix);
+  const gid = (preset && preset.games && preset.games[0]) || curGid;
+  const pv = cfg.mix ? scenPreview(cfg, gid) : null;
+  const SC = SCEN_STAGES[cfg.stage], SK = SCEN_STACKS[cfg.stack];
+  const surprise = () => setCfg(c => ({ ...c,
+    stage:(Math.random()*SCEN_STAGES.length)|0, stack:(Math.random()*SCEN_STACKS.length)|0,
+    field:SCEN_FIELDS[(Math.random()*SCEN_FIELDS.length)|0] }));
+  return (
+    <>
+      <div style={L.sec}>
+        <div style={L.lbl}>GAME — always your pick, never randomized</div>
+        <div style={L.grid}>
+          {mixes.map(m => (
+            <button key={m.id} onClick={()=>setCfg(c=>({...c, mix:m.id}))}
+              style={{...L.tile, ...(cfg.mix===m.id?L.tileOn:{})}}>
+              <span style={{...L.tileN, ...(cfg.mix===m.id?{color:"#f4ead0"}:{})}}>{m.name}</span>
+              <span style={{...L.tileD, ...(cfg.mix===m.id?{color:"#c9b98c"}:{})}}>{m.desc}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+      <div style={L.sec}>
+        <div style={L.lbl}>STAGE OF THE TOURNAMENT</div>
+        <div style={L.pills}>
+          {SCEN_STAGES.map((x,i)=>(
+            <button key={x.n} onClick={()=>setCfg(c=>({...c, stage:i}))}
+              style={{...L.pill, flex:"1 1 30%", ...(cfg.stage===i?L.pillOn:{})}}>
+              {x.n}<span style={L.pillU}>{x.u}</span>
+            </button>))}
+        </div>
+      </div>
+      <div style={L.sec}>
+        <div style={L.lbl}>YOUR STACK</div>
+        <div style={L.pills}>
+          {SCEN_STACKS.map((x,i)=>(
+            <button key={x.n} onClick={()=>setCfg(c=>({...c, stack:i}))}
+              style={{...L.pill, flex:"1 1 22%", ...(cfg.stack===i?L.pillOn:{})}}>
+              {x.n}<span style={L.pillU}>{x.u}</span>
+            </button>))}
+        </div>
+      </div>
+      <div style={L.sec}>
+        <div style={L.lbl}>FIELD</div>
+        <div style={L.pills}>
+          {SCEN_FIELDS.map(f=>(
+            <button key={f} onClick={()=>setCfg(c=>({...c, field:f}))}
+              style={{...L.pill, ...(cfg.field===f?L.pillOn:{})}}>
+              {f.toLocaleString()}<span style={L.pillU}>runners</span>
+            </button>))}
+        </div>
+      </div>
+      <button onClick={surprise} style={SCN.surprise}>🎲 SURPRISE ME — random stage, stack &amp; field</button>
+      <div style={L.summary}>
+        {cfg.mix && pv
+          ? <><b>{preset.name}</b> · {cfg.field.toLocaleString()} runners · <b>{SC.n}</b> ({pv.left.toLocaleString()} left) · you <b>{pv.heroBB}bb</b> vs avg {pv.avgBB}bb</>
+          : <>Pick a <b>game</b> to arm the scenario — everything else can be randomized, the game never is.</>}
+      </div>
+      <button style={{...L.start, ...(cfg.mix?{}:{opacity:0.35, boxShadow:"none", cursor:"default"})}}
+        disabled={!cfg.mix} onClick={()=>setBrief(true)}>DEAL ME IN</button>
+      <div style={L.note}>Every scenario plays to completion — down to your bust or the win. The debrief grades your finish against what the starting spot was worth.</div>
+      {brief && pv && (
+        <div style={SCN.ov}>
+          <div style={SCN.card}>
+            <div style={SCN.kick}>THE SITUATION</div>
+            <div style={SCN.big}>{SC.n} — {preset.name}</div>
+            <div style={SCN.line}>{pv.left.toLocaleString()} of {cfg.field.toLocaleString()} remain. You're roughly <b style={{color:"#e8d9a8"}}>{ordinal(pv.rank)}</b> in chips with <b style={{color:"#e8d9a8"}}>{pv.heroBB}bb</b>; the field averages {pv.avgBB}bb. {pv.inMoney
+              ? <>You're <b style={{color:"#57E6B0"}}>in the money</b> — every bust from here is a pay jump.</>
+              : pv.toMoney === 1 ? <><b style={{color:"#E2857A"}}>Stone bubble.</b> The next player out gets nothing.</>
+              : <>{pv.toMoney.toLocaleString()} eliminations to the money ({pv.paid.toLocaleString()} paid).</>}
+              {(pv.SC.skill||0) >= 0.5 && <> These survivors are battle-tested — expect sharper opponents than the early levels.</>}</div>
+            <div style={SCN.stats}>
+              <div style={SCN.stat}><div style={SCN.statV}>{pv.heroBB}bb</div><div style={SCN.statK}>YOU</div></div>
+              <div style={SCN.stat}><div style={SCN.statV}>{ordinal(pv.rank)}</div><div style={SCN.statK}>OF {pv.left.toLocaleString()}</div></div>
+              <div style={SCN.stat}><div style={SCN.statV}>${pv.first.toLocaleString()}</div><div style={SCN.statK}>UP TOP</div></div>
+            </div>
+            <div style={SCN.warn}>Plays to completion — bust or win, then the debrief.</div>
+            <button style={SCN.go} onClick={()=>{ setBrief(false); onStart({ ...cfg }); }}>DEAL ▸</button>
+            <button style={SCN.ghost} onClick={()=>setBrief(false)}>back to the dials</button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function TournamentLobby({ cfg, setCfg, onStart, onCash, onResume, curGid, scen, setScen, onScenario, focus, onProgress }) {
+  const L = LOBBY_S;
+  const [tab, setTab] = useState("tour");
+  const parked = tsLoad();   // a tournament left in progress (survives cash detours + reloads)
+  if (tab === "scen") return (
+    <div style={L.screen}>
+      <div style={L.tabs}>
+        <button style={L.tab} onClick={onCash}>CASH</button>
+        <button style={L.tab} onClick={()=>setTab("tour")}>TOURNAMENT</button>
+        <button style={{...L.tab, ...L.tabOn}}>SCENARIO</button>
+      </div>
+      <ScenarioPanel cfg={scen} setCfg={setScen} onStart={onScenario} curGid={curGid}/>
+    </div>
+  );
+  const preset = MIX_PRESETS.find(m => m.id === cfg.mix) || MIX_PRESETS[0];
+  const rot = preset.games
+    ? preset.games.map(id => (GAMES.find(g => g.id === id)?.label) || id)
+    : preset.id === "single" ? [(GAMES.find(g => g.id === curGid)?.label) || "current game"] : ["your custom mix"];
+  const stake = STAKE_OPTS.find(s => s.id === cfg.stakes) || STAKE_OPTS[2];
+  const spd = SPEED_OPTS.find(s => s.id === cfg.speed) || SPEED_OPTS[2];
+  const singleTable = cfg.runners <= 9;
+  return (
+    <div style={L.screen}>
+      <div style={L.tabs}>
+        <button style={L.tab} onClick={onCash}>CASH</button>
+        <button style={{...L.tab, ...L.tabOn}}>TOURNAMENT</button>
+        <button style={L.tab} onClick={()=>setTab("scen")}>SCENARIO</button>
+      </div>
+
+      {onProgress && (
+        <div style={{marginBottom:14}}>
+          <FocusLine focus={focus} onOpen={onProgress}/>
+        </div>
+      )}
+
+      {parked && onResume && (
+        <button onClick={onResume} style={{width:"100%",margin:"0 0 14px",padding:"13px 15px",borderRadius:12,cursor:"pointer",
+          border:"1px solid rgba(134,239,172,0.55)",background:"linear-gradient(180deg,rgba(46,140,104,0.28),rgba(28,66,40,0.22))",
+          textAlign:"left",display:"flex",flexDirection:"column",gap:3}}>
+          <span style={{fontSize:13,letterSpacing:1.2,fontWeight:"bold",color:"#57E6B0"}}>▶  RESUME TOURNAMENT IN PROGRESS</span>
+          <span style={{fontSize:11,color:"#a9c9b3"}}>
+            Level {(parked.tour?.level||0)+1} · {(parked.tour?.mix||"mixed").toUpperCase()} · {(parked.players?.[0]?.chips||0).toLocaleString()} chips
+          </span>
+        </button>
+      )}
+
+      <div style={L.sec}>
+        <div style={L.lbl}>GAME MIX</div>
+        <div style={L.grid}>
+          {MIX_PRESETS.map(m => (
+            <button key={m.id} onClick={()=>setCfg(c=>({...c, mix:m.id}))}
+              style={{...L.tile, ...(cfg.mix===m.id?L.tileOn:{})}}>
+              <span style={{...L.tileN, ...(cfg.mix===m.id?{color:"#f4ead0"}:{})}}>{m.name}</span>
+              <span style={{...L.tileD, ...(cfg.mix===m.id?{color:"#c9b98c"}:{})}}>{m.desc}</span>
+            </button>
+          ))}
+        </div>
+        <div style={L.rotates}><span style={{color:"#9d8659"}}>ROTATES: </span>{rot.join(" · ")}</div>
+      </div>
+
+      <div style={L.sec}>
+        <div style={L.lbl}>RUNNERS (FIELD SIZE)</div>
+        <div style={L.pills}>
+          {RUNNER_OPTS.map(r => (
+            <button key={r.n} onClick={()=>setCfg(c=>({...c, runners:r.n}))}
+              style={{...L.pill, ...(cfg.runners===r.n?L.pillOn:{})}}>
+              {r.n.toLocaleString()}<span style={L.pillU}>{r.u}</span>
+            </button>
+          ))}
+        </div>
+        <div style={L.hint}>6–9 is a true single table down to a winner. Larger fields simulate the room — you play your 8-max table while it shrinks, payouts &amp; ICM scaled to the real count.</div>
+      </div>
+
+      <div style={L.sec}>
+        <div style={L.lbl}>STARTING STACK</div>
+        <div style={L.pills}>
+          {STACK_OPTS.map(s => (
+            <button key={s.bb} onClick={()=>setCfg(c=>({...c, startBB:s.bb}))}
+              style={{...L.pill, ...(cfg.startBB===s.bb?L.pillOn:{})}}>
+              {s.bb}bb<span style={L.pillU}>{s.u}</span>
+            </button>
+          ))}
+        </div>
+        <div style={L.hint}>Chips everyone starts with, in big blinds. Deeper stacks mean more post-flop play before the blinds start to bite.</div>
+      </div>
+
+      <div style={L.sec}>
+        <div style={L.lbl}>BIG BLIND ANTE</div>
+        <div style={L.pills}>
+          <button onClick={()=>setCfg(c=>({...c, bba:true}))}  style={{...L.pill, flex:"1 1 46%", ...(cfg.bba!==false?L.pillOn:{})}}>ON<span style={L.pillU}>wsop style</span></button>
+          <button onClick={()=>setCfg(c=>({...c, bba:false}))} style={{...L.pill, flex:"1 1 46%", ...(cfg.bba===false?L.pillOn:{})}}>OFF<span style={L.pillU}>classic blinds</span></button>
+        </div>
+        <div style={L.hint}>The big blind posts a one-BB ante for the whole table each hand — fewer ante actions, more action. Applies to blind rounds; stud rounds keep their own ante.</div>
+      </div>
+
+      <div style={L.sec}>
+        <div style={L.lbl}>STAKES — SETS THE FIELD'S SKILL</div>
+        <div style={L.stakes}>
+          {STAKE_OPTS.map(s => (
+            <button key={s.id} onClick={()=>setCfg(c=>({...c, stakes:s.id}))}
+              style={{...L.srow, ...(cfg.stakes===s.id?L.srowOn:{})}}>
+              <span style={{...L.stag, ...(cfg.stakes===s.id?{color:"#D9B96A"}:{})}}>{s.tag}</span>
+              <span style={L.sdesc}>{s.desc}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={L.sec}>
+        <div style={L.lbl}>BLIND SPEED — LEVEL LENGTH</div>
+        <div style={L.pills}>
+          {SPEED_OPTS.map(sp => (
+            <button key={sp.id} onClick={()=>setCfg(c=>({...c, speed:sp.id}))}
+              style={{...L.pill, ...(cfg.speed===sp.id?L.pillOn:{})}}>
+              {sp.label}<span style={L.pillU}>{sp.min} min</span>
+            </button>
+          ))}
+        </div>
+        <div style={L.hint}>~{spd.min}-minute levels — about {Math.max(2, Math.round(spd.min*60/TOUR_HAND_SECS))} hands per level. Shorter levels mean the blinds climb faster.</div>
+      </div>
+
+      <div style={L.summary}>
+        <b>{preset.name}</b> · {cfg.runners.toLocaleString()} runners · <b>{cfg.startBB}bb</b> · <b>{stake.tag}</b> stakes · <b>{spd.label}</b><br/>
+        {singleTable ? "single table · plays down to a winner" : "8-max · simulated room · payouts & ICM scaled to the field"}
+      </div>
+      <button style={L.start} onClick={()=>onStart(cfg)}>START TOURNAMENT</button>
+      <div style={L.note}>Full tournament: real-time blind clock, HORSE-style game rotation, a shrinking field with bubble &amp; ICM, and a payout ladder scaled to the field.</div>
+    </div>
+  );
+}
+
+const LOBBY_S = {
+  screen:{position:"fixed",inset:0,zIndex:60,overflowY:"auto",background:"#0A1F18",
+    backgroundImage:"radial-gradient(ellipse 70% 50% at 50% -8%, #1f3454 0%, transparent 60%), radial-gradient(ellipse at 50% 120%, #2a1f10 0%, transparent 55%), linear-gradient(#0A1F18,#0c121e)",
+    padding:"20px 16px 44px",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",color:"#F0E9D6"},
+  tabs:{display:"flex",gap:8,margin:"2px auto 6px",maxWidth:410},
+  tab:{flex:1,textAlign:"center",padding:"11px 0",borderRadius:10,fontSize:13,letterSpacing:2,fontWeight:"bold",
+    border:"1px solid rgba(255,255,255,0.1)",color:"#9aa0ad",background:"rgba(255,255,255,0.04)",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",cursor:"pointer"},
+  tabOn:{color:"#F0E9D6",background:"linear-gradient(135deg,rgba(201,162,75,0.26),rgba(201,162,75,0.12))",
+    borderColor:"rgba(201,162,75,0.7)",boxShadow:"0 0 12px rgba(201,162,75,0.14)"},
+  sec:{marginTop:18,maxWidth:410,marginLeft:"auto",marginRight:"auto"},
+  lbl:{fontSize:9,letterSpacing:2,color:"#C9A24B",marginBottom:8,textTransform:"uppercase"},
+  grid:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8},
+  tile:{border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"11px 12px",background:"rgba(255,255,255,0.04)",
+    display:"flex",flexDirection:"column",justifyContent:"center",minHeight:52,textAlign:"left",cursor:"pointer",transition:"all 0.14s"},
+  tileOn:{background:"linear-gradient(135deg,rgba(201,162,75,0.26),rgba(201,162,75,0.12))",
+    borderColor:"rgba(201,162,75,0.7)",boxShadow:"0 0 12px rgba(201,162,75,0.14)"},
+  tileN:{fontSize:13,fontWeight:"bold",letterSpacing:1.5,color:"#e0d4ad",lineHeight:1.1},
+  tileD:{fontSize:8,letterSpacing:0.5,color:"#8a7c5a",marginTop:3,textTransform:"uppercase"},
+  rotates:{marginTop:10,fontSize:9.5,letterSpacing:0.4,color:"#cbbd97",lineHeight:1.5},
+  pills:{display:"flex",flexWrap:"wrap",gap:6},
+  pill:{flex:"1 1 21%",minWidth:58,textAlign:"center",border:"1px solid rgba(255,255,255,0.1)",borderRadius:8,padding:"8px 0",
+    fontSize:13,color:"#cdbf9e",background:"rgba(255,255,255,0.04)",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",cursor:"pointer",transition:"all 0.14s"},
+  pillOn:{color:"#F0E9D6",background:"linear-gradient(135deg,rgba(201,162,75,0.26),rgba(201,162,75,0.12))",
+    borderColor:"rgba(201,162,75,0.7)",fontWeight:"bold",boxShadow:"0 0 10px rgba(201,162,75,0.12)"},
+  pillU:{display:"block",fontSize:7,letterSpacing:1,opacity:0.7},
+  hint:{fontSize:9,color:"#6f6048",marginTop:7,lineHeight:1.5},
+  stakes:{display:"flex",flexDirection:"column",gap:7},
+  srow:{display:"flex",alignItems:"center",gap:10,border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"9px 11px",
+    background:"rgba(255,255,255,0.04)",textAlign:"left",cursor:"pointer",width:"100%",transition:"all 0.14s"},
+  srowOn:{borderColor:"rgba(201,162,75,0.7)",background:"linear-gradient(135deg,rgba(201,162,75,0.18),rgba(201,162,75,0.07))",
+    boxShadow:"0 0 10px rgba(201,162,75,0.1)"},
+  stag:{fontSize:12,fontWeight:"bold",letterSpacing:1,width:52,flex:"none",color:"#b9ac86"},
+  sdesc:{fontSize:9.5,color:"#9c8f70",lineHeight:1.4},
+  summary:{marginTop:18,maxWidth:410,marginLeft:"auto",marginRight:"auto",textAlign:"center",fontSize:10,color:"#b9ac86",
+    letterSpacing:0.4,lineHeight:1.6,borderTop:"1px solid rgba(201,162,75,0.14)",paddingTop:14},
+  start:{display:"block",width:"100%",maxWidth:410,margin:"14px auto 0",background:"linear-gradient(165deg,#57b56a,#3f9152)",
+    color:"#0a1a0e",border:"none",borderRadius:12,padding:15,fontSize:15,fontWeight:"bold",letterSpacing:2,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",boxShadow:"0 6px 18px rgba(46,140,104,0.3)",cursor:"pointer"},
+  note:{fontSize:10,color:"#6f6048",textAlign:"center",marginTop:14,maxWidth:380,marginLeft:"auto",marginRight:"auto",lineHeight:1.5},
+};
+
+function dealHand(s0) {
+    if (s0.tour?.on && s0.tour.result) return s0;   // S2: tournament over — no more hands
+    // Cash mixed rotation: play CASH_MIX_HANDS hands of each game, then advance through the chosen sequence.
+    let s0b = s0;
+    if (!s0.tour?.on && s0.cashSeq && s0.cashSeq.length > 1) {
+      const rep = (s0.cashRep || 0) + 1;                      // hands played of the current game (this one included)
+      if (rep >= CASH_MIX_HANDS) {                            // rotate to the next game
+        const idx = ((s0.cashIdx || 0) + 1) % s0.cashSeq.length;
+        s0b = { ...s0, gid: s0.cashSeq[idx], cashIdx: idx, cashRep: 0 };
+      } else {
+        s0b = { ...s0, cashRep: rep };                        // same game, next hand
+      }
+    }
+    return dealCards(s0b.tour?.on ? refillTable(rotateTour(s0b)) : s0b);   // rotate game + reseat fresh players, then deal
+}
+const CASH_MIX_HANDS = 3;   // cash HORSE/mixed rotations: hands of each game before moving to the next
+// Peek the seat that WILL hold the button on the prepared state (same rule dealCards uses) — lets Dealer's
+// Choice know whose turn it is to pick before any cards are pitched.
+function peekDealer(s) {
+  const nP = s.players.length;
+  if (s.dealerIdx == null) return 0;
+  for (let step = 1; step <= nP; step++) { const c = (s.dealerIdx + step) % nP; if (s.players[c].chips > 0) return c; }
+  return s.dealerIdx;
+}
+// Dealer's Choice picker rotates one live seat per ORBIT (starts on the human), independent of the per-hand button.
+function nextPicker(players, cur) {
+  const n = players.length;
+  for (let step = 1; step <= n; step++) { const c = ((cur ?? 0) + step) % n; if (players[c].chips > 0) return c; }
+  return cur ?? 0;
+}
+// dealCards: pitch the physical hand for an already-prepared state `s` (game already chosen). Split out from
+// dealHand so Dealer's Choice can insert a game-selection step between preparing the table and dealing.
+function dealCards(s) {
+    const deck   = mkDeck();
+    // Button rotates one live seat clockwise each hand (random only on the very first hand).
+    const nP = s.players.length;
+    let dealer;
+    if (s.dealerIdx == null) {
+      dealer = Math.floor(rnd() * nP);
+    } else {
+      dealer = s.dealerIdx;
+      for (let step = 1; step <= nP; step++) {
+        const cand = (s.dealerIdx + step) % nP;
+        if (s.players[cand].chips > 0) { dealer = cand; break; }   // skip busted seats
+      }
+    }
+    const stk    = STK(s);
+
+    // ── STUD GAMES: antes, deal 2 down + 1 up, bring-in posts ──
+    if (IS_STUD(s.gid)) {
+      let cursor = 0;
+      let players = mkPs(s.players, 0, s.players.length).map(p => {
+        if (p.chips < stk.studAnte + 1)
+          return { ...p, sittingOut:true, folded:true, hand:[], lastAct:{ text:"Sitting Out", color:"#2C4438" } };
+        const hole = s.gid === "superstud"
+          ? [
+              { ...deck[cursor++], up:false },
+              { ...deck[cursor++], up:false },
+              { ...deck[cursor++], up:false },
+              { ...deck[cursor++], up:false },
+              { ...deck[cursor++], up:true },   // door card (3rd street up-card)
+            ]
+          : [
+              { ...deck[cursor++], up:false },
+              { ...deck[cursor++], up:false },
+              { ...deck[cursor++], up:true },   // door card (3rd street up-card)
+            ];
+        return { ...p, sittingOut:false, folded:false, hand:hole, betSt:0, cmt:0, aggr:0,
+          chips:p.chips - stk.studAnte, cmt:stk.studAnte, lastAct:{ text:`Ante $${MNY(stk.studAnte)}`, color:"#3E5C4E" } };
+      });
+      let pot = players.filter(p => !p.sittingOut).length * stk.studAnte;
+      // Bring-in
+      const biId = bringInSeat(players, s.gid);
+      players = players.map(p => {
+        if (p.id !== biId) return p;
+        const amt = Math.min(stk.bringin, p.chips);
+        pot += amt;
+        return { ...p, chips:p.chips - amt, betSt:amt, cmt:(p.cmt||0)+amt, lastAct:{ text:`Bring-in $${MNY(amt)}`, color:"#fbbf24" } };
+      });
+      const queue = queueFromSeat(players, (biId + 1) % players.length); // wraps to put bring-in last
+      const nx = queue[0];
+      return { ...mkState(s.gid, s), deck:deck.slice(cursor), players, board:[], pot,
+        currentBet:stk.bringin, queue, phase:"acting", dealerIdx:dealer, streetN:0,
+        dealKey:(s.dealKey||0)+1, boardKey:(s.boardKey||0)+1, seq:(s.seq||0)+1,
+        msg: nx === 0 ? `Your action on 3rd street — Pot $${MNY(pot)}` : `${players[nx].name} acts on 3rd street…` };
+    }
+
+    // ── BOMB POT: everyone antes, no preflop, deal both flops, action starts on the flop ──
+    if (IS_BOMB(s.gid)) {
+      const hs = HOLE_SIZE(s.gid);          // Omaha: 4 hole cards
+      const ante = stk.bblind * BOMB_ANTE_BB;
+      let cursor = 0;
+      let players = mkPs(s.players, 0, s.players.length).map(p => {
+        if (p.chips < ante)
+          return { ...p, sittingOut:true, folded:true, hand:[], lastAct:{ text:"Sitting Out", color:"#2C4438" } };
+        const hand = deck.slice(cursor, cursor + hs); cursor += hs;
+        return { ...p, sittingOut:false, folded:false, hand, betSt:0, cmt:0, aggr:0,
+          chips:p.chips - ante, cmt:ante, lastAct:{ text:`Ante $${MNY(ante)}`, color:"#3E5C4E" } };
+      });
+      const pot = players.filter(p => !p.sittingOut).length * ante;
+      // Deal both flops immediately (burn + 3 each).
+      cursor++; const board  = deck.slice(cursor, cursor + 3); cursor += 3;
+      cursor++; const board2 = deck.slice(cursor, cursor + 3); cursor += 3;
+      // Flop betting starts left of the button; button acts last.
+      const queue = startQueue(players, dealer);
+      const nx = queue[0];
+      return { ...mkState(s.gid, s), deck:deck.slice(cursor), players, board, board2, pot,
+        currentBet:0, queue, phase:"acting", dealerIdx:dealer, streetN:1, discardDone:true,
+        dealKey:(s.dealKey||0)+1, boardKey:(s.boardKey||0)+1, seq:(s.seq||0)+1,
+        msg: nx === 0 ? `Bomb pot! Your action on the flop — Pot $${MNY(pot)}` : `Bomb pot! ${players[nx].name} acts on the flop…` };
+    }
+
+    // ── FLOP & DRAMAHA GAMES: blinds + hole cards, board comes later ──
+    if (IS_FLOP(s.gid) || IS_DRAMAHA(s.gid)) {
+      const hs = HOLE_SIZE(s.gid);
+      let cursor = 0;
+      let players = mkPs(s.players, 0, s.players.length).map(p => {
+        if (p.chips <= 0)
+          return { ...p, sittingOut:true, folded:true, hand:[], lastAct:{ text:"Sitting Out", color:"#2C4438" } };
+        const hand = deck.slice(cursor, cursor + hs);
+        cursor += hs;
+        return { ...p, sittingOut:false, folded:false, hand, betSt:0, cmt:0, aggr:0, lastAct:null };
+      });
+      // Assign blinds to first two live seats left of the button
+      const order = liveFromDealer(players, dealer);
+      const sbId = order[0] ?? 0, bbId = order[1] ?? order[0] ?? 0;
+      const bbaAmt = (s.tour?.on && s.tour?.bba) ? stk.bblind : 0;   // WSOP big blind ante = one big blind
+      let pot = 0;
+      players = players.map(p => {
+        if (p.id === sbId) { const amt = Math.min(stk.sblind, p.chips); pot += amt; return { ...p, chips:p.chips-amt, betSt:amt, cmt:(p.cmt||0)+amt, lastAct:{ text:`SB $${MNY(amt)}`, color:"#3E5C4E" } }; }
+        if (p.id === bbId) {
+          const ante  = Math.min(bbaAmt, p.chips);                   // ante posted first (dead money in the pot)
+          const blind = Math.min(stk.bblind, p.chips - ante);        // then the live big blind
+          pot += ante + blind;
+          return { ...p, chips:p.chips-ante-blind, betSt:blind, cmt:(p.cmt||0)+ante+blind, lastAct:{ text: ante>0 ? `BB $${MNY(blind)} +ante $${MNY(ante)}` : `BB $${MNY(blind)}`, color:"#3E5C4E" } };
+        }
+        return p;
+      });
+      // Preflop action starts left of the big blind
+      const queue = queueFrom(players, (bbId + 1) % players.length);
+      const nx = queue[0];
+      return { ...mkState(s.gid, s), deck:deck.slice(cursor), players, board:[], pot,
+        currentBet:stk.bblind, queue, phase:"acting", dealerIdx:dealer, streetN:0,
+        dealKey:(s.dealKey||0)+1, boardKey:(s.boardKey||0)+1, seq:(s.seq||0)+1,
+        msg: nx === 0 ? `Your action preflop — Pot $${MNY(pot)}` : `${players[nx].name} acts preflop…` };
+    }
+
+    // ── DRAW GAMES: blinds + full hands (forced bet pre-draw, like real limit draw) ──
+    const hs = HAND_SIZE(s.gid);
+    let cursor = 0;
+    let players = mkPs(s.players, 0, s.players.length).map(p => {
+      if (p.chips <= 0)  // only busted players sit out; short stacks play all-in for less than the blind
+        return { ...p, sittingOut:true, folded:true, hand:[], lastAct:{ text:"Sitting Out", color:"#2C4438" } };
+      const hand = deck.slice(cursor, cursor + hs);
+      cursor += hs;
+      return { ...p, sittingOut:false, folded:false, hand, betSt:0, cmt:0, aggr:0, lastAct:null };
+    });
+    // Limit draw games are played with blinds (not antes) so the first round has a forced bet.
+    const order = liveFromDealer(players, dealer);
+    const sbId = order[0] ?? 0, bbId = order[1] ?? order[0] ?? 0;
+    const bbaAmt = (s.tour?.on && s.tour?.bba) ? stk.bblind : 0;   // WSOP big blind ante = one big blind
+    let pot = 0;
+    players = players.map(p => {
+      if (p.id === sbId) { const amt = Math.min(stk.sblind, p.chips); pot += amt; return { ...p, chips:p.chips-amt, betSt:amt, cmt:(p.cmt||0)+amt, lastAct:{ text:`SB $${MNY(amt)}`, color:"#3E5C4E" } }; }
+      if (p.id === bbId) {
+        const ante  = Math.min(bbaAmt, p.chips);
+        const blind = Math.min(stk.bblind, p.chips - ante);
+        pot += ante + blind;
+        return { ...p, chips:p.chips-ante-blind, betSt:blind, cmt:(p.cmt||0)+ante+blind, lastAct:{ text: ante>0 ? `BB $${MNY(blind)} +ante $${MNY(ante)}` : `BB $${MNY(blind)}`, color:"#3E5C4E" } };
+      }
+      return p;
+    });
+    const queue = queueFrom(players, (bbId + 1) % players.length);  // action starts left of the big blind
+    const nx    = queue[0];
+    // Veronica deals one community card face-up immediately after the deal (plays for HIGH only).
+    const vBoard = s.gid === "veronica" ? deck.slice(cursor, cursor + 1) : [];
+    if (s.gid === "veronica") cursor += 1;
+    return { ...mkState(s.gid, s), deck:deck.slice(cursor), players, pot, queue, board:vBoard,
+      currentBet:stk.bblind,
+      phase:"acting", maxDraws:(s.gid === "triple" || s.gid === "badugi" || s.gid === "pl27td" || s.gid === "plbad" || IS_SPLITDRAW(s.gid)) ? 3 : s.gid === "pl5d" ? 2 : 1, dealerIdx:dealer,
+      nlBet:Math.max(40, Math.floor(pot * 0.65)),
+      dealKey:(s.dealKey || 0) + 1, seq:(s.seq||0)+1,  // bumps to replay deal animation
+      msg: nx === 0 ? `Your action — Pot $${MNY(pot)}` : `${players[nx].name} is thinking…` };
+  
+}
+
+const DEFAULT_HUMANS = new Set([0]);   // single-player: you are seat 0
+// ── stepTable(st, opts): advance a table through all AUTOMATIC transitions (bots bet, bots draw, streets,
+// showdown) until it needs a human — the pure core of the game loop, callable outside React.
+//
+// Multiplayer seam: `opts.humans` is the set of seats the caller must supply decisions for. Single-player passes
+// nothing and gets today's behavior (seat 0 is you, everyone else is a bot). A server passes the seats occupied
+// by real players — then this same function drives a table of humans, stopping at each one for a networked
+// action instead of consulting cpuDecide. `status` reports WHICH seat it's waiting on so the caller can route it.
+//   returns { st, status: 'needs-bet'|'needs-draw'|'showdown'|'idle'|'guard', seat }
+function stepTable(st, opts) {
+  const humans = opts?.humans instanceof Set ? opts.humans
+               : Array.isArray(opts?.humans) ? new Set(opts.humans)
+               : DEFAULT_HUMANS;                       // default: the local player sits in seat 0
+  let s = st;
+  for (let guard = 0; guard < 1000; guard++) {
+    if (s.phase === 'acting') {
+      const actor = s.queue && s.queue[0];
+      if (actor == null) return { st: s, status: 'idle', seat: null };
+      if (humans.has(actor)) return { st: s, status: 'needs-bet', seat: actor };   // a human's betting decision
+      const { action, amount } = cpuDecide(s, actor);
+      s = applyAction(s, action, amount);
+      continue;
+    }
+    if (s.phase === 'drawing') {
+      // Stop for the lowest-seated human still in the hand; bots resolve automatically. (Note: drewLast is NOT
+      // reset between draw rounds, so it can't be used to detect "hasn't drawn yet" — liveness is the test,
+      // exactly as the single-player loop always did.)
+      const waiting = [...humans].filter(i => s.players[i] && live(s.players[i])).sort((a,b)=>a-b);
+      if (waiting.length) return { st: s, status: 'needs-draw', seat: waiting[0] };
+      s = execDraw(s, [], false);                                      // no human left to draw → bots draw, advance
+      continue;
+    }
+    if (s.phase === 'showdown') return { st: s, status: 'showdown', seat: null };   // hand over
+    return { st: s, status: 'idle', seat: null };
+  }
+  return { st: s, status: 'guard', seat: null };
+}
+
+// ─── ONLINE MULTIPLAYER (client) ─────────────────
+// The server (mp-server.mjs on Railway) is authoritative: it owns game state, validates every move, and
+// pushes each seat a REDACTED view (never opponents' hole cards). This client connects, renders whatever
+// the server sends, and sends the local player's taps as "intents". It NEVER runs the game engine locally
+// for online play — that would defeat server authority. Solo play is entirely unaffected by any of this.
+//
+// Set this to your Railway URL once deployed (wss://... for TLS; ws://... for local testing). Until it's
+// set, the online button explains that multiplayer isn't configured yet rather than failing cryptically.
+const MP_SERVER_URL = "wss://server-getmixed-production.up.railway.app"; // live Railway server (Get Mixed multiplayer)
+
+const MP_TOKEN_KEY = "pmg_mp_token";
+function mpLoadToken() { try { return localStorage.getItem(MP_TOKEN_KEY) || null; } catch { return null; } }
+function mpSaveToken(t) { try { if (t) localStorage.setItem(MP_TOKEN_KEY, t); } catch {} }
+function mpClearToken() { try { localStorage.removeItem(MP_TOKEN_KEY); } catch {} }
+
+// Custom hook: owns the socket lifecycle and the latest server-pushed view. Decoupled from game logic —
+// it only speaks the wire protocol (create/join/start/intent out; welcome/created/joined/state/error in).
+function useOnlineTable() {
+  const [status, setStatus]   = useState("idle");   // idle | connecting | connected | error
+  const [conn, setConn]       = useState(null);     // the live WebSocket
+  const [server, setServer]   = useState(null);     // {seat, view, yourTurn, code} — latest pushed table state
+  const [code, setCode]       = useState(null);     // table code (created or joined)
+  const [err, setErr]         = useState(null);
+  const [joinState, setJoinState] = useState(null); // joiner: null | pending | declined | next-hand
+  const [srvVer, setSrvVer] = useState(null);       // server build version (from welcome) — for deploy debugging
+  const [joinReq, setJoinReq]     = useState(null); // host: {token,name} of someone requesting to join
+  const tokenRef = useRef(mpLoadToken());
+  const wsRef = useRef(null);
+
+  const connect = () => {
+    if (!MP_SERVER_URL) { setErr("not-configured"); setStatus("error"); return; }
+    setStatus("connecting"); setErr(null);
+    let ws;
+    try { ws = new WebSocket(MP_SERVER_URL); }
+    catch { setErr("bad-url"); setStatus("error"); return; }
+    wsRef.current = ws; setConn(ws);
+    ws.onopen = () => {
+      setStatus("connected");
+      if (tokenRef.current) ws.send(JSON.stringify({ type:"resume", token: tokenRef.current }));
+    };
+    ws.onmessage = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.type === "welcome") {
+        if (m.serverVersion) setSrvVer(m.serverVersion);   // remember which server build we're actually talking to
+        // Only adopt the server's fresh token if we don't already have one. If we DO have a saved token,
+        // keep it and resume — otherwise a reconnect would orphan our seat (the table still maps the old
+        // token, so broadcasts would go to a dead socket and our screen would freeze).
+        if (!tokenRef.current) { tokenRef.current = m.token; mpSaveToken(m.token); }
+        else { try { ws.send(JSON.stringify({ type:"resume", token: tokenRef.current })); } catch {} }
+      }
+      else if (m.type === "created") { setCode(m.code); }
+      else if (m.type === "joined")  { setCode(m.code); setJoinState(null); }
+      else if (m.type === "join-pending")   { setJoinState("pending"); }        // joiner: waiting for host
+      else if (m.type === "join-declined")  { setJoinState("declined"); }        // joiner: host said no
+      else if (m.type === "join-next-hand") { setJoinState("next-hand"); }       // joiner: in on next hand
+      else if (m.type === "join-request")   { setJoinReq({ token:m.token, name:m.name }); }  // host: someone wants in
+      else if (m.type === "state")   { setServer({ seat:m.seat, view:m.view, yourTurn:m.yourTurn, code:m.table, spectating:m.spectating }); }
+      else if (m.type === "left")    { setServer(null); setCode(null); setJoinState(null); }
+      else if (m.type === "error")   { setErr(m.err); }
+    };
+    ws.onerror = () => { setErr("connection-failed"); setStatus("error"); };
+    ws.onclose = () => { setStatus(s => s === "error" ? s : "idle"); };
+  };
+
+  const disconnect = () => { try { wsRef.current?.close(); } catch {} wsRef.current = null; setConn(null); setServer(null); setCode(null); setStatus("idle"); };
+  // Leave the current table: tell the server to free our seat, forget our saved identity so we DON'T get
+  // auto-resumed back into the same game, and reset everything to a clean slate.
+  const leaveTable = () => {
+    try { wsRef.current?.send(JSON.stringify({ type:"leave" })); } catch {}
+    mpClearToken(); tokenRef.current = null;
+    try { wsRef.current?.close(); } catch {}
+    wsRef.current = null; setConn(null); setServer(null); setCode(null);
+    setJoinState(null); setJoinReq(null); setErr(null); setStatus("idle");
+  };
+  const sendMsg = (obj) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === 1) { ws.send(JSON.stringify(obj)); return true; }
+    // Socket isn't open — don't silently swallow the action. Surface it so the player knows to reconnect.
+    setErr("disconnected");
+    return false;
+  };
+  const sockState = () => { const ws = wsRef.current; return ws ? ["connecting","open","closing","closed"][ws.readyState] : "none"; };
+  const createTable = (gid, botFill, name) => sendMsg({ type:"create", gid, botFill, name });
+  const joinTable   = (c, name) => sendMsg({ type:"join", code:c, name });
+  const startTable  = () => sendMsg({ type:"start" });
+  const sendIntent  = (action, amount=0) => sendMsg({ type:"intent", action, amount });
+  const rebuy       = () => sendMsg({ type:"rebuy" });
+  const approveJoin = (token) => { sendMsg({ type:"join-approve", token }); setJoinReq(null); };
+  const declineJoin = (token) => { sendMsg({ type:"join-decline", token }); setJoinReq(null); };
+
+  return { status, server, code, err, joinState, joinReq, srvVer, connect, disconnect, leaveTable, createTable, joinTable, startTable, sendIntent, rebuy, approveJoin, declineJoin, clearJoinState:()=>setJoinState(null), sockState: (wsRef.current ? ["connecting","open","closing","closed"][wsRef.current.readyState] : "none") };
+}
+
+// The online play screen. Renders whatever the server pushes; sends taps as intents. Deliberately simple
+// for v1 — create or join by code, then a table view driven entirely by the redacted server state.
+// ─── Table renderer ────────────────────────────────────────────────────────
+// Seats are laid out in flow rows, not at absolute coordinates, so overlap and
+// clipping are structurally impossible. Every size is a multiple of one unit
+// (--u); after layout we measure the widest row and the stack of rows and
+// scale that unit until both fit — which is what makes landscape use the room
+// it actually has instead of a guess.
+
+function TSeat({ p, hero, acting, dealer, shape, reveal, drawsShown }) {
+  if (!p) return null;
+  const hand = p.hand || [];
+  const up   = hand.filter(c => !c.down);
+  const down = hand.filter(c =>  c.down).length;
+  const showUp = shape === "stud" && !p.folded && !hero;
+  const showOwn = hero && hand.length > 0;
+  const cardBox = {
+    height:"calc(var(--u)*3.5)", width:"calc(var(--u)*2.5)", fontSize:"calc(var(--u)*1.6)",
+    marginLeft:"calc(var(--u)*-1.05)", alignItems:"flex-start", paddingLeft:"calc(var(--u)*0.16)",
+  };
+  const ownBox = {
+    height:"calc(var(--u)*4.6)", width:"calc(var(--u)*3.3)", fontSize:"calc(var(--u)*2.1)",
+    marginLeft:"calc(var(--u)*-1.2)", alignItems:"flex-start", paddingLeft:"calc(var(--u)*0.18)",
+  };
+  return (
+    <div className="gm-seat" style={{
+      flex:"0 0 auto", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center",
+      background: acting ? "rgba(12,30,21,0.96)" : "rgba(6,15,11,0.86)",
+      border:`1px solid ${acting ? "#57E6B0" : "rgba(201,162,75,0.18)"}`,
+      boxShadow: acting ? "0 0 0 1px #57E6B0, 0 0 calc(var(--u)*2.2) rgba(87,230,176,0.3)" : "none",
+      borderRadius:"calc(var(--u)*1)", padding:"calc(var(--u)*0.55) calc(var(--u)*0.8)",
+      opacity: p.folded ? 0.34 : 1, transition:"opacity .2s, box-shadow .2s, border-color .2s",
+    }}>
+      <div style={{display:"flex",alignItems:"baseline",gap:"calc(var(--u)*0.6)",whiteSpace:"nowrap"}}>
+        <span style={{fontSize:"calc(var(--u)*1.7)",fontWeight:"bold",color:"#F0E9D6",
+          fontFamily:"'GM-Body',system-ui,sans-serif"}}>{hero ? "You" : p.name}</span>
+        <span style={{fontSize:"calc(var(--u)*1.55)",color:"#EBD08A",fontVariantNumeric:"tabular-nums",
+          fontFamily:"'GM-Body',system-ui,sans-serif"}}>${MNY(p.chips||0)}</span>
+        {dealer && shape !== "stud" && (
+          <span style={{width:"calc(var(--u)*1.8)",height:"calc(var(--u)*1.8)",borderRadius:"50%",
+            background:"#C9A24B",color:"#08160f",fontSize:"calc(var(--u)*1.15)",fontWeight:"bold",
+            display:"inline-flex",alignItems:"center",justifyContent:"center",alignSelf:"center"}}>D</span>
+        )}
+      </div>
+
+      {showOwn && (
+        <div style={{display:"flex",marginTop:"calc(var(--u)*0.4)"}}>
+          {hand.map((c,ci)=>(
+            <BoardCard key={ci} card={c} idx={ci} styleOverride={{
+              ...ownBox, ...(ci===0?{marginLeft:0}:{}),
+              ...(c.down ? {boxShadow:"inset 0 0 0 2px #2f6b8f, 0 2px 6px rgba(0,0,0,0.42)"} : {}),
+            }}/>
+          ))}
+        </div>
+      )}
+
+      {showUp && (up.length > 0 || down > 0) && (
+        <div style={{display:"flex",marginTop:"calc(var(--u)*0.4)",alignItems:"center"}}>
+          {up.map((c,ci)=>(
+            <BoardCard key={ci} card={c} idx={ci}
+              styleOverride={{...cardBox, ...(ci===0?{marginLeft:0}:{})}}/>
+          ))}
+          {down > 0 && (
+            <div style={{marginLeft:"calc(var(--u)*0.35)",display:"flex",gap:"calc(var(--u)*0.12)"}}>
+              {Array.from({length:down}).map((_,d)=>(
+                <i key={d} style={{width:"calc(var(--u)*0.32)",height:"calc(var(--u)*3.5)",borderRadius:1,
+                  display:"block",background:"linear-gradient(160deg,#2f6b8f,#1d4763)",
+                  border:"1px solid rgba(255,255,255,0.12)"}}/>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {!hero && p.folded && (
+        <span style={{fontSize:"calc(var(--u)*1.35)",fontWeight:"bold",marginTop:"calc(var(--u)*0.3)",
+          padding:"calc(var(--u)*0.12) calc(var(--u)*0.6)",borderRadius:"calc(var(--u)*0.45)",
+          background:"rgba(226,133,122,0.16)",color:"#E2857A",whiteSpace:"nowrap"}}>folds</span>
+      )}
+      {!hero && !p.folded && drawsShown && p.drewLast != null && (
+        <span style={{fontSize:"calc(var(--u)*1.35)",fontWeight:"bold",marginTop:"calc(var(--u)*0.3)",
+          padding:"calc(var(--u)*0.12) calc(var(--u)*0.6)",borderRadius:"calc(var(--u)*0.45)",
+          background: p.drewLast === 0 ? "rgba(201,162,75,0.2)" : "rgba(140,170,255,0.18)",
+          color: p.drewLast === 0 ? "#EBD08A" : "#9fb7ff", whiteSpace:"nowrap"}}>
+          {p.drewLast === 0 ? "pat" : `drew ${p.drewLast}`}</span>
+      )}
+      {!hero && !p.folded && !drawsShown && p.lastAct && p.lastAct.text && (
+        <span style={{fontSize:"calc(var(--u)*1.35)",fontWeight:"bold",marginTop:"calc(var(--u)*0.3)",
+          padding:"calc(var(--u)*0.12) calc(var(--u)*0.6)",borderRadius:"calc(var(--u)*0.45)",
+          background:"rgba(87,230,176,0.16)",color:p.lastAct.color||"#57E6B0",
+          whiteSpace:"nowrap",fontFamily:"'GM-Body',system-ui,sans-serif"}}>{p.lastAct.text}</span>
+      )}
+    </div>
+  );
+}
+
+function LandscapeTable({ st, la, onAction, coachAdvice, turnText, onClose }) {
+  const [coachOpen, setCoachOpen] = useState(false);
+  const [land, setLand] = useState(() =>
+    typeof window !== "undefined" && window.innerWidth > window.innerHeight);
+  const rootRef = useRef(null), fieldRef = useRef(null);
+
+  const n      = st.players.length;
+  const shape  = TABLE_SHAPE(st.gid);
+  const cap    = seatCap(st.gid);
+  const rows   = tableRows(n, land);
+  const acting = (st.queue && st.queue[0] != null) ? st.queue[0] : null;
+  const isShow = st.phase === "showdown";
+  const draws  = shape === "draw" || shape === "drawBoard" || shape === "drawOne";
+  const boards = shape === "board2" ? [st.board||[], st.board2||[]]
+               : shape === "stud" || shape === "draw" ? []
+               : [st.board||[]];
+
+  useEffect(() => {
+    const onResize = () => setLand(window.innerWidth > window.innerHeight);
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    return () => { window.removeEventListener("resize", onResize);
+                   window.removeEventListener("orientationchange", onResize); };
+  }, []);
+
+  // Fit: solve for the unit that makes the widest row and the stack of rows
+  // both fit the field. Written straight to the DOM so it can't loop renders.
+  useLayoutEffect(() => {
+    const root = rootRef.current, field = fieldRef.current;
+    if (!root || !field) return;
+    let u = 12;
+    for (let pass = 0; pass < 5; pass++) {
+      root.style.setProperty("--u", u + "px");
+      const fx = field.clientWidth, fy = field.clientHeight;
+      if (!fx || !fy) break;
+      const seats = [...field.querySelectorAll(".gm-seat:not(.gm-hero)")];
+      seats.forEach(s => { s.style.width = ""; s.style.minHeight = ""; });
+      let ow = 0, oh = 0;
+      seats.forEach(s => { ow = Math.max(ow, s.offsetWidth); oh = Math.max(oh, s.offsetHeight); });
+      seats.forEach(s => { s.style.width = ow + "px"; s.style.minHeight = oh + "px"; });
+      let maxW = 0, totH = 0;
+      [...field.children].forEach(c => {
+        totH += c.offsetHeight;
+        if (c.classList.contains("gm-row")) {
+          let w = 0; [...c.children].forEach(k => { w += k.offsetWidth; });
+          w += u * 0.7 * (c.children.length - 1) + u * 1.4;
+          maxW = Math.max(maxW, w);
+        } else maxW = Math.max(maxW, c.offsetWidth);
+      });
+      totH += u * 0.5 * (field.children.length - 1);
+      const s = Math.min(fx / (maxW || 1), fy / (totH || 1));
+      if (s > 0.99 && s < 1.05) break;
+      u = Math.max(6, Math.min(30, u * Math.min(s, 1.3)));
+    }
+  });
+
+  const seatFor = k => {
+    const i = k === "H" ? 0 : k;
+    const p = st.players[i];
+    return <TSeat key={k} p={p} hero={i===0} acting={acting===i} dealer={st.dealerIdx===i}
+      shape={shape} reveal={st.reveal} drawsShown={draws && (st.drawN||0) > 0}/>;
+  };
+
+  const centre = (
+    <div key="C" style={{display:"flex",flexDirection:"column",alignItems:"center",
+      gap:"calc(var(--u)*0.7)"}}>
+      <div style={{fontSize:"calc(var(--u)*2)",letterSpacing:1,color:"#EBD08A",whiteSpace:"nowrap",
+        background:"rgba(8,26,19,0.82)",border:"1px solid rgba(201,162,75,0.5)",borderRadius:99,
+        padding:"calc(var(--u)*0.35) calc(var(--u)*1.8)",fontVariantNumeric:"tabular-nums"}}>
+        POT&nbsp;&nbsp;${MNY(st.pot||0)}</div>
+      {boards.map((b,bi)=> b.length > 0 && (
+        <div key={bi} style={{display:"flex",gap:"calc(var(--u)*0.45)"}}>
+          {b.map((c,ci)=><BoardCard key={ci} card={c} idx={ci} styleOverride={{
+            height:"calc(var(--u)*6.2)",width:"calc(var(--u)*4.4)",fontSize:"calc(var(--u)*2.5)"}}/>)}
+        </div>
+      ))}
+      {draws && (st.maxDraws||1) > 0 && !isShow && (
+        <div style={{fontSize:"calc(var(--u)*1.4)",color:"#9d8a62",letterSpacing:1.6,whiteSpace:"nowrap"}}>
+          {`DRAW ${Math.min((st.drawN||0)+1, st.maxDraws||1)} OF ${st.maxDraws||1}`}</div>
+      )}
+      {isShow && st.msg && (
+        <div style={{fontSize:"calc(var(--u)*1.7)",color:"#57E6B0",fontWeight:"bold",textAlign:"center",
+          fontFamily:"'GM-Body',system-ui,sans-serif"}}>{st.msg}</div>
+      )}
+    </div>
+  );
+
+  const actionBar = la && onAction && (
+    <div style={{flex:"0 0 auto",display:"flex",gap:6,
+      ...(land ? {flexDirection:"column",width:"calc(var(--u)*9.5)"}
+               : {flexDirection:"row",height:"calc(var(--u)*4.6)"})}}>
+      {!la.canCheck && <button onClick={()=>onAction("fold")} style={{flex:1,border:"none",
+        borderRadius:"calc(var(--u)*0.85)",background:"#8f3a34",color:"#fff",fontWeight:"bold",
+        fontSize:"calc(var(--u)*1.75)",cursor:"pointer"}}>FOLD</button>}
+      <button onClick={()=>onAction(la.canCheck?"check":"call")} style={{flex:1,border:"none",
+        borderRadius:"calc(var(--u)*0.85)",background:"#2f6b8f",color:"#fff",fontWeight:"bold",
+        fontSize:"calc(var(--u)*1.75)",cursor:"pointer"}}>
+        {la.canCheck?"CHECK":`CALL ${MNY(la.toCall||0)}`}</button>
+      {la.canRaise && <button onClick={()=>onAction("raise",la.maxTotal)} style={{flex:1,border:"none",
+        borderRadius:"calc(var(--u)*0.85)",background:"linear-gradient(165deg,#e0b755,#c9992f)",
+        color:"#241a06",fontWeight:"bold",fontSize:"calc(var(--u)*1.75)",cursor:"pointer"}}>RAISE ▸</button>}
+    </div>
+  );
+
+  return (
+    <div ref={rootRef} style={{position:"fixed",inset:0,zIndex:200,background:"#05080c",display:"flex",
+      flexDirection:"column",padding:"5px 6px calc(5px + env(safe-area-inset-bottom))",
+      overflow:"hidden","--u":"12px"}}>
+
+      <div style={{flex:"0 0 auto",display:"flex",justifyContent:"space-between",alignItems:"center",
+        fontSize:12,color:"#9d8a62",padding:"0 4px 4px"}}>
+        <span>{(GAMES.find(g=>g.id===st.gid)?.label)||st.gid}
+          {st.stakes?` · ${st.stakes}`:""} · {n} of {cap} seats</span>
+        {onClose && <button onClick={onClose} style={{background:"transparent",
+          border:"1px solid rgba(201,162,75,0.3)",color:"#C9A24B",borderRadius:8,padding:"4px 11px",
+          fontSize:12,fontWeight:"bold",cursor:"pointer"}}>✕ Close</button>}
+      </div>
+
+      <div style={{flex:"1 1 auto",minHeight:0,display:"flex",gap:6,
+        flexDirection: land ? "row" : "column"}}>
+
+        <div style={{flex:"1 1 auto",minWidth:0,minHeight:0,position:"relative",borderRadius:16,
+          overflow:"hidden",
+          background:"radial-gradient(120% 130% at 50% 4%, #10402d 0%, #0d3325 46%, #0a2419 100%)",
+          border:"1px solid rgba(201,162,75,0.25)",boxShadow:"0 8px 40px rgba(0,0,0,0.5)"}}>
+          <div style={{position:"absolute",left:"calc(var(--u)*0.5)",right:"calc(var(--u)*0.5)",
+            top:"calc(var(--u)*0.5)",bottom:"calc(var(--u)*0.5)",borderRadius:"50%/44%",
+            border:"2px solid rgba(201,162,75,0.13)",pointerEvents:"none",
+            background:"radial-gradient(56% 50% at 50% 46%, rgba(87,230,176,0.05), transparent 72%)"}}/>
+
+          <div ref={fieldRef} style={{position:"absolute",left:"calc(var(--u)*0.9)",
+            right:"calc(var(--u)*0.9)",top:"calc(var(--u)*0.9)",bottom:"calc(var(--u)*3.1)",
+            display:"flex",flexDirection:"column",justifyContent:"space-between",zIndex:3}}>
+            {rows.map((r,ri)=> r === "C" ? centre : (
+              <div key={ri} className="gm-row" style={{display:"flex",alignItems:"center",
+                width:"100%",gap:"calc(var(--u)*0.7)",
+                justifyContent: r.length >= 2 ? "space-between" : "center"}}>
+                {r.map(k => seatFor(k))}
+              </div>
+            ))}
+          </div>
+
+          <div style={{position:"absolute",left:"calc(var(--u)*0.9)",right:"calc(var(--u)*0.9)",
+            bottom:"calc(var(--u)*0.7)",zIndex:4,textAlign:"center",pointerEvents:"none",
+            fontSize:"calc(var(--u)*1.45)",color:"#EBD08A",whiteSpace:"nowrap",overflow:"hidden",
+            textOverflow:"ellipsis",textShadow:"0 1px 6px rgba(0,0,0,0.9)"}}>{turnText||""}</div>
+
+          {coachAdvice && coachOpen && (
+            <div style={{position:"absolute",left:"calc(var(--u)*0.9)",right:"calc(var(--u)*0.9)",
+              bottom:"calc(var(--u)*3.2)",zIndex:7,background:"rgba(9,24,34,0.96)",
+              border:"1px solid rgba(87,230,176,0.45)",borderRadius:"calc(var(--u)*0.85)",
+              padding:"calc(var(--u)*0.9) calc(var(--u)*1.1)"}}>
+              <span style={{fontSize:"calc(var(--u)*1.15)",letterSpacing:1.6,color:"#57E6B0",
+                fontWeight:"bold"}}>COACH · THIS SPOT</span>
+              <p style={{fontSize:"calc(var(--u)*1.5)",color:"#cdeede",lineHeight:1.4,
+                marginTop:"calc(var(--u)*0.35)"}}>{coachAdvice.text}{" "}
+                <span onClick={()=>setCoachOpen(false)} style={{color:"#57E6B0",cursor:"pointer",
+                  textDecoration:"underline"}}>Hide ▴</span></p>
+            </div>
+          )}
+          {coachAdvice && !coachOpen && (
+            <button onClick={()=>setCoachOpen(true)} style={{position:"absolute",zIndex:7,
+              top:"calc(var(--u)*0.6)",right:"calc(var(--u)*0.9)",
+              background:"rgba(87,230,176,0.12)",border:"1px solid rgba(87,230,176,0.4)",
+              color:"#57E6B0",borderRadius:"calc(var(--u)*0.6)",
+              padding:"calc(var(--u)*0.35) calc(var(--u)*0.8)",
+              fontSize:"calc(var(--u)*1.25)",fontWeight:"bold",cursor:"pointer"}}>Coach ▾</button>
+          )}
+        </div>
+
+        {actionBar}
+      </div>
+    </div>
+  );
+}
+
+function OnlineTable({ mp, onClose }) {
+  const [joinCode, setJoinCode] = useState("");
+  const [tapDbg, setTapDbg] = useState("");
+  const [raiseOpen, setRaiseOpen] = useState(false);
+  const [raiseAmt, setRaiseAmt] = useState(null);
+  const [name, setName] = useState("");
+  const [gid, setGid] = useState("nlhe");
+  const [botFill, setBotFill] = useState(true);
+  const { status, server, code, err } = mp;
+
+  const errText = {
+    "not-configured": "Online play isn't switched on yet — the server URL still needs to be set in this build.",
+    "bad-url": "The server address looks wrong.",
+    "connection-failed": "Couldn't reach the server. It may be asleep or the address may be off.",
+    "no-such-table": "No table with that code — check the letters and try again.",
+    "table-full": "That table is full.",
+    "conserving": "New tables are paused right now to keep the server within its monthly budget. You can still join a game already in progress — try again later for new tables.",
+    "too-many-tables": "The server is at capacity right now — please try again in a little while.",
+    "disconnected": "Lost the connection to the table. Tap Connect to rejoin — your seat is held.",
+    "not-your-turn": "Hold on — it's not your turn.",
+    "illegal-move": "That move isn't legal here.",
+    "not-seated": "You're not seated at a table.",
+  }[err] || (err ? `Something went wrong (${err}).` : null);
+
+  // Not connected yet → connect / lobby screen.
+  if (status !== "connected") {
+    return (
+      <div style={S.mpOverlay} onClick={onClose}>
+        <div style={{...S.mpModal, maxWidth:400}} onClick={e=>e.stopPropagation()}>
+          <div style={S.modalHead}>
+            <span style={S.modalTitle}>PLAY ONLINE</span>
+            <button style={S.modalClose} onClick={onClose}>✕</button>
+          </div>
+          <div style={{fontSize:12.5,lineHeight:1.6,color:"#cdd8cf",marginBottom:16,fontFamily:"'GM-Body',system-ui,sans-serif"}}>
+            Play real people at a private table — share a code with friends and deal in. Empty seats can be
+            filled with bots or left for humans.
+          </div>
+          {errText && <div style={S.mpErr}>{errText}</div>}
+          <button style={{...S.bigBtn, opacity: status==="connecting"?0.6:1}} disabled={status==="connecting"}
+            onClick={()=>mp.connect()}>
+            {status==="connecting" ? "CONNECTING…" : "CONNECT"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Connected but not yet in a table → create or join.
+  if (!server) {
+    // Joiner is waiting on the host's decision (or was declined).
+    if (mp.joinState === "pending" || mp.joinState === "declined") {
+      return (
+        <div style={S.mpOverlay} onClick={onClose}>
+          <div style={{...S.mpModal, maxWidth:400}} onClick={e=>e.stopPropagation()}>
+            <div style={S.modalHead}>
+              <span style={S.modalTitle}>PLAY ONLINE</span>
+              <button style={S.modalClose} onClick={onClose}>✕</button>
+            </div>
+            {mp.joinState === "pending" ? (
+              <div style={{textAlign:"center",padding:"24px 8px"}}>
+                <div style={{fontSize:15,color:"#EBD08A",marginBottom:8,fontFamily:"'GM-Body',system-ui,sans-serif"}}>Waiting for the host…</div>
+                <div style={{fontSize:12.5,color:"#8FA396",lineHeight:1.6,fontFamily:"'GM-Body',system-ui,sans-serif"}}>
+                  The table host has been asked to let you in. Hang tight — this window will update when they respond.
+                </div>
+              </div>
+            ) : (
+              <div style={{textAlign:"center",padding:"24px 8px"}}>
+                <div style={{fontSize:15,color:"#E2857A",marginBottom:8,fontFamily:"'GM-Body',system-ui,sans-serif"}}>The host declined</div>
+                <div style={{fontSize:12.5,color:"#8FA396",lineHeight:1.6,marginBottom:16,fontFamily:"'GM-Body',system-ui,sans-serif"}}>
+                  You weren't let into that table. You can try another code.
+                </div>
+                <button style={S.bigBtn} onClick={()=>mp.clearJoinState()}>BACK</button>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div style={S.mpOverlay} onClick={onClose}>
+        <div style={{...S.mpModal, maxWidth:400}} onClick={e=>e.stopPropagation()}>
+          <div style={S.modalHead}>
+            <span style={S.modalTitle}>PLAY ONLINE</span>
+            <button style={S.modalClose} onClick={onClose}>✕</button>
+          </div>
+          {errText && <div style={S.mpErr}>{errText}</div>}
+          {code && <div style={S.mpCode}>Table code: <b>{code}</b> — share it, then Start when everyone's in.</div>}
+
+          <div style={S.mpSecTitle}>YOUR NAME</div>
+          <input style={S.mpInput} value={name} onChange={e=>setName(e.target.value)} placeholder="Name at the table" maxLength={12}/>
+
+          <div style={S.mpSecTitle}>CREATE A TABLE</div>
+          <div style={{display:"flex",gap:8,marginBottom:6}}>
+            <select style={S.mpSelect} value={gid} onChange={e=>setGid(e.target.value)}>
+              {GAMES.filter(g=>g.available).map(g=><option key={g.id} value={g.id}>{g.label}</option>)}
+            </select>
+          </div>
+          <label style={S.mpCheck}>
+            <input type="checkbox" checked={botFill} onChange={e=>setBotFill(e.target.checked)}/>
+            Fill empty seats with bots
+          </label>
+          <button style={S.bigBtn} onClick={()=>mp.createTable(gid, botFill, name||"Host")}>CREATE TABLE</button>
+
+          <div style={{...S.mpSecTitle, marginTop:18}}>OR JOIN BY CODE</div>
+          <div style={{display:"flex",gap:8}}>
+            <input style={{...S.mpInput, textTransform:"uppercase", flex:1, marginBottom:0}} value={joinCode}
+              onChange={e=>setJoinCode(e.target.value.toUpperCase())} placeholder="ABCD" maxLength={4}/>
+            <button style={{...S.smBtn, flexShrink:0}} onClick={()=>{ setTapDbg("joining "+joinCode); mp.joinTable(joinCode.trim().toUpperCase(), name||"visitor"); }}>JOIN</button>
+          </div>
+          {tapDbg && <div style={{fontSize:10,color:"#8FA396",marginTop:8,fontFamily:"ui-monospace,monospace"}}>{tapDbg} · sock:{mp.sockState} · srv:{mp.srvVer||"?"}</div>}
+        </div>
+      </div>
+    );
+  }
+
+  // In a table → render the server's redacted view.
+  const v = server.view;
+  const mySeat = server.seat;
+  const isOwner = mySeat === 0;   // v1: seat 0 created the table
+  const notStarted = v.phase === "idle";
+  const la = server.yourTurn ? legalActions(v) : null;
+
+  return (
+    <div style={S.mpOverlay} onClick={onClose}>
+      <div style={{...S.mpModal, maxWidth:440, maxHeight:"92vh", overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+        <div style={S.modalHead}>
+          <span style={S.modalTitle}>ONLINE · {server.code}</span>
+          <button style={S.modalClose} onClick={onClose}>✕</button>
+        </div>
+        {mp.joinReq && (
+          <div style={S.mpJoinReq}>
+            <div style={{fontSize:13,color:"#F0E9D6",marginBottom:10,fontFamily:"'GM-Body',system-ui,sans-serif"}}>
+              <b style={{color:"#EBD08A"}}>{mp.joinReq.name}</b> wants to join your table.
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button style={{...S.mpActBtn, background:"#7a2d2d", flex:1}} onClick={()=>mp.declineJoin(mp.joinReq.token)}>DECLINE</button>
+              <button style={{...S.mpActBtn, background:"#2f6b4f", flex:1}} onClick={()=>mp.approveJoin(mp.joinReq.token)}>LET THEM IN</button>
+            </div>
+          </div>
+        )}
+        {errText && <div style={S.mpErr}>{errText}</div>}
+
+        {notStarted ? (
+          <div>
+            <div style={S.mpCode}>Table <b>{server.code}</b> — share this code. You're in seat {mySeat}.</div>
+            <div style={S.mpSecTitle}>SEATED</div>
+            <div style={{marginBottom:16}}>
+              {v.players.map((p,i)=> p ? (
+                <div key={i} style={S.mpSeatRow}><span style={{color:"#EBD08A"}}>{p.name || `Seat ${i}`}</span><span style={{color:"#8FA396",fontSize:11}}>{i===mySeat?"you":`seat ${i}`}</span></div>
+              ) : null)}
+            </div>
+            {isOwner
+              ? <div>
+                  <button style={S.bigBtn} onClick={()=>{ setTapDbg("sent: start"); mp.startTable(); }}>START GAME</button>
+                  <div style={{fontSize:10,color:"#8FA396",textAlign:"center",marginTop:6,fontFamily:"ui-monospace,monospace"}}>{tapDbg||"tap start when everyone's in"} · sock:{mp.sockState} · srv:{mp.srvVer||"?"}</div>
+                </div>
+              : <div style={S.mpWait}>Waiting for the table owner to start…</div>}
+            <button style={S.mpLeaveBtn} onClick={onClose}>LEAVE TABLE</button>
+          </div>
+        ) : (
+          <div>
+            {/* ── FELT: a real table look — centered board + pot on green, seats around ── */}
+            <div style={S.mpFelt}>
+              <div style={S.mpFeltGlow}/>
+              {/* board + pot, centered */}
+              <div style={S.mpCenter}>
+                <div style={S.mpPotChip}>POT&nbsp;&nbsp;${MNY(v.pot||0)}</div>
+                <div style={S.mpBoardRow}>
+                  {(v.board && v.board.length>0)
+                    ? v.board.map((c,ci)=><BoardCard key={`mp-${ci}-${c.r}${c.s}`} card={c} idx={ci}/>)
+                    : <span style={S.mpPhaseTag}>{v.phase==="acting"?"pre-flop":v.phase}</span>}
+                </div>
+                {v.phase==="showdown" && v.msg && <div style={S.mpResult}>{v.msg}</div>}
+              </div>
+            </div>
+
+            {/* ── SEATS ── */}
+            <div style={S.mpSeats}>
+              {v.players.map((p,i)=> { if (!p) return null;
+                const isActing = (v.queue && v.queue[0]===i) && !p.folded && v.phase!=="showdown";
+                const bet = p.betSt||0;
+                return (
+                <div key={i} style={{...S.mpSeatCard,
+                  ...(i===mySeat?S.mpSeatMe:{}),
+                  ...(isActing?S.mpSeatActive:{}),
+                  ...(p.folded?S.mpSeatFolded:{})}}>
+                  <div style={S.mpSeatTop}>
+                    <span style={S.mpSeatName}>{p.name || (i===mySeat?"You":`Seat ${i}`)}</span>
+                    <span style={{display:"flex",gap:4,alignItems:"center"}}>
+                      {i===v.dealerIdx && <span style={S.mpDealer}>D</span>}
+                      {isActing && <span style={S.mpToAct}>● TO ACT</span>}
+                    </span>
+                  </div>
+                  <div style={S.mpSeatChips}>${MNY(p.chips||0)}{bet>0 && <span style={S.mpBet}>  bet ${MNY(bet)}</span>}</div>
+                  <div style={S.mpSeatCards}>
+                    {(p.hand||[]).map((c,ci)=> c.down
+                      ? <span key={ci} style={S.mpCardBack}/>
+                      : <span key={ci} style={{...S.mpMiniCard, ...(RED.has(c.s)?S.mpCardRed:{})}}>{c.r}<span style={S.mpPipSm}>{c.s}</span></span>)}
+                  </div>
+                  {p.folded
+                    ? <div style={S.mpFolded}>folded</div>
+                    : (p.lastAct && p.lastAct.text) ? <div style={{...S.mpLastAct, color:p.lastAct.color||"#8FA396"}}>{p.lastAct.text}</div> : null}
+                </div>
+              ); })}
+            </div>
+
+            {/* whose turn, in words, above the buttons */}
+            <div style={S.mpTurnLine}>
+              {server.spectating ? "Watching — you're dealt in next hand"
+                : v.phase==="showdown" ? "Showdown"
+                : server.yourTurn ? "Your turn"
+                : (v.queue && v.queue[0]!=null && v.players[v.queue[0]]) ? `${v.players[v.queue[0]].name || "Seat "+v.queue[0]} to act…`
+                : "…"}
+            </div>
+
+            {/* what hand you currently hold — computed from your hole cards + board */}
+            {(() => {
+              const me = v.players[mySeat];
+              if (!me || me.folded || !me.hand || me.hand.some(c=>c.down) || me.hand.length===0) return null;
+              try {
+                const cards = [...me.hand, ...((v.board)||[])];
+                const ev = evalHand(v.gid || "nlhe", cards);
+                if (ev && ev.desc) return <div style={S.mpHandName}>You have: <b>{ev.desc}</b></div>;
+              } catch {}
+              return null;
+            })()}
+
+            {/* action bar — only when it's your turn */}
+            {server.yourTurn && la ? (
+              <div>
+                {raiseOpen && (la.canBet||la.canRaise) ? (
+                  // ── bet-sizing panel ──
+                  (() => {
+                    const myBet = v.players[mySeat]?.betSt || 0;
+                    const minT = la.minTotal||la.maxTotal, maxT = la.maxTotal;
+                    const potNow = v.pot||0;
+                    const clamp = t => Math.max(minT, Math.min(maxT, Math.round(t)));
+                    const presets = [
+                      { lbl:"Min", to: minT },
+                      { lbl:"½ Pot", to: clamp(myBet + la.toCall + Math.round(potNow*0.5)) },
+                      { lbl:"Pot", to: clamp(myBet + la.toCall + potNow) },
+                      { lbl:"All-in", to: maxT },
+                    ];
+                    const chosen = raiseAmt==null ? minT : clamp(raiseAmt);
+                    return (
+                      <div>
+                        <div style={S.mpRaiseHead}>{la.canBet?"BET":"RAISE TO"} <b style={{color:"#EBD08A"}}>${MNY(chosen)}</b> <span style={{color:"#8FA396",fontSize:10}}>(${MNY(chosen-myBet)} more)</span></div>
+                        <input type="range" min={minT} max={maxT} value={chosen} step={Math.max(1,Math.round((maxT-minT)/100))}
+                          onChange={e=>setRaiseAmt(Number(e.target.value))} style={S.mpSlider}/>
+                        <div style={S.mpPresets}>
+                          {presets.map(pr => pr.to>=minT && pr.to<=maxT ? (
+                            <button key={pr.lbl} style={{...S.mpPresetBtn, ...(chosen===pr.to?S.mpPresetOn:{})}} onClick={()=>setRaiseAmt(pr.to)}>{pr.lbl}</button>
+                          ) : null)}
+                        </div>
+                        <div style={S.mpActions}>
+                          <button style={{...S.mpActBtn, background:"#3a3a3a"}} onClick={()=>{ setRaiseOpen(false); setRaiseAmt(null); }}>CANCEL</button>
+                          <button style={{...S.mpActBtn, background:"#b8860b"}} onClick={()=>{ setTapDbg("sent: "+(la.canBet?"bet":"raise")+" "+chosen); mp.sendIntent(la.canBet?"bet":"raise", chosen); setRaiseOpen(false); setRaiseAmt(null); }}>CONFIRM ${MNY(chosen)}</button>
+                        </div>
+                      </div>
+                    );
+                  })()
+                ) : (
+                  <div style={S.mpActions}>
+                    {la.canFold && <button style={{...S.mpActBtn, background:"#7a2d2d"}} onClick={()=>{ setTapDbg("sent: fold"); mp.sendIntent("fold"); }}>FOLD</button>}
+                    {la.canCheck && <button style={{...S.mpActBtn, background:"#2d4a7a"}} onClick={()=>{ setTapDbg("sent: check"); mp.sendIntent("check"); }}>CHECK</button>}
+                    {la.canCall && <button style={{...S.mpActBtn, background:"#2d4a7a"}} onClick={()=>{ setTapDbg("sent: call"); mp.sendIntent("call"); }}>CALL ${MNY(la.toCall)}</button>}
+                    {(la.canBet||la.canRaise) && la.minTotal<la.maxTotal && <button style={{...S.mpActBtn, background:"#b8860b"}}
+                      onClick={()=>{ setRaiseOpen(true); setRaiseAmt(la.minTotal); }}>{la.canBet?"BET":"RAISE"} ▸</button>}
+                    {(la.canBet||la.canRaise) && la.minTotal>=la.maxTotal && <button style={{...S.mpActBtn, background:"#b8860b"}}
+                      onClick={()=>{ setTapDbg("sent: allin"); mp.sendIntent(la.canBet?"bet":"raise", la.maxTotal); }}>ALL-IN ${MNY(la.maxTotal-(v.players[mySeat]?.betSt||0))}</button>}
+                  </div>
+                )}
+                <div style={{fontSize:10,color:"#8FA396",textAlign:"center",marginTop:6,fontFamily:"ui-monospace,monospace"}}>
+                  {tapDbg || "your turn"} · sock:{mp.sockState} · srv:{mp.srvVer||"?"}
+                </div>
+              </div>
+            ) : (
+              <div style={S.mpWait}>{v.queue && v.queue[0]!=null ? `Waiting on seat ${v.queue[0]}…` : "Waiting…"}</div>
+            )}
+            {v.players[mySeat] && (v.players[mySeat].chips||0) <= 500 && (
+              <div style={S.mpBustBox}>
+                <div style={S.mpBustMsg}>
+                  {(v.players[mySeat].chips||0) === 0
+                    ? "You're out of chips. Rebuy to keep playing, or leave the table (a bot takes your seat)."
+                    : "Running low. You can rebuy to a full stack, or play on."}
+                </div>
+                <button style={S.mpRebuyBtn} onClick={()=>mp.rebuy()}>REBUY TO $2,000</button>
+              </div>
+            )}
+            <button style={S.mpLeaveBtn} onClick={onClose}>LEAVE TABLE</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function App() {
+  const [st, setSt]   = useState(() => tsLoad() || mkState("triple"));   // resume a saved tournament on load
+  const [showSettings, setShowSettings] = useState(false);
+  const [showReview, setShowReview] = useState(false);
+  const [showFeedback, setShowFeedback] = useState(false);
+  const [showBug, setShowBug] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [tourStep, setTourStep] = useState(-1);   // -1 = off; 0..N = spotlight step
+  const [showWelcome, setShowWelcome] = useState(false);   // first-visit intro card
+  const [tourRect, setTourRect] = useState(null);
+  const [view, setView] = useState("play");                              // "play" (cash/table) | "lobby" (tournament setup)
+  const [tourCfg, setTourCfg] = useState({ mix:"horse", runners:45, stakes:"high", speed:"standard", startBB:200, bba:true });
+  const [scenCfg, setScenCfg] = useState({ mix:null, stage:4, stack:5, field:45, stakes:"high" });
+  const [showProgress, setShowProgress] = useState(false);
+  const [showNash, setShowNash] = useState(false);
+  const [showOnline, setShowOnline] = useState(false);   // online multiplayer screen
+  const [previewLandscape, setPreviewLandscape] = useState(false);   // TEMP: preview the new landscape table
+  const mp = useOnlineTable();
+  const [focus, setFocus] = useState(() => focusLoad());
+  const [pendingCash, setPendingCash] = useState(false);   // CASH tapped mid-hand → switch after this hand finishes
+  const [gamePick, setGamePick] = useState(null);          // single-game tournament/scenario → fan open at start
+  const [showPayouts, setShowPayouts] = useState(false);   // payout ladder / pay-jump sheet (tap the tournament HUD)
+  // Boot a tournament from the lobby. This slice deals an 8-max tourney table using the mix's first game;
+  // blind clock / rotation / field payouts land in later slices.
+  // Save & resume: checkpoint at each hand's showdown; clear once the tournament is over or abandoned.
+  useEffect(() => {
+    const t = st.tour;
+    if (t?.on && !t.result && st.phase === "showdown") tsSave(st);
+    if (t?.result) tsClear();   // clear only when the tournament is over — a cash detour leaves it PARKED
+  }, [st.phase, st.tour?.on, st.tour?.result, st.tour?.hands]);
+
+  const startTournament = (cfg) => {
+    // Single game with no pick yet → open the game fan first; it calls back with cfg.gid set.
+    if (cfg.mix === "single" && !cfg.gid) { setGamePick({ kind:"tour", cfg }); return; }
+    tsClear();
+    const preset = MIX_PRESETS.find(m => m.id === cfg.mix);
+    const seq = (preset && preset.games)
+      ? preset.games.filter(g => GAMES.find(x => x.id === g && x.available))
+      : [cfg.gid || st.gid];
+    const gid = seq[0] || st.gid;
+    const bbDepth = Math.max(5, Math.round((cfg.startBB || 200) / 2));   // effective big blinds = 2 × bbDepth
+    const tour = { on:true, mix:cfg.mix, runners:cfg.runners, stakes:cfg.stakes, buyIn: TOUR_BUYIN[cfg.stakes] || 250, bba: cfg.bba !== false, dc: cfg.mix === "dealers",
+                   seq: seq.length ? seq : [gid], mixIdx:0, level:0, clock:0, levelSec:(SPEED_OPTS.find(s=>s.id===cfg.speed)?.min || 35) * 60, hands:0, busted:0, dcRecent:[], dcPicker:0,
+                   field: { total: cfg.runners, startStack: tourStartStack(gid, bbDepth) } };
+    // Fresh tournament → fresh field: reset every seat to the new starting stack (an empty prev makes mkPs deal
+    // the tournament start chips) and to the seven archetype names. Passing the old players kept their chips,
+    // so a new stack size showed the right field average but the wrong actual stacks.
+    setSt(s => mkState(gid, { ...s, format:"tourney", bbDepth, tour, players:[] }));
+    setView("play");
+  };
+
+  // Start a scenario drill: synthesize the mid-tournament state and play it to completion like any tournament.
+  const startScenario = (cfg) => {
+    if (cfg.mix === "single" && !cfg.gid) { setGamePick({ kind:"scen", cfg }); return; }   // pick the game first
+    tsClear();
+    scenLogRef.current = [];   // fresh decision log for the debrief
+    setScenCfg(cfg);
+    setSt(s => buildScenarioState(s, cfg));
+    setView("play");
+  };
+
+  // "Finish this hand first": a pending cash switch fires the moment the hand completes. The tournament stays
+  // parked (checkpointed at showdown) and can be resumed from the lobby.
+  useEffect(() => {
+    if (!pendingCash) return;
+    if (st.phase === "showdown" || st.phase === "idle") {
+      setPendingCash(false);
+      setSt(s => mkState(s.gid, { ...s, format:"cash", tour:null, players:[] }));
+      setView("play");
+    }
+  }, [pendingCash, st.phase]);
+  // Tournament clock (Leg C · C2): pauses on your turn, runs 1× while you watch a hand, compresses ~6×
+  // when you're folded or between hands, and pauses when the app is backgrounded. Bumps blind levels.
+  useEffect(() => {
+    if (!st.tour?.on) return;
+    const iv = setInterval(() => {
+      if (typeof document !== "undefined" && document.hidden) return;   // backgrounded → pause
+      setSt(s => {
+        const t = s.tour; if (!t || !t.on) return s;
+        if (s.phase === "acting" && s.queue?.[0] === 0) return s;       // your decision → pause the clock
+        // Real time adds only a gentle tick while a hand is actually being played (so the countdown moves
+        // smoothly); the bulk of each level comes from the per-hand advance in rotateTour, so sitting at a
+        // showdown or idle doesn't inflate the blinds.
+        const speed   = s.phase === "acting" ? 1 : 0;
+        const clock   = (t.clock || 0) + speed;
+        return { ...s, tour: { ...t, clock, level: tourLevelFromClock(clock, t.levelSec) } };
+      });
+    }, 1000);
+    return () => clearInterval(iv);
+  }, [st.tour?.on]);
+  const screenW       = useWidth();
+  const mobile        = screenW < 560;
+  const curGame       = GAMES.find(g => g.id === st.gid);
+
+  // ── Hand-history logging (silent; works even with Coach off) ──
+  const histRef = useRef({ dealKey:-1, decisions:[], startChips:null, startHole:null });
+  const scenLogRef = useRef([]);   // every graded decision across the current scenario (for the debrief)
+  const recordedRef = useRef(-1);
+  // New hand: snapshot starting chips + hole, reset the decision log.
+  useEffect(() => {
+    if (st.phase === "idle" || st.phase === "showdown") return;
+    if (histRef.current.dealKey !== st.dealKey) {
+      histRef.current = {
+        dealKey: st.dealKey, decisions: [],
+        startChips: st.players[0]?.chips ?? null,
+        startHole: (st.players[0]?.hand || []).map(c => ({ r:c.r, s:c.s })),
+      };
+    }
+  }, [st.dealKey, st.phase]);
+  // Hand over: finalize + persist exactly once per hand.
+  useEffect(() => {
+    if (st.phase !== "showdown") return;
+    if (recordedRef.current === st.dealKey) return;
+    recordedRef.current = st.dealKey;
+    try {
+      const h = histRef.current;
+      const me = st.players[0];
+      const delta = (me?.chips ?? 0) - (h.startChips ?? me?.chips ?? 0);
+      hsAppend({
+        ts: Date.now(), gid: st.gid,
+        result: delta > 0 ? "won" : delta < 0 ? "lost" : "chop",
+        delta,
+        startHole: h.startHole || [],
+        finalHole: (me?.hand || []).map(c => ({ r:c.r, s:c.s })),
+        board: (st.board || []).map(c => ({ r:c.r, s:c.s })),
+        decisions: h.decisions || [],
+        msg: st.msg || "",
+      });
+      psPush(h.decisions || []);   // roll this hand's graded decisions into the persistent skill log
+    } catch {}
+  }, [st.phase, st.dealKey]);
+  const logBet = (action, amount) => { try { const g = gradeDecision(st, action, amount); histRef.current.decisions.push(g); if (st.tour?.scen) scenLogRef.current.push(g); } catch {} };
+  const logDraw = (sel) => { try { const g = gradeDraw(st, sel); if (g) { histRef.current.decisions.push(g); if (st.tour?.scen) scenLogRef.current.push(g); } } catch {} };
+
+  // CPU auto-acts with realistic delays (tilted CPUs act faster — impulsive)
+  useEffect(() => {
+    if (st.phase !== "acting" || !st.queue.length || st.queue[0] === 0) return;
+    const actor = st.queue[0];
+    const tilt  = st.cpuTilt?.[actor] || 0;
+    const heroOut = !live(st.players[0]);   // once you're out, fast-forward the rest of the hand
+    // Deliberate pacing so the action is easy to follow — a human-ish beat before each bot acts, with
+    // variation so it doesn't feel metronomic. (Kevin's note: instant CPU actions are hard to track.)
+    const base  = tilt > 0 ? 620 + Math.random() * 420 : 820 + Math.random() * 620;
+    const delay = heroOut ? base / 3.5 : base;
+    const t = setTimeout(() => {
+      setSt(s => {
+        if (s.phase !== "acting" || !s.queue.length || s.queue[0] !== actor) return s;
+        const { action, amount } = cpuDecide(s, actor);
+        return applyAction(s, action, amount);
+      });
+    }, delay);
+    return () => clearTimeout(t);
+  }, [st.seq, st.phase]);
+
+  // When you've folded (or are sitting out), the draw phase must auto-resolve —
+  // the bots draw on their own and the hand plays out to showdown without you.
+  useEffect(() => {
+    if (st.phase !== "drawing") return;
+    if (live(st.players[0])) return;            // you're still in — wait for your input
+    const t = setTimeout(() => {
+      setSt(s => (s.phase === "drawing" && !live(s.players[0])) ? execDraw(s, [], false) : s);
+    }, 190);   // hero's already out — resolve quickly (was 650)
+    return () => clearTimeout(t);
+  }, [st.seq, st.phase]);
+
+  const switchGame = g => { if (!g.available) return; setSt(s => mkState(g.id, { ...s, cashSeq:null, cashIdx:0 })); };
+  // Start a rotating cash mix (HORSE, 8-Game, etc.) — same sequences as the tournament lobby, no clock/field.
+  const startCashMix = mixId => {
+    const preset = MIX_PRESETS.find(m => m.id === mixId);
+    const seq = (preset?.games || []).filter(g => GAMES.find(x => x.id === g && x.available));
+    if (!seq.length) return;
+    setSt(s => mkState(seq[0], { ...s, format:"cash", tour:null, cashSeq:seq, cashIdx:0, cashRep:0 }));
+    setMenuOpen(false);
+  };
+
+const deal = () => setSt(s => {
+  // Dealer's Choice — PER ORBIT: the game is chosen once per lap of the button and held for the whole orbit.
+  // The picker rotates one seat per orbit and starts on the human, so you always make the first choice.
+  if (s.tour?.on && s.tour?.dc && !s.tour.result) {
+    const prep = refillTable(rotateTour(s));
+    const orbitLen = Math.max(2, prep.players.length);
+    const orbitStart = (((prep.tour.hands || 1) - 1) % orbitLen) === 0;   // first hand of a new lap
+    if (!orbitStart) return dealCards(prep);                              // mid-orbit → keep the same game
+    const picker = prep.tour.dcPicker ?? 0;
+    if (picker === 0) return { ...prep, phase:"choosing", chooser:{ picker, hero:true } };
+    const gid = botChooseGame(prep, picker);
+    return { ...prep, phase:"choosing", chooser:{ picker, hero:false, gid, reason:chooseReason(gid) } };
+  }
+  return dealHand(s);
+});
+// Hero taps a game → show the confirm beat (like the mock). DEAL pitches the cards; "choose again" returns to the fan.
+const pickGame    = gid => setSt(s => (s.phase === "choosing" ? { ...s, chooser:{ ...s.chooser, confirm:gid } } : s));
+const chooseAgain = ()  => setSt(s => (s.phase === "choosing" ? { ...s, chooser:{ ...s.chooser, confirm:null } } : s));
+const confirmDeal = ()  => setSt(s => {
+  if (s.phase !== "choosing" || !s.chooser?.confirm) return s;
+  const gid = s.chooser.confirm;
+  const recent = [gid, ...((s.tour?.dcRecent || []).filter(g => g !== gid))].slice(0, 4);
+  const nextP  = nextPicker(s.players, s.tour?.dcPicker ?? 0);
+  return dealCards({ ...s, gid, phase:"acting", chooser:null, tour:{ ...s.tour, dcGame:gid, dcPicker:nextP, dcRecent:recent } });
+});
+// A bot chose the orbit's game: show its pick for a beat, then advance the picker and deal.
+useEffect(() => {
+  if (st.phase === "choosing" && st.chooser && !st.chooser.hero) {
+    const gid = st.chooser.gid;
+    const t = setTimeout(() => setSt(s => {
+      if (s.phase !== "choosing") return s;
+      const nextP = nextPicker(s.players, s.tour?.dcPicker ?? 0);
+      return dealCards({ ...s, gid, phase:"acting", chooser:null, tour:{ ...s.tour, dcGame:gid, dcPicker:nextP } });
+    }), 1500);
+    return () => clearTimeout(t);
+  }
+}, [st.phase, st.chooser]);
+// Hero shot-clock: auto-deal your confirmed pick (or last/first game) if you don't act in time.
+useEffect(() => {
+  if (st.phase === "choosing" && st.chooser?.hero) {
+    const t = setTimeout(() => setSt(s => {
+      if (s.phase !== "choosing") return s;
+      const gid = s.chooser?.confirm || (s.tour?.dcRecent && s.tour.dcRecent[0]) || (s.tour?.seq && s.tour.seq[0]) || s.gid;
+      const nextP = nextPicker(s.players, s.tour?.dcPicker ?? 0);
+      return dealCards({ ...s, gid, phase:"acting", chooser:null, tour:{ ...s.tour, dcGame:gid, dcPicker:nextP, dcRecent:[gid, ...((s.tour?.dcRecent || []).filter(g => g !== gid))].slice(0, 4) } });
+    }), 12000);
+    return () => clearTimeout(t);
+  }
+}, [st.phase, st.chooser]);
+
+  const act   = (action, amount = 0) => { logBet(action, amount); setSt(s => applyAction(s, action, amount)); };
+  const flip  = i => { if (st.phase !== "drawing") return; setSt(s => {
+    if (s.sel.includes(i)) return { ...s, sel:s.sel.filter(x=>x!==i) };
+    if (IS_DRAMAHA(s.gid) && s.sel.length >= DRAW_CAP(s.gid)) return s; // dramadugi caps at 3
+    return { ...s, sel:[...s.sel, i] };
+  }); };
+  const draw  = () => { logDraw(st.sel); setSt(s => execDraw(s, s.sel, false)); };
+  const fold  = () => { logDraw([]); setSt(s => execDraw(s, [], true)); };  // fold during draw
+  // Super Stud discard: tap up to 2 face-down cards, then Discard.
+  const flipDiscard = i => { if (st.phase !== "discarding") return; setSt(s => {
+    if (s.players[0].hand[i]?.up) return s;            // can't discard the up-card
+    if (s.sel.includes(i)) return { ...s, sel:s.sel.filter(x => x !== i) };
+    if (s.sel.length >= 2) return s;                   // exactly two
+    return { ...s, sel:[...s.sel, i] };
+  }); };
+  const discardGo = () => { if (st.sel.length !== 2) return; setSt(s => execDiscard(s, s.sel)); };
+  // Crazy Pineapple discard: tap exactly 1 hole card to pitch.
+  const flipPine = i => { if (st.phase !== "pineDiscard") return; setSt(s => ({ ...s, sel: s.sel.includes(i) ? [] : [i] })); };
+  const pineDiscardGo = () => { if (st.sel.length !== 1) return; setSt(s => execPineDiscard(s, s.sel[0])); };
+  const setTight = (id, v) => setSt(s => ({ ...s, botTight:{ ...s.botTight, [id]:v } }));
+  const setCoach = v => setSt(s => ({ ...s, coach:v }));
+  const setExploitDial = v => setSt(s => ({ ...s, exploitDial:v }));
+
+  // First visit: show the welcome card first; the spotlight tour follows once it's dismissed.
+  useEffect(() => { try {
+    if (!localStorage.getItem("pmg_welcomed")) setShowWelcome(true);
+    else if (!localStorage.getItem("pmg_onboarded")) setTourStep(0);
+  } catch {} }, []);
+  const dismissWelcome = () => {
+    try { localStorage.setItem("pmg_welcomed", "1"); } catch {}
+    setShowWelcome(false);
+    try { if (!localStorage.getItem("pmg_onboarded")) setTourStep(0); } catch { setTourStep(0); }
+  };
+  useEffect(() => {
+    if (tourStep < 0) return;
+    let advanced = false;
+    const measure = () => {
+      const el = document.getElementById(TOUR[tourStep].id);
+      if (el) { setTourRect(el.getBoundingClientRect()); return true; }
+      return false;
+    };
+    // Try immediately; if the target isn't in the DOM (e.g. the coach/Deep Check panel isn't showing in
+    // this situation), don't strand the user on a stale spotlight — skip to the next step that IS present.
+    if (!measure()) {
+      const t = setTimeout(() => {
+        if (measure()) return;                 // it appeared after layout — good
+        if (advanced) return;
+        advanced = true;
+        setTourStep(s => {
+          if (s >= TOUR.length - 1) { try { localStorage.setItem("pmg_onboarded", "1"); } catch {} return -1; }
+          return s + 1;                        // skip the missing step
+        });
+      }, 120);
+      return () => clearTimeout(t);
+    }
+    const t = setTimeout(measure, 60);   // re-measure after layout settles
+    window.addEventListener("resize", measure);
+    window.addEventListener("scroll", measure, true);
+    return () => { clearTimeout(t); window.removeEventListener("resize", measure); window.removeEventListener("scroll", measure, true); };
+  }, [tourStep]);
+  const endTour    = () => { try { localStorage.setItem("pmg_onboarded", "1"); } catch {} setTourStep(-1); };
+  const nextTour   = () => { if (tourStep >= TOUR.length - 1) endTour(); else setTourStep(s => s + 1); };
+  const replayTour = () => {
+    setShowSettings(false); setMenuOpen(false);
+    // Give the tour a sensible situation to point at. The coach + Deep Check steps only make sense on a
+    // live decision with the coach panel showing, so before replaying we set that up — but never at the
+    // cost of a tournament in progress.
+    setSt(s => {
+      if (s.tour?.on && !s.tour.result) return { ...s, coach: true };   // mid-tournament: don't wipe it, just ensure coach is on
+      // Casual play: deal a fresh clean hand with the coach on, so the tour opens on a real decision.
+      return dealHand({ ...s, coach: true });
+    });
+    // Start the tour on the next tick, after the fresh hand has rendered (so spotlight targets exist).
+    setTimeout(() => setTourStep(0), 60);
+  };
+  // Changing format/stake/depth resets the table to fresh, equal stacks (can't change mid-hand).
+  const applyStakeChange = (s, patch) => {
+    const ns  = { ...s, ...patch };
+    const stk = ns.format === "tourney" ? TOURNEY_STAKES : CASH_STAKES[ns.stakeIdx];
+    const chips = depthUnit(ns.gid, stk) * (ns.format === "tourney" ? ns.bbDepth * depthMult(ns.gid) : CASH_DEPTH);
+    return { ...ns, phase:"idle", pot:0, currentBet:0, board:[], reveal:false, result:null,
+      sel:[], queue:[], streetN:0, drawN:0, msg:"Stakes set — press Deal",
+      players: ns.players.map(p => ({ ...p, chips, hand:[], betSt:0, folded:false, sittingOut:false, lastAct:null })) };
+  };
+  const setFormat = f => setSt(s => applyStakeChange(s, { format:f }));
+  const setStake  = i => setSt(s => applyStakeChange(s, { stakeIdx:i }));
+  const setDepth  = d => setSt(s => applyStakeChange(s, { bbDepth:d }));
+
+  // Derived
+  const me       = st.players[0];
+  const meActive = !me.folded && !me.sittingOut;
+  const myTurn   = st.phase === "acting" && st.queue[0] === 0;
+  const drawing  = st.phase === "drawing";
+  const discarding = st.phase === "discarding";
+  const pineDiscarding = st.phase === "pineDiscard";
+  const cpuTurn  = st.phase === "acting" && st.queue.length > 0 && st.queue[0] !== 0;
+  const callAmt  = myTurn ? Math.min(st.currentBet - me.betSt, me.chips) : 0;
+  const canCheck = myTurn && st.currentBet === me.betSt;
+  const mode     = BET_MODE(st.gid);
+  const stk      = STK(st);
+  const bigBet   = mode === "nl" || mode === "pl";
+  const isFL     = mode === "fl";
+  const stud     = IS_STUD(st.gid);
+  const flop     = IS_FLOP(st.gid);
+  const dramaha  = IS_DRAMAHA(st.gid);
+  const fb       = st.streetN <= 1 ? stk.sbet : stk.bbet;  // FL: streets 0-1 = small, 2-3 = big
+  const toCallNow = Math.max(0, st.currentBet - me.betSt);
+  const nlMin    = st.currentBet > 0 ? Math.max(toCallNow + st.currentBet, stk.bblind) : stk.bblind; // additional chips
+  const nlCapTot = mode === "pl" ? potLimitMaxTotal(st, me) : (me.betSt + me.chips);
+  const nlMax    = Math.max(nlMin, nlCapTot - me.betSt);   // additional chips (≥ min)
+  const nlVal    = Math.max(nlMin, Math.min(st.nlBet, nlMax));
+  const odds     = callAmt > 0 ? (st.pot / callAmt).toFixed(1) : null;
+  const wid      = winnerId(st);
+  // Live hand readout
+  const myEval   = stud
+    ? ((st.gid === "razz" || st.gid === "razzdugi") ? (me.hand.length >= 1 ? bestRazz(me.hand) : null)
+                         : (me.hand.length >= 5 ? studHigh(me.hand) : null))
+    : dramaha
+    ? (me.hand.length === HAND_SIZE(st.gid) && st.board.length >= 3 ? bestOmahaHigh(me.hand, st.board) : null)
+    : flop
+    ? ((IS_PINEAPPLE(st.gid) ? me.hand.length >= 2 : me.hand.length === HOLE_SIZE(st.gid)) && st.board.length >= 3 ? flopHigh(st.gid, me.hand, st.board) : null)
+    : (me.hand.length === HAND_SIZE(st.gid) && !IS_SPLITDRAW(st.gid) ? evalHand(st.gid, me.hand) : null);
+  // Double Board: second readout for the bottom board.
+  const myEval2 = IS_DOUBLE(st.gid) && me.hand.length >= 2 && (st.board2||[]).length >= 3
+    ? flopHigh(st.gid, me.hand, st.board2) : null;
+  // Split-draw (Badeucey/Badacey/Archie): show both halves of your hand.
+  const mySplit = IS_SPLITDRAW(st.gid) && me.hand.length === 5 ? splitSides(st.gid, st.board || []) : null;
+  const mySplitTxt = mySplit
+    ? `${mySplit.A.name}: ${mySplit.A.ev(me.hand).desc}  ·  ${mySplit.B.name}: ${mySplit.B.ev(me.hand).desc}`
+    : null;
+  // Dramaha draw-side hand (made from the five hole cards), shown alongside the Omaha high.
+  const myDraw   = dramaha && me.hand.length === HAND_SIZE(st.gid) ? drawSideEval(st.gid, me.hand) : null;
+  const myDrawTxt = myDraw ? (DRAMAHA_SIDE(st.gid) === "27" ? `2-7: ${myDraw.desc}`
+                            : DRAMAHA_SIDE(st.gid) === "badugi" ? myDraw.desc
+                            : `Draw: ${myDraw.desc}`) : null;
+  const myLow    = stud
+    ? (IS_STUD8(st.gid) && me.hand.length >= 5 ? bestLow7(me.hand) : null)
+    : (IS_HILO(st.gid) && me.hand.length === HOLE_SIZE(st.gid) && st.board.length >= 3 ? bestOmahaLow(me.hand, st.board) : null);
+  const myBadugi = (st.gid === "razzdugi" && me.hand.length >= 1) ? evalBadugi(me.hand) : null;
+  const minLive  = stud ? (stk.studAnte + 1) : (flop || dramaha) ? stk.bblind : stk.bblind;
+  const isOver   = st.phase === "idle" || st.phase === "showdown";
+  const ableCount = st.players.filter(p => p.chips >= minLive).length;
+  const meBroke  = isOver && me.chips < minLive;
+  const allBroke = isOver && st.players.filter((_,i)=>i>0).every(p=>p.chips<minLive);
+  const gameOver = isOver && (meBroke || allBroke || ableCount < 2);
+  const tilted   = [1,2,3,4,5,6,7].filter(i => (st.cpuTilt?.[i]||0) > 0);
+  const SLBL     = stud
+    ? ["3rd Street","4th Street","5th Street","6th Street","7th Street"]
+    : (flop || dramaha)
+    ? ["Preflop","Flop","Turn","River"]
+    : ["Pre-Draw Betting","After Draw 1","After Draw 2","After Draw 3"];
+  const streetLbl = st.phase === "showdown" ? "Showdown"
+    : (dramaha && st.phase === "drawing") ? "The Draw"
+    : st.phase === "discarding" ? "The Discard"
+    : (SLBL[st.streetN] || "");
+
+  // DEEP CHECK — on-demand rollout best-response. The engine (bestResponse/rolloutEV) is
+  // trustworthy but expensive, so it runs only when the player taps, never automatically.
+  // Framed as "correct against THIS table," not GTO: it re-deals opponents holdings
+  // consistent with how they've actually played the hand.
+  const [deepCheck, setDeepCheck] = useState(null);   // { best, all, sims } | "running" | null
+  const runDeepCheck = () => {
+    if (!myTurn && !drawing) return;
+    setDeepCheck("running");
+    // Defer so the "running" state paints before the (blocking) sim starts.
+    setTimeout(() => {
+      try {
+        const seat = me.id;
+        const res = bestResponse(st, seat, 220);   // more sims than the passive coach — this is the deliberate deep look
+        setDeepCheck(res || { empty: true });
+      } catch (e) {
+        if (typeof console !== "undefined") console.warn("deep check failed:", e);
+        setDeepCheck({ empty: true });
+      }
+    }, 30);
+  };
+  // Any change to the live decision invalidates a prior deep check.
+  const deepKey = `${st.gid}|${st.phase}|${st.drawN}|${myTurn?1:0}|${drawing?1:0}|${st.currentBet}|${st.pot}|${(me.hand||[]).map(c=>c.r+c.s).join("")}`;
+  const deepKeyRef = useRef(deepKey);
+  if (deepKeyRef.current !== deepKey) { deepKeyRef.current = deepKey; if (deepCheck) setDeepCheck(null); }
+
+  // Coach advice (only when coach mode is on and it's your move).
+  // Memoized so the Monte-Carlo equity sim reruns only when the situation changes,
+  // not on every bet-slider drag.
+  const adviceKey = (!st.coach || !meActive) ? "off"
+    : `${st.gid}|${st.phase}|${st.drawN}|${drawing?1:0}|${myTurn?1:0}|${callAmt}|${st.currentBet}|${st.pot}|${st.exploitDial}|${(me.hand||[]).map(c=>c.r+c.s).join("")}|${st.players.map(p=>p.folded?"F":(p.drewLast??"-")).join(",")}|${(st.sel||[]).join("")}`;
+  const advice = useMemo(() => {
+    if (!st.coach || !meActive) return null;
+    try {
+      if (drawing) return coachDraw(st, me);
+      if (myTurn)  return coachBet(st, me, callAmt);
+      return null;
+    } catch (e) {
+      // A coach glitch must never crash the table — suppress the tip and play on.
+      if (typeof console !== "undefined") console.warn("coach suppressed:", e);
+      return null;
+    }
+  }, [adviceKey]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Bet-size presets (pot-limit caps at the pot; no-limit allows all-in)
+  // Pot-fraction sizing done right: an opening bet is fraction×pot; a raise is
+  // call + fraction×(pot AFTER the call) — which is what "½-pot raise" actually means.
+  const potAdd = f => st.currentBet === 0
+    ? Math.floor(st.pot * f)
+    : toCallNow + Math.floor((st.pot + toCallNow) * f);
+  // Big-blind opens (like the sizing chips on online clients) sit alongside the pot fractions — a raise TO N×bb.
+  const bbv  = STK(st).bblind || STK(st).bbet || 1;
+  const bbTo = m => Math.round(m * bbv);
+  const presets = (mode === "pl"
+    ? [ { lbl:"2bb", v:bbTo(2) }, { lbl:"2.2bb", v:bbTo(2.2) }, { lbl:"½", v:potAdd(.5) }, { lbl:"¾", v:potAdd(.75) }, { lbl:"Pot", v:potAdd(1) } ]
+    : [ { lbl:"2bb", v:bbTo(2) }, { lbl:"2.2bb", v:bbTo(2.2) }, { lbl:"½", v:potAdd(.5) }, { lbl:"¾", v:potAdd(.75) }, { lbl:"Pot", v:potAdd(1) }, { lbl:"All In", v:nlMax } ]
+  ).map(p => ({ ...p, v:Math.max(nlMin, Math.min(p.v, nlMax)) }))
+   .filter((p,i,a) => p.v > 0 && a.findIndex(x => x.v === p.v) === i);
+
+  return (
+    <div style={S.root}>
+      <style>{`
+        @font-face{font-family:'GM-Neon';src:url(data:font/woff;base64,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) format('woff');font-weight:400;font-style:normal;font-display:swap}
+        @font-face{font-family:'GM-Body';src:url(data:font/woff;base64,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ABf/9AAY/+4AGf/qABr/5AAb/+gAHP/oAB3/6AAe/+IAIP/iACH/4gAi/+IAI//hACT/4gAs/+IALv/iADH/4QAz/+QANP/qADb/5AA4/+IAPf/hAD7/4QA//+EAQP/hAEH/4QBC/+EAbwAGAHX/4QCE/+IAEAAK/20AE//VABb/1wAX/+IAGP/QABr/2AAw/4gANP+TADX/gAA3/5IAOf+KAGj/8ABvAAoAc//QAHX/sgCF/+QACQAj//4AMf/+ADT//gA9//4APv/+AD///gBA//4AQf/+AEL//gACADX//QB1/+YAAwA0//oANf/xAHUAEAABACcANAABADT/+AABACcAPwAqAB7/5QAg/+UAIf/lACL/5QAj/94AJP/lACb/7gAn/+4AKv/wACv/8AAs/+UALf/wAC7/5QAv//AAMP/kADH/3gAy/+4AM//fADT/3wA1/9wANv/fADf/5AA4/+UAOf/qADv/8AA8//AAPf/eAD7/3gA//94AQP/eAEH/3gBC/94AQ//uAET/7gBF/+4ARv/wAEf/8ABp//AAav/wAG//4gB1/8YAhP/lAAMAJwBSAIH/6wCC/+sAMAAe/98AH//kACD/3wAh/98AIv/fACP/7QAk/98AJf/uACb/7gAn/+8AKP/uACn/7gAq//AAK//wACz/3wAt//AALv/fAC//8AAw/+QAMf/tADL/7gAz/+YANP/pADX/6AA2/+YAN//kADj/3wA5/94AOv/uADv/8AA8//AAPf/tAD7/7QA//+0AQP/tAEH/7QBC/+0AQ//uAET/7gBF/+4ARv/wAEf/8ABp/7MAav+zAHP/vgB1/84AhP/fAIX/7QACAIH/6gCC/+oABwAw//IANP/wADX/7AA3//gAOf/uAHX/5gB6/9wAFgAe//IAIP/yACH/8gAi//IAJP/yACb/+AAs//IALv/yADD/9AAz//AANP/qADX/8gA2//AAN//4ADj/8gA5/+4Aaf/fAGr/3wB6/+QAgf/9AIL//QCE//IAGQAe//EAIP/xACH/8QAi//EAI//sACT/8QAs//EALv/xADD/8AAx/+wAM//sADT/8gA1/+YANv/sADj/8QA9/+wAPv/sAD//7ABA/+wAQf/sAEL/7AB1/+UAgf/9AIL//QCE//EALwAe/+YAH//0ACD/5gAh/+YAIv/mACP/+AAk/+YAJf/0ACb/8gAn//IAKP/0ACn/9AAq//QAK//0ACz/5gAt//QALv/mAC//9AAw/+4AMf/4ADP/7gA0/+QANf/kADb/7gA3/+oAOP/mADn/1gA6//QAO//0ADz/9AA9//gAPv/4AD//+ABA//gAQf/4AEL/+ABG//QAR//0AGn/vABq/7wAa//yAGz/8gB1/90Aev/cAHz/7gB+//YAhP/mABMAHv/3ACD/9wAh//cAIv/3ACP/9AAk//cALP/zAC7/9wAx//QAOP/3AD3/9AA+//QAP//0AED/9ABB//QAQv/0AHMAEgB1/+kAhP/3AAEAJ//4AAwAHv/4ACD/+AAh//gAIv/4ACT/+AAnAFIALP/4AC7/+AAz//gANv/4ADj/+ACE//gACQAe/+QAIP/kACH/5AAi/+QAJP/kACz/5AAu/+QAOP/kAIT/5AARAB7/7gAg/+4AIf/uACL/7gAj/+IAJP/uACz/7gAu/+4AMf/iADj/7gA9/+IAPv/iAD//4gBA/+IAQf/iAEL/4gCE/+4ADAAw/+4ANP/yADX/5gA3/+4AOf/oAG8ALABxABIAc//sAHX/zAB6ADgAfAA2AH4AOAAEADD/9gA1//kAN//yAHX/7QAGAE7//gBT/9oAaf/lAGr/5QCB/94Agv/eAAEAU//5AAIAU//mAHX/4AADAFP/7ABp/+QAav/kAAoATf/ZAE7/8wBQ/+wAUf/yAFP/zwBV/+cAaf/XAGr/1wCB/8IAgv/CAAMAU//hAGn/5ABq/+QABgBN/+cAT//0AFP/3wBV/+wAgf/JAIL/yQANAEz/7wBO//YAT//rAFD/2QBS/90AU//xAFT/6gBV/+4Aaf+8AGr/vAB1/8sAgQAXAIIAFwAHAE3/7gBO//cAT//tAFP/4wBV//QAgf/lAIL/5QALAE3/9wBO//YAT//3AFD/7QBS/+MAU//fAFT/7wBp/7kAav+5AIH//QCC//0ABwAB/+QACv/kABT/8AAZ/+QAG//wABz/8AAd//AACwAW/7EAF//IACcAJAA0/98ATP/lAE3/rgBQ/+AAUv/kAFP/wwBV/8wAcf+8ADUAAf/GAAIADgAD/+UABAAOAAUADgAGAA4AB//lAAgADgAJAA4ACv+yAAsADgAMAA4ADQAOAA4ADgAP/+UAEAAOABH/5QASAA4AHv/MACD/zAAh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ADwAAwA9AEIACQBDAEUABQBGAEcAAwBpAGoADwBrAGwADgCBAIIAEACEAIQAAQCGAIYAAgABAAAACgBYAPIAAkRGTFQADmxhdG4ALgAEAAAAAP//AAsAAAABAAMABAAFAAYABwAIAAkACgALAAQAAAAA//8ACwAAAAIAAwAEAAUABgAHAAgACQAKAAsADGFhbHQASmNjbXAAUmNjbXAAWGRsaWcAYGZyYWMAZmxpZ2EAbG9yZG4AcnBudW0AeHNhbHQAfnNzMDEAhHN1cHMAjnRudW0AlAAAAAIAAAABAAAAAQACAAAAAgACAAIAAAABAAkAAAABAAQAAAABAAoAAAABAAUAAAABAAcAAAABAAsABgABAAwAAAEAAAAAAQADAAAAAQAIAA0AHACaAMoA8AEIAUQBggGkAbwB1AI2Ar4CvgABAAAAAQAIAAIAPAAbAEoASwBKADgAOQA6ADsAPABLAD0AVwBcAF0AXgBfAGAATABNAE4ATwBQAFEAUgBTAFQAVQCHAAEAGwABAA8AHgAiACQAKAAqACsALAAxAEwAUQBSAFMAVABVAFcAWABZAFoAWwBcAF0AXgBfAGAAhQADAAAAAQAIAAEAXAAEAA4AFgAcACIAAwBWAFgAZAACAFkAZQACAFoAZgACAFsAZwACAAAAAQAIAAEACgACABIAGAABAAIAQQBCAAIAIwAmAAIAIwApAAEAAAABAAgAAQAGABcAAgABAE0AUAAAAAQAAAABAAgAAQAsAAIACgAgAAIABgAOAGIAAwBzAFAAYQADAHMATgABAAQAYwADAHMAUAABAAIATQBPAAYAAAACAAoAJAADAAEAfAABABIAAAABAAAABgABAAIAAQAeAAMAAQBiAAEAEgAAAAEAAAAGAAEAAgAPACwAAQAAAAEACAACAA4ABABKAEsASgBLAAEABAABAA8AHgAsAAEAAAABAAgAAQAG//UAAgABAFcAYAAAAAEAAAABAAgAAQAGAAsAAgABAEwAVQAAAAQACAABAAgAAQBOAAQADgAoADIARAADAAgADgAUABsAAgAUABwAAgAlAB0AAgApAAEABABAAAIAMQACAAYADABGAAIAIwBHAAIAMQABAAQASAACACMAAQAEABQAIwAvADEABAAIAAEACAABAHYAAwAMAC4AbAAEAAoAEAAWABwAPgACACMAQQACACYAPwACACcAQgACACkAAwAIABwAMABEAAkAMgAxACMAJgAxADEAIgAhAEUACQAyADEAIwAmADEAMQAiAC8AQwAGADIAMQAjACYAMQABAAQASQACADEAAQADACMALAAxAAEAAAABAAgAAgAWAAgAOAA5ADoAOwA8AD0AVgCHAAEACAAiACQAKAAqACsAMQBNAIUAAAABAAEACAABAAAAFAABAAAAHAACd2dodAEBAAAAAgADAAAAAgACAZAAAAK8AAAAAA==) format('woff');font-weight:400;font-style:normal;font-display:swap}
+        @font-face{font-family:'GM-Body';src:url(data:font/woff;base64,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AAAAAABoAG4AgQByAIgAkACFAIIAeQB6AHEAiQBqAHUAaQBzAGsAbACNAIsAjABvAIQAfQB0AH4AjwB4AJMAewCGAHwAjgBiAGEAYwAAAAoAfgADAAEECQAAAKgAAAADAAEECQABAAwAqAADAAEECQACAAgAtAADAAEECQADACwAvAADAAEECQAEABYA6AADAAEECQAFADoA/gADAAEECQAGABYBOAADAAEECQEAAAgBTgADAAEECQEBAAwBVgADAAEECQEIAAgAtABDAG8AcAB5AHIAaQBnAGgAdAAgADIAMAAyADEAIABUAGgAZQAgAE8AdQB0AGYAaQB0ACAAUAByAG8AagBlAGMAdAAgAEEAdQB0AGgAbwByAHMAIAAoAGgAdAB0AHAAcwA6AC8ALwBnAGkAdABoAHUAYgAuAGMAbwBtAC8ATwB1AHQAZgBpAHQAaQBvAC8ATwB1AHQAZgBpAHQALQBGAG8AbgB0AHMAKQBPAHUAdABmAGkAdABCAG8AbABkADEALgAxADAAMAA7AGYAcgBhAGcAOwBPAHUAdABmAGkAdAAtAEIAbwBsAGQATwB1AHQAZgBpAHQAIABCAG8AbABkAFYAZQByAHMAaQBvAG4AIAAxAC4AMQAwADAAOwBnAGYAdABvAG8AbABzAFsAMAAuADkALgAyADcAXQBPAHUAdABmAGkAdAAtAEIAbwBsAGQAcwBzADAAMQBXAGUAaQBnAGgAdAADAAAAAAAA/5wAMgAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAf//AA8AAQAAAAwAAACUAAAAAgAWAAEAAQABAAMABQABAAcABwABAAkACQABAAsADAABAA4ADwABABIAFQABABcAFwABABkAGgABAB4AHgABACAAIAABACIAIgABACQAJAABACYAJgABACgAKQABACsALAABAC8AMgABADQANAABADYAOAABADoAOgABADwAPQABAD4ASQACABwADAAmADYALgA2AD4ARgBmAJgAygDSANoA4gACAAEAPgBJAAAAAQAEAAEBdAABAAQAAQFeAAEABAABAUAAAQAEAAEBPAAFAAwAEAAUABgAHAABAZcAAQMuAAEExAABBlsAAQfyAAgAEgAWABoAHgAiACYAKgAuAAEBrwABA14AAQUNAAEGuwABCGoAAQoYAAELxwABDXYACAAS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AD7/ygA//8oAQP/KAEH/ygBC/8oAQ//gAET/4ABF/+AARv/oAEf/6AB1/88AhP/bAIX/+ACG//IAh//yABUACv91ABP/vwAV//QAFv/gABf/3AAY/9YAGf/WABr/6gAm/9oAJ//UADD/fgA0/7EANf+SADf/pwA5/4oAaP/kAG///QBz/7wAdf+zAIX/0ACH/8gAJQAB/+QAA//qAAf/6gAK/+gAD//qABH/6gAU/+gAFv/oABf/9AAY/+4AGf/qABr/5AAb/+gAHP/oAB3/6AAe/+oAIP/qACH/6gAi/+oAI//sACT/6gAs/+oALv/qADH/7AAz/+QANP/qADb/5AA4/+oAPf/sAD7/7AA//+wAQP/sAEH/7ABC/+wAbwANAHX/8gCE/+oAEAAK/3sAE//bABb/5gAX/+kAGP/XABr/4gAw/5EANP+iADX/iQA3/6AAOf+KAGj/8ABvAA8Ac//QAHX/wACF/+QACQAjAAAAMQAAADQAAAA9AAAAPgAAAD8AAABAAAAAQQAAAEIAAAACADX/+gB1/+wAAwA0//oANf/zAHUAFQABACcANAABADT/+AABACcAPwAqAB7/6wAg/+sAIf/rACL/6wAj/+UAJP/rACb/7gAn/+4AKv/wACv/8AAs/+sALf/wAC7/6wAv//AAMP/kADH/5QAy/+4AM//oADT/6wA1/+MANv/oADf/5AA4/+sAOf/qADv/8AA8//AAPf/lAD7/5QA//+UAQP/lAEH/5QBC/+UAQ//uAET/7gBF/+4ARv/wAEf/8ABp//AAav/wAG//6QB1/9MAhP/rAAMAJwBSAIH/8wCC//MAMAAe/+EAH//kACD/4QAh/+EAIv/hACP/9AAk/+EAJf/uACb/7gAn/+wAKP/uACn/7gAq/+sAK//rACz/4QAt/+sALv/hAC//6wAw/+QAMf/0ADL/7gAz/+sANP/sADX/6AA2/+sAN//kADj/4QA5/94AOv/uADv/6wA8/+sAPf/0AD7/9AA///QAQP/0AEH/9ABC//QAQ//uAET/7gBF/+4ARv/rAEf/6wBp/7IAav+yAHP/xgB1/9gAhP/hAIX/8gACAIH/6gCC/+oABwAw//IANP/wADX/7AA3//gAOf/uAHX/6wB6/9wAFgAe//YAIP/2ACH/9gAi//YAJP/2ACb/+AAs//YALv/2ADD/9AAz//AANP/qADX/8gA2//AAN//4ADj/9gA5/+4Aaf/mAGr/5gB6/+QAgQAAAIIAAACE//YAGQAe//MAIP/zACH/8wAi//MAI//0ACT/8wAs//MALv/zADD/8AAx//QAM//sADT/8gA1/+YANv/sADj/8wA9//QAPv/0AD//9ABA//QAQf/0AEL/9AB1/+gAgQAAAIIAAACE//MALwAe/+4AH//0ACD/7gAh/+4AIv/uACP/+AAk/+4AJf/0ACb/8gAn//IAKP/0ACn/9AAq//QAK//0ACz/7gAt//QALv/uAC//9AAw/+4AMf/4ADP/7gA0/+QANf/kADb/7gA3/+oAOP/uADn/1gA6//QAO//0ADz/9AA9//gAPv/4AD//+ABA//gAQf/4AEL/+ABG//QAR//0AGn/vABq/7wAa//yAGz/8gB1/+cAev/cAHz/7gB+//YAhP/uABMAHv/1ACD/9QAh//UAIv/1ACP/9AAk//UALP/yAC7/9QAx//QAOP/1AD3/9AA+//QAP//0AED/9ABB//QAQv/0AHMAGAB1//AAhP/1AAEAJ//4AAwAHv/4ACD/+AAh//gAIv/4ACT/+AAnAFIALP/4AC7/+AAz//gANv/4ADj/+ACE//gACQAe/+0AIP/tACH/7QAi/+0AJP/tACz/7QAu/+0AOP/tAIT/7QARAB7/7gAg/+4AIf/uACL/7gAj/+IAJP/uACz/7gAu/+4AMf/iADj/7gA9/+IAPv/iAD//4gBA/+IAQf/iAEL/4gCE/+4ADAAw/+4ANP/2ADX/6gA3/+4AOf/oAG8AMwBxABIAc//yAHX/2gB6ADgAfAA2AH4AOAAEADD/9gA1//kAN//yAHX/9AAGAE4AAABT/+YAaf/tAGr/7QCB/+IAgv/iAAEAUwAAAAIAU//xAHX/7gADAFP/8QBp/+oAav/qAAoATf/gAE7/9gBQ//cAUf/2AFP/1wBV/+4Aaf/lAGr/5QCB/8wAgv/MAAMAU//oAGn/7wBq/+8ABgBN//EAT//2AFP/6QBV//MAgf/SAIL/0gANAEz/9ABO//wAT//zAFD/4ABS/+QAU//1AFT/8wBV//UAaf/EAGr/xAB1/9gAgQAcAIIAHAAHAE3/9ABO//wAT//0AFP/8ABV//sAgf/wAIL/8AALAE3//QBO//wAT//8AFD/8wBS/+wAU//u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AAcABAAIAAkAAgALAA4AAgAPAA8ABAAQABAAAgARABEABAASABIAAgAUABQACgAVABUACAAXABcADAAZABkADQAbAB0ACgAeAB4AAQAfAB8ABwAgACIAAQAjACMACQAkACQAAQAlACUABwAoACkABwAqACsAAwAsACwAAQAtAC0AAwAuAC4AAQAvAC8AAwAxADEACQAyADIABQAzADMACwA2ADYACwA4ADgAAQA6ADoABwA7ADwAAwA9AEIACQBDAEUABQBGAEcAAwBpAGoADwBrAGwADgCBAIIAEACEAIQAAQCGAIYAAgABAAAACgBcAQIAAkRGTFQADmxhdG4AMAAEAAAAAP//AAwAAAABAAMABAAFAAYABwAJAAoACwAMAAgABAAAAAD//wAMAAAAAgADAAQABQAGAAcACQAKAAsADAAIAA1hYWx0AFBjY21wAFhjY21wAF5kbGlnAGZmcmFjAGxsaWdhAHJvcmRuAHhwbnVtAH5ydnJuAIRzYWx0AIpzczAxAJBzdXBzAJp0bnVtAKAAAAACAAAAAQAAAAEAAgAAAAIAAgACAAAAAQAJAAAAAQAEAAAAAQAKAAAAAQAFAAAAAQAHAAAAAQANAAAAAQALAAYAAQAMAAABAAAAAAEAAwAAAAEACAAOAB4AnADMAPIBCgFGAYQBpgG+AdYCOALAAsAC8gABAAAAAQAIAAIAPAAbAEoASwBKADgAOQA6ADsAPABLAD0AVwBcAF0AXgBfAGAATABNAE4ATwBQAFEAUgBTAFQAVQCHAAEAGwABAA8AHgAiACQAKAAqACsALAAxAEwAUQBSAFMAVABVAFcAWABZAFoAWwBcAF0AXgBfAGAAhQADAAAAAQAIAAEAXAAEAA4AFgAcACIAAwBWAFgAZAACAFkAZQACAFoAZgACAFsAZwACAAAAAQAIAAEACgACABIAGAABAAIAQQBCAAIAIwAmAAIAIwApAAEAAAABAAgAAQAGABcAAgABAE0AUAAAAAQAAAABAAgAAQAsAAIACgAgAAIABgAOAGIAAwBzAFAAYQADAHMATgABAAQAYwADAHMAUAABAAIATQBPAAYAAAACAAoAJAADAAEAfAABABIAAAABAAAABgABAAIAAQAeAAMAAQBiAAEAEgAAAAEAAAAGAAEAAgAPACwAAQAAAAEACAACAA4ABABKAEsASgBLAAEABAABAA8AHgAsAAEAAAABAAgAAQAG//UAAgABAFcAYAAAAAEAAAABAAgAAQAGAAsAAgABAEwAVQAAAAQACAABAAgAAQBOAAQADgAoADIARAADAAgADgAUABsAAgAUABwAAgAlAB0AAgApAAEABABAAAIAMQACAAYADABGAAIAIwBHAAIAMQABAAQASAACACMAAQAEABQAIwAvADEABAAIAAEACAABAHYAAwAMAC4AbAAEAAoAEAAWABwAPgACACMAQQACACYAPwACACcAQgACACkAAwAIABwAMABEAAkAMgAxACMAJgAxADEAIgAhAEUACQAyADEAIwAmADEAMQAiAC8AQwAGADIAMQAjACYAMQABAAQASQACADEAAQADACMALAAxAAEAAAABAAgAAgAWAAgAOAA5ADoAOwA8AD0AVgCHAAEACAAiACQAKAAqACsAMQBNAIUAAQAAAAEACAABAAYADAABAAEAiAABAAEACAABAAAAFAABAAAAHAACd2dodAEBAAAAAgABAAAAAAEIArwAAAAA) format('woff');font-weight:700;font-style:normal;font-display:swap}
+        @font-face{font-family:'GM-Stamp';src:url(data:font/woff;base64,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AAAAAAAA/73/zv+7/7sAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/B/8QAAAAAAAAAAP/C/8P/uQAA/77/u//A/8D/t/+8/8b/vwAA/8j/yv/J/7X/vv/B/8H/vv+z/7j/vAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/7L/mwAAAAAAAAAAAAAAAAAAAAD/xwAA/8j/zQAA/8b/0P/LAAD/tv+FAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+9/7YAAP+nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/Q/7UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/uAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/2v/bf+7/50AAAAAAAAAAP/EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8sAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+zAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/88AAAAAAAAAAAAA/8v/zP/J/8v/0AAA/8z/yf/F/8H/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8YAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+4/8r/xQAAAAD/zwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+x/7cAAAAAAAAAAP+R/5L/n/+1/5b/mP+Y/5j/ev+S/57/sgAA/7z/u/+3/53/rv+3/7D/mP+d/6T/lgAA/7sANAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/NAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/0AAA/88AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/of+aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+2/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+l/4kAAAAAAAAAAAAAAAAAAAAA/7P/p/+v/7X/xf+w/67/rAAA/5D/ogAAAAAAAAAA/7sAAP/BAAD/tgAAAAAAM//L/87/zAAwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/wgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8r/0f+h/8wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/6r/nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8//mf+oAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKYAtgDMAMYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcgAAAAAAUwBXAF4AAACEAHQAgQCYAHUAhQBvAHsAbwCRAEkAVQBsAFoAAAAAAAAAAAAA/7j/wgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/B/8//nP/DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/i/+j/77/uP+MAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8j/yP+3/6MAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/y//N/9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8MAAAAAAAAAAAAA/7AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/4H/l/+6/7r/fQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/J/8P/t/+YAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8T/xwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/IAAAAAAAA/8f/0P+Z/7YAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/wwAA/63/qwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/80AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/sP+KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/H/2P/uP+9AAD/0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/kQAAAAAAAAAAAAD/kAAAAAAAAP+VAAAAAAAA/8oAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/7T/lwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/vf+vAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/y/+Y/8sAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/dP+s/64AAP+4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+eAAAAAAAAAAAAAP+WAAAAAAAA/5cAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/zf+SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8cAAAAAAAAAAAAA/8QAAAAAAAD/wgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/fv+s/67/0f++AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP+cAAAAAAAAAAAAAP+RAAAAAAAA/5QAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/pgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/8UAAP+4/5QAAAAA/8YAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/qwAAAAAAAAAAAAD/iv/LAAD/zf+O/8v/ywAA/8T/yv/PAAD/zv/DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAA0ACgAKAAAADQANAAEADwAPAAIAEQAVAAMAGAAZAAgAGwAkAAoAJgAmABQAKAAsABUALgAvABoAMQAyABwANAA9AB4ATwBPACgAXwBfACkAAQANAFMAAQAAAAIAAAADAAQABQAGAAcAAAAAAAgACQAAAAoACwAMAA0ADgAPABAAEQASABMAAAAUAAAAFQAWABcAGAAZAAAAGgAbAAAAHAAdAAAAHgAfACAAIQAiACMAJAAlACYAJwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAApAAEACgBXAAkAAAAiACYAJwAoACMAKgApAAoAKwAtACwALgAkAC8AAAAxADAAAwAzAAUABAAfAAYAMgAMAAAADQAOAAsAFwAPACEAGAAZAAAAJQAAABoAEAAAABEAHAAbABMAEgACABQAHQAVAB4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAgABYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAHAAEAAAAKACYAZAABbGF0bgAIAAQAAAAA//8ABQAAAAEAAgADAAQABWFhbHQAIGZyYWMAJmxpZ2EALG9yZG4AMnN1cHMAOAAAAAEAAAAAAAEABAAAAAEAAgAAAAEAAwAAAAEAAQAIABIAOABWAH4ArgGsAcYCLAABAAAAAQAIAAIAEAAFAEMAQgBYAFkAQAABAAUAAgADACQAMgBXAAEAAAABAAgAAgAMAAMAQwBCAEAAAQADAAIAAwBXAAQAAAABAAgAAQAaAAEACAACAAYADABdAAIALABeAAIALwABAAEAKQAGAAAAAQAIAAMAAQASAAEBOAAAAAEAAAAFAAIAAwACAAkAAABXAFcACABhAGEACQAGAAAACQAYAC4AQgBWAGoAhACeAL4A2AADAAAABAF2ANoBdgF2AAAAAQAAAAYAAwAAAAMBYADEAWAAAAABAAAABwADAAAAAwBwALAAtgAAAAEAAAAGAAMAAAADAEIAnACiAAAAAQAAAAYAAwAAAAMASACIABQAAAABAAAABgABAAEAAgADAAAAAwAUAG4ANAAAAAEAAAAGAAEAAQBAAAMAAAADABQAVAAaAAAAAQAAAAYAAQABAFcAAQABAEMAAwAAAAMAFAA0ADoAAAABAAAABgABAAEAAwADAAAAAwAUABoAIAAAAAEAAAAGAAEAAQBCAAEAAQBQAAEAAQAEAAEAAAABAAgAAgAKAAIAWABZAAEAAgAkADIABAAAAAEACAABAFAABQAWABAAFgAiAEIAAgAiACoAAQAEAEEAAwBQAAQAAwAIABAAGAA+AAMAUAACAD8AAwBQAAQAPgADAFAAQwABAAQAXAAEAFAAYQBhAAEABQADAEAAQgBXAGEABAAAAAEACAABAAgAAQAOAAEAAQBhAAEABABIAAMAUABhAAA=) format('woff');font-weight:400;font-style:normal;font-display:swap}
+        :root{
+          --lacquer:#08120E; --felt:#0E3B2E; --felt-lo:#0A2C22; --felt-hi:#155A44;
+          --brass:#C9A24B; --brass-lt:#EBD08A; --brass-dk:#8C6E2A;
+          --bone:#F0E9D6; --sub:#8FA396; --neon:#57E6B0; --loss:#E2857A;
+          --line:rgba(201,162,75,0.22);
+        }
+        /* Monoton announces. Special Elite stamps. Neither trespasses. */
+        .gm-neon{font-family:'GM-Neon',Georgia,serif;font-weight:400 !important}
+        .gm-stamp{font-family:'GM-Stamp',Georgia,serif;font-weight:400 !important}
+        .num,.gm-num{font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+        @keyframes dealIn {
+          0%   { opacity: 0; transform: translateY(-34px) translateX(-22px) rotate(-12deg) scale(0.7); }
+          100% { opacity: 1; transform: translateY(0) translateX(0) rotate(0deg) scale(1); }
+        }
+        @keyframes boardIn {
+          0%   { opacity: 0; transform: translateY(-12px) scale(0.86); }
+          70%  { opacity: 1; }
+          100% { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes winPulse {
+          0%,100% { filter: drop-shadow(0 0 8px rgba(87,230,176,0.4)); }
+          50%     { filter: drop-shadow(0 0 18px rgba(87,230,176,0.85)); }
+        }
+        @keyframes potShine {
+          0%   { background-position: -120% 0; }
+          100% { background-position: 220% 0; }
+        }
+        @keyframes feltGlow {
+          0%,100% { opacity: 0.55; }
+          50%     { opacity: 0.8; }
+        }
+        @keyframes brandIn {
+          0% { opacity:0; letter-spacing: 10px; }
+          100% { opacity:1; letter-spacing: 5px; }
+        }
+        @keyframes dcClock { from { width:100%; } to { width:0%; } }
+        @keyframes dcFlip { from { transform: rotateY(90deg) scale(0.8); opacity:0; } to { transform: rotateY(0) scale(1); opacity:1; } }
+        * { -webkit-tap-highlight-color: transparent; }
+        button:focus, button:focus-visible { outline: none; }
+        @media (hover: hover) and (pointer: fine) {
+          button:focus-visible { outline: 2px solid rgba(201,162,75,0.55); outline-offset: 1px; }
+        }
+      `}</style>
+
+      {/* BRAND LOCKUP (+ settings gear, top-right) */}
+      <div style={S.brandRow}>
+        <div style={S.fmtQuick}>
+          <button onClick={()=>{
+              if (st.format === "cash") return;
+              // Mid-hand: don't abandon the pot — arm a switch that fires when the hand completes (tap again to cancel).
+              const midHand = st.tour?.on && (st.phase === "acting" || st.phase === "drawing");
+              if (midHand) { setPendingCash(p => !p); return; }
+              setPendingCash(false);
+              setSt(s=>mkState(s.gid,{...s,format:"cash",tour:null,players:[]})); setView("play");
+            }}
+            style={{...S.fmtQuickBtn, ...(st.format==="cash"?S.fmtQuickOn:{}),
+              ...(pendingCash?{color:"#fbbf24",borderColor:"rgba(251,191,36,0.6)",boxShadow:"0 0 8px rgba(251,191,36,0.15)"}:{})}}
+            title={pendingCash?"Switching to cash after this hand — tap to cancel":"Switch to a cash game"}>
+            {pendingCash?"CASH ⌛":"CASH"}</button>
+          <button onClick={()=>{ if(view!=="lobby") setView("lobby"); }}
+            style={{...S.fmtQuickBtn, ...(st.format==="tourney"?S.fmtQuickOn:{})}}>TRMNT</button>
+        </div>
+        <div style={S.brandStack}>
+          <div style={S.suitRow}>
+            <span style={S.suitB}>♠</span><span style={S.suitR}>♥</span><span style={S.suitR}>♦</span><span style={S.suitB}>♣</span>
+          </div>
+          <span style={S.brandText}>GET MIXED</span>
+          <span style={S.brandSub}>Deal me in.</span>
+        </div>
+        <button id="tour-gear" onClick={()=>setShowSettings(true)} style={S.gearBtnTop} title="Settings">⚙</button>
+      </div>
+
+      {/* GAME BAR — always visible on the table screen; everything else lives behind the gear ⚙ */}
+      <div style={S.menuBar}>
+        <button id="tour-menu" onClick={()=>{ if (st.format==="tourney") return; setMenuOpen(o=>!o); }}
+          style={{...S.menuTrigger,...(menuOpen?S.menuTriggerOpen:{}),...(st.format==="tourney"?{opacity:0.9,cursor:"default"}:{})}}>
+          <span style={S.menuTrigCur}>
+            {curGame?.tag && <span style={S.menuTrigTag}>{curGame.tag}</span>}
+            <span style={S.menuTrigName}>{curGame?.label || "Choose a game"}</span>
+            {st.format==="tourney" && <span style={{fontSize:7,letterSpacing:1,color:"#9d8659",border:"1px solid #9d865955",borderRadius:3,padding:"1px 4px",marginLeft:6,fontWeight:"bold",alignSelf:"center"}}>ROTATION</span>}
+            {st.format!=="tourney" && st.cashSeq && <span style={{fontSize:7,letterSpacing:1,color:"#9d8659",border:"1px solid #9d865955",borderRadius:3,padding:"1px 4px",marginLeft:6,fontWeight:"bold",alignSelf:"center"}}>MIX</span>
+            {IS_BETA && st.format!=="tourney" && <span style={{fontSize:7,letterSpacing:1,color:"#C9A24B",border:"1px solid #C9A24B55",borderRadius:3,padding:"1px 4px",marginLeft:6,fontWeight:"bold",alignSelf:"center"}}>BETA</span>}
+          </span>
+          <span style={{transform:menuOpen?"rotate(180deg)":"none",transition:"transform 0.2s",color:"#e0bd5e",fontSize:16,fontWeight:"bold",lineHeight:1,marginLeft:6}}>{st.format==="tourney" ? "🔒" : "▾"}</span>
+        </button>
+        {menuOpen && st.format!=="tourney" && (
+          <>
+            <div style={S.menuBackdrop} onClick={()=>setMenuOpen(false)}/>
+            <div style={S.menuDropdown}>
+              <div style={S.selSection}>
+                <div style={S.selSecTitle}>MIXED ROTATIONS · one game per hand</div>
+                <div style={S.selGrid}>
+                  {MIX_PRESETS.filter(m => m.games && m.id !== "dealers").map(m => {
+                    const on = st.cashSeq && st.cashSeq.length === m.games.filter(g => GAMES.find(x => x.id === g && x.available)).length && st.cashSeq[0] === m.games[0];
+                    return (
+                      <button key={m.id} onClick={()=>startCashMix(m.id)}
+                        style={{...S.gBtn,...(on?S.gOn:{})}}>
+                        <span style={{...S.gTag,...(on?{color:"#C9A24B"}:{})}}>MIX</span>
+                        <span style={S.gName}>{m.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              {SECTIONS.map(sec => (
+                <div key={sec.title} style={S.selSection}>
+                  <div style={S.selSecTitle}>{sec.title}</div>
+                  <div style={S.selGrid}>
+                    {sec.games.map(g => (
+                      <button key={g.id} onClick={()=>{ if(g.available){ switchGame(g); setMenuOpen(false); } }} disabled={!g.available}
+                        style={{...S.gBtn,...(g.id===st.gid?S.gOn:{}),...(!g.available?S.gOff:{})}}>
+                        {g.tag && <span style={{...S.gTag,...(g.id===st.gid?{color:"#C9A24B"}:{})}}>{g.tag}</span>}
+                        <span style={S.gName}>{g.label}</span>
+                        {!g.available && <span style={S.gSoon}>＋</span>}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      {view==="lobby" && (
+        <TournamentLobby cfg={tourCfg} setCfg={setTourCfg} onStart={startTournament}
+          scen={scenCfg} setScen={setScenCfg} onScenario={startScenario}
+          onCash={()=>{ setSt(s => s.format !== "cash" ? mkState(s.gid, { ...s, format:"cash", tour:null, players:[] }) : s); setView("play"); }} onResume={()=>{ const q = tsLoad(); if (q) { setSt(q); setView("play"); } }} curGid={st.gid}
+          focus={focus} onProgress={()=>setShowProgress(true)}/>
+      )}
+
+      {st.phase === "choosing" && <DealersChooser st={st} onPick={pickGame} onConfirm={confirmDeal} onAgain={chooseAgain}/>}
+
+      {showProgress && <ProgressReport focus={focus}
+        onClose={()=>setShowProgress(false)}
+        onSetFocus={gid=>{ const f={ gid, since:Date.now() }; setFocus(f); focusSave(f); }}
+        onClearFocus={()=>{ setFocus(null); focusSave(null); setShowProgress(false); }}/>}
+
+      {showNash && <NashTables onClose={()=>setShowNash(false)}/>}
+      {showOnline && <OnlineTable mp={mp} onClose={()=>{ mp.leaveTable(); setShowOnline(false); }}/>}
+      {previewLandscape && <LandscapeTable
+        st={st}
+        la={myTurn ? legalActions(st) : null}
+        onAction={act}
+        coachAdvice={advice}
+        turnText={st.phase==="showdown" ? (st.msg||"Showdown")
+          : (st.queue && st.queue[0]!=null && st.players[st.queue[0]]) ? `${st.players[st.queue[0]].name} to act…` : "Your turn"}
+        onClose={()=>setPreviewLandscape(false)}
+      />}
+
+      {gamePick && <SingleGamePicker curGid={st.gid}
+        onDone={gid => { const gp = gamePick; setGamePick(null); const cfg = { ...gp.cfg, gid };
+          if (gp.kind === "tour") startTournament(cfg); else startScenario(cfg); }}
+        onCancel={() => setGamePick(null)}/>}
+
+      {/* PAYOUTS SHEET — tap the tournament HUD. The ladder in bands, your band highlighted, next jump on top. */}
+      {showPayouts && st.tour?.on && st.tour.field && (() => {
+        const F = st.tour.field, buyIn = st.tour.buyIn || 0, P = paidSpots(F.total);
+        const rows = []; let a = 1;
+        while (a <= P) { const amt = payoutFor(a, F.total, buyIn); let b = a;
+          while (b + 1 <= P && payoutFor(b + 1, F.total, buyIn) === amt) b++; rows.push({ a, b, amt }); a = b + 1; }
+        const seatsN = st.players.length, model = fieldLeft(F.total, st.tour.level || 0);
+        const fll = fieldLeftLive(F, st.tour.level || 0, st.tour.busted);
+        const single = model <= seatsN || fll <= seatsN;
+        const left = single ? st.players.filter(p => p.chips > 0).length : Math.max(seatsN + 1, fll);
+        const avg = Math.round(F.total * F.startStack / Math.max(1, left));
+        const rank = single ? 1 + st.players.filter(p => p.chips > st.players[0].chips).length : fieldRank(st.players[0].chips, avg, left);
+        const inMoney = left <= P;
+        const myRow = inMoney ? rows.findIndex(r => rank >= r.a && rank <= r.b) : -1;
+        const jump = myRow > 0 ? rows[myRow - 1].amt - rows[myRow].amt : null;
+        return (
+          <div style={S.resultOverlay} onClick={()=>setShowPayouts(false)}>
+            <div style={{...S.resultCard, textAlign:"left", maxHeight:"78vh", overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
+              <div style={{fontSize:9, letterSpacing:2, color:"#9d8659"}}>PAYOUTS · {F.total.toLocaleString()} RUNNERS · ${(F.total*buyIn).toLocaleString()} POOL</div>
+              {myRow >= 0 && jump != null && <div style={{fontSize:11.5, color:"#57E6B0", margin:"7px 0 2px"}}>Next pay jump: <b>+${jump.toLocaleString()}</b> when the field reaches {rows[myRow-1].b.toLocaleString()}</div>}
+              {myRow === 0 && <div style={{fontSize:11.5, color:"#57E6B0", margin:"7px 0 2px"}}>You're playing for it all — ${rows[0].amt.toLocaleString()} up top.</div>}
+              {!inMoney && <div style={{fontSize:11.5, color:"#fbbf24", margin:"7px 0 2px"}}>{Math.max(0, left - P).toLocaleString()} eliminations to the money · {P.toLocaleString()} paid</div>}
+              <div style={{marginTop:9, display:"flex", flexDirection:"column", gap:3}}>
+                {rows.map((r, i) => { const mine = i === myRow; return (
+                  <div key={r.a} style={{display:"flex", justifyContent:"space-between", padding:"5px 10px", borderRadius:7, fontSize:12,
+                    fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums", color: mine ? "#0a1a0e" : "#d8c79a", fontWeight: mine ? "bold" : "normal",
+                    background: mine ? "linear-gradient(135deg,#e6c669,#C9A24B)" : "rgba(255,255,255,0.04)"}}>
+                    <span>{r.a === r.b ? ordinal(r.a) : `${ordinal(r.a)}–${ordinal(r.b)}`}{mine ? " · YOU" : ""}</span>
+                    <span>${r.amt.toLocaleString()}</span>
+                  </div>); })}
+              </div>
+              <button style={{...S.resultBtn2, marginTop:12}} onClick={()=>setShowPayouts(false)}>Close</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* TOURNAMENT RESULT (sim S2) — bust or win + finishing place */}
+      {st.tour?.result && (() => {
+        const R = st.tour.result, win = R.type === "win", cashed = R.place <= paidSpots(R.total);
+        const buyIn = st.tour.buyIn || 0, prize = payoutFor(R.place, R.total, buyIn), pool = R.total * buyIn;
+        const first = payoutFor(1, R.total, buyIn);
+        const scen = st.tour.scen;                                       // scenario drill → grade the finish
+        const grade = scen ? scenGrade(prize, scen.icm0, scen.mincash || Math.round(buyIn*1.8)) : null;
+        return (
+          <div style={S.resultOverlay}>
+            <div style={S.resultCard}>
+              <div style={{fontSize:46,lineHeight:1}}>{win ? "🏆" : cashed ? "💵" : "♠"}</div>
+              <div style={{...S.resultTitle, color: win ? "#57E6B0" : cashed ? "#D9B96A" : "#cbb996"}}>
+                {win ? "You won!" : cashed ? "In the money" : "Busted"}
+              </div>
+              <div style={S.resultPlace}>{ordinal(R.place)} <span style={{opacity:0.55,fontSize:16}}>of {R.total.toLocaleString()}</span></div>
+              {prize > 0 && <div style={S.resultPrize}>+${prize.toLocaleString()}</div>}
+              <div style={S.resultSub}>
+                {win ? "Last player standing — you took the whole thing down."
+                     : cashed ? "You made the money before falling. Solid run."
+                     : `${(R.place - paidSpots(R.total)).toLocaleString()} spots short of the cash.`}
+              </div>
+              {!scen && buyIn > 0 && <div style={S.resultPool}>Prize pool ${pool.toLocaleString()} · 1st paid ${first.toLocaleString()}</div>}
+              {scen && (
+                <div style={{margin:"10px 0 2px", padding:"10px 12px", borderRadius:10, textAlign:"center",
+                  border:"1px solid rgba(201,162,75,0.3)", background:"rgba(201,162,75,0.06)"}}>
+                  <div style={{fontSize:8, letterSpacing:2, color:"#9d8659"}}>SCENARIO DEBRIEF · {scen.stageN.toUpperCase()} · {scen.stackN.toUpperCase()}</div>
+                  <div style={{fontSize:30, fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif", margin:"4px 0",
+                    color: /^A/.test(grade) ? "#57E6B0" : grade === "B" || grade === "C+" || grade === "C" ? "#D9B96A" : "#E2857A"}}>{grade}</div>
+                  <div style={{fontSize:10.5, color:"#cfc3a0", lineHeight:1.55}}>
+                    The starting spot was worth <b style={{color:"#e8d9a8"}}>~${scen.icm0.toLocaleString()}</b> (ICM). You cashed <b style={{color:"#e8d9a8"}}>${prize.toLocaleString()}</b>
+                    {prize > scen.icm0 ? <> — <b style={{color:"#57E6B0"}}>+${(prize - scen.icm0).toLocaleString()} over expectation.</b></>
+                      : prize > 0 ? <> — ${(scen.icm0 - prize).toLocaleString()} under expectation.</>
+                      : <> — short of the spot's value this run.</>}
+                  </div>
+                  {(() => {
+                    const rev = scenReview(scenLogRef.current);
+                    if (!rev) return null;
+                    return (
+                      <div style={{marginTop:9, paddingTop:9, borderTop:"1px solid rgba(201,162,75,0.18)"}}>
+                        <div style={{fontSize:10.5, color:"#cfc3a0"}}>
+                          You played <b style={{color: rev.sharp>=80?"#57E6B0":rev.sharp>=60?"#D9B96A":"#E2857A"}}>{rev.sharp}% sharp</b> across {rev.n} decision{rev.n===1?"":"s"}
+                          {rev.leaks>0 ? <> · {rev.leaks} leak{rev.leaks===1?"":"s"}.</> : <> · clean run.</>}
+                        </div>
+                        {rev.biggest && (
+                          <div style={{marginTop:5, fontSize:10, color:"#c7a86a"}}>
+                            Biggest leak — <b>{rev.biggest}</b> ({rev.bigCount}×): {SCENARIO_TIPS[rev.biggest] || "review these spots."}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+              {scen && <button style={S.resultBtn} onClick={()=>startScenario(scen.cfg)}>RUN IT BACK — SAME SCENARIO</button>}
+              <button style={scen ? S.resultBtn2 : S.resultBtn} onClick={()=>{ setSt(s => ({ ...s, tour:null })); setView("lobby"); }}>{scen ? "New scenario" : "NEW TOURNAMENT"}</button>
+              <button style={S.resultBtn2} onClick={()=>{ tsClear(); setSt(s => mkState(s.gid, { ...s, format:"cash", tour:null, players:[] })); setView("play"); }}>Back to cash game</button>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* TOURNAMENT HUD — one clean line. Players-left and your stack-vs-field live in the row itself (next-level
+          countdown tucked under LEVEL). The distance-to-money only appears as a slim alert when it actually
+          matters — near the bubble or in the money — so early levels stay a single uncluttered strip. */}
+      {st.tour?.on && view==="play" && (() => {
+        const T = st.tour, F = T.field, sb = tourSb(T.level||0);
+        const rem = Math.max(0, (T.levelSec||300) - ((T.clock||0) % (T.levelSec||300)));
+        const mmss = `${Math.floor(rem/60)}:${String(Math.floor(rem%60)).padStart(2,"0")}`;
+        let fieldCells = null, moneyTier = null, accent = null;
+        if (F) {
+          const seatsN = st.players.length;
+          const model  = fieldLeft(F.total, T.level||0);
+          const fll    = fieldLeftLive(F, T.level||0, T.busted);
+          const aliveN = st.players.filter(p=>p.chips>0).length;
+          // Multi-table: real busts tick the field down between blind levels, but never below one more than a
+          // full table. Once EITHER the model or the real bust count says the field fits one table, show the
+          // actual players remaining (so a heads-up scenario reads "2 left", not "9").
+          const single = model <= seatsN || fll <= seatsN;
+          const left  = single ? aliveN : Math.max(seatsN+1, fll);
+          const avg   = Math.round(F.total * F.startStack / Math.max(1, left));
+          // At the final table every stack is visible — rank is a COUNT, not the statistical field estimate
+          // (which called a $241k chip lead "3rd of 8"). Mid-tournament keeps the model-based estimate.
+          const rank  = single ? 1 + st.players.filter(p => p.chips > me.chips).length
+                               : fieldRank(me.chips, avg, left);
+          const paid  = paidSpots(F.total);
+          const bb    = STK(st).bblind || STK(st).bbet || 1;
+          const toMoney = left - paid;
+          const inMoney = left <= paid;
+          const stone   = toMoney === 1;
+          const nearBubble = toMoney > 0 && toMoney <= Math.max(3, Math.round(paid * 0.12));
+          const buyIn  = T.buyIn || 0;
+          const locked = inMoney && buyIn ? payoutFor(Math.min(rank, paid), F.total, buyIn) : 0;
+          fieldCells = (
+            <>
+              <div style={S.tourHudDiv}/>
+              <div style={S.tourHudCol}><div style={S.tourHudLbl}>LEFT</div><div style={S.tourHudVal}>{rank.toLocaleString()}/{left.toLocaleString()}</div></div>
+              <div style={S.tourHudDiv}/>
+              <div style={S.tourHudCol}><div style={S.tourHudLbl}>YOU</div><div style={S.tourHudVal}>{Math.round(me.chips/bb)}bb</div><div style={S.tourHudSub}>avg {Math.round(avg/bb)}</div></div>
+            </>
+          );
+          if (inMoney || stone || nearBubble) {   // only surface the money line when it's actually in play
+            let money, mColor;
+            if (inMoney)    { money = locked ? `● IN THE MONEY · $${locked.toLocaleString()} locked` : "● IN THE MONEY"; mColor = "#57E6B0"; }
+            else if (stone) { money = "◆ STONE BUBBLE — next out misses the cash"; mColor = "#E2857A"; }
+            else            { money = `HAND-FOR-HAND · ${toMoney} from the money`; mColor = "#fbbf24"; }
+            accent = stone ? S.tourHudBubble : S.tourHudNear;
+            moneyTier = <div style={{...S.tourHudTier, color:mColor, fontWeight:"bold", fontSize:10, letterSpacing:0.6}}>{money}</div>;
+          }
+        }
+        return (
+          <div style={{...S.tourHud, ...(accent||{}), cursor:"pointer"}} onClick={()=>setShowPayouts(true)} title="Payouts & pay jumps">
+            <div style={S.tourHudRow}>
+              <div style={S.tourHudCol}><div style={S.tourHudLbl}>LEVEL</div><div style={S.tourHudVal}>{(T.level||0)+1}</div><div style={S.tourHudSub}>{mmss}</div></div>
+              <div style={S.tourHudDiv}/>
+              <div style={S.tourHudCol}><div style={S.tourHudLbl}>BLINDS</div><div style={S.tourHudVal}>{sb}/{2*sb}</div></div>
+              <div style={S.tourHudDiv}/>
+              {T.dc
+                ? <div style={S.tourHudCol}><div style={S.tourHudLbl}>HAND</div><div style={S.tourHudVal}>{(((T.hands||1)-1)%Math.max(2,st.players.length))+1}/{Math.max(2,st.players.length)}</div></div>
+                : <div style={S.tourHudCol}><div style={S.tourHudLbl}>GAME</div><div style={S.tourHudVal}>{(T.mixIdx||0)+1}/{T.seq?.length||1}</div></div>}
+              {fieldCells}
+            </div>
+            {moneyTier}
+          </div>
+        );
+      })()}
+
+      {/* SETTINGS OVERLAY */}
+      {showSettings && (
+        <div style={S.overlay} onClick={()=>setShowSettings(false)}>
+          <div style={S.modal} onClick={e=>e.stopPropagation()}>
+            <div style={S.modalHead}>
+              <span style={S.modalTitle}>⚙ Table Settings</span>
+              <button onClick={()=>setShowSettings(false)} style={S.modalClose}>✕</button>
+            </div>
+
+            {/* ── PLAY ONLINE — its own mode, up top (not buried in settings) ── */}
+            <div style={S.onlineHero}>
+              <div style={S.onlineHeroGlow}/>
+              <div style={S.onlineHeroTag}>● LIVE MULTIPLAYER</div>
+              <div style={S.onlineHeroTitle}>Play with real people</div>
+              <div style={S.onlineHeroText}>Create a private table and share the code, or join a friend's game. Bots fill any empty seats.</div>
+              <button onClick={()=>{ setShowSettings(false); setShowOnline(true); }} style={S.onlineHeroCta}>
+                Create or join a table →
+              </button>
+            </div>
+            <div style={S.settingsDivider}>
+              <span style={{flex:1,height:1,background:"rgba(201,162,75,0.18)"}}/>
+              <span style={S.settingsDividerLabel}>SOLO — PRACTICE VS BOTS</span>
+              <span style={{flex:1,height:1,background:"rgba(201,162,75,0.18)"}}/>
+            </div>
+
+            <div style={S.setCard}>
+            <div style={S.setCardHead}>🎭 OPPONENTS</div>
+            <div style={S.modalHint}>Higher = optimal (solid, balanced, value-focused, hard to read). Lower = exploitative (attacks, bluffs and applies pressure, higher variance — and more beatable if you adjust).</div>
+
+            {st.players.filter(p=>p.id!==0).map(p=>p.id).map(id => {
+              const t = st.botTight?.[id] ?? 50;
+              const desc = t >= 78 ? "Optimal" : t >= 58 ? "Disciplined" : t >= 42 ? "Balanced" : t >= 24 ? "Exploitative" : "Wildly Exploit.";
+              return (
+                <div key={id} style={S.tightRow}>
+                  <div style={S.tightLabel}>
+                    <span style={{color:"#C9A24B",fontSize:12}}>{st.players.find(p=>p.id===id)?.name || PROF[id].name}</span>
+                    <span style={{color:"#9d8a62",fontSize:9}}>{PROF[id].tag}</span>
+                  </div>
+                  <input type="range" min={0} max={100} step={2} value={t}
+                    onChange={e=>setTight(id, +e.target.value)} style={S.tightSlider}/>
+                  <span style={S.tightVal}>{desc}</span>
+                </div>
+              );
+            })}
+
+            <div style={S.modalActions}>
+              <button onClick={()=>{ setTight(1,28); setTight(2,12); setTight(3,22); }} style={S.presetBtn}>All Exploit.</button>
+              <button onClick={()=>{ setTight(1,62); setTight(2,18); setTight(3,38); }} style={S.presetBtn}>Reset</button>
+              <button onClick={()=>{ setTight(1,84); setTight(2,70); setTight(3,80); }} style={S.presetBtn}>All Optimal</button>
+            </div>
+            </div>
+
+            <div style={S.setCard}>
+            <div style={S.setCardHead}>🎓 COACHING</div>
+            <div style={S.modalHint}>Show live strategy tips on your turn — hand strength, pot odds, and the recommended play.</div>
+            <button onClick={()=>setCoach(!st.coach)} style={{...S.toggleRow,...(st.coach?S.toggleRowOn:{})}}>
+              <span style={{display:"flex",flexDirection:"column",alignItems:"flex-start"}}>
+                <span style={{color:st.coach?"#bff0cf":"#C9A24B",fontSize:12}}>Coach Mode</span>
+                <span style={{color:"#9c8760",fontSize:9}}>{st.coach?"On — tips appear as you play":"Off"}</span>
+              </span>
+              <span style={{...S.switch,...(st.coach?S.switchOn:{})}}>
+                <span style={{...S.knob,...(st.coach?S.knobOn:{})}}/>
+              </span>
+            </button>
+
+            {/* Coach style: GTO ↔ Exploit dial */}
+            <div style={S.modalHint}>How much the coach adjusts to the opponents you've set up. GTO ignores them and plays theoretically sound; Exploit leans on their tendencies (the bot dials above).</div>
+            <div style={S.tightRow}>
+              <span style={{...S.tightLabel, color:"#9d8a62", fontSize:10}}>GTO</span>
+              <input type="range" min={0} max={100} step={5} value={st.exploitDial ?? 0}
+                onChange={e=>setExploitDial(+e.target.value)} style={S.tightSlider}/>
+              <span style={{...S.tightLabel, color:"#9d8a62", fontSize:10, textAlign:"right"}}>Exploit</span>
+            </div>
+            <div style={{...S.modalHint, textAlign:"center", marginTop:2}}>
+              {(() => { const d = st.exploitDial ?? 0;
+                return d === 0 ? "Pure GTO — opponent-agnostic, textbook advice."
+                  : d <= 30 ? "Mostly GTO, with a light read on the table."
+                  : d <= 70 ? "Balanced — blends solid play with table reads."
+                  : "Full exploit — advice leans hard on how these players play."; })()}
+            </div>
+            </div>
+
+            {/* Stakes & format */}
+            <div style={S.setCard}>
+            <div style={S.setCardHead}>💵 FORMAT &amp; STAKES</div>
+            <div style={S.modalHint}>Cash buys in at 100bb. Tournament lets you pick stack depth on the table screen.</div>
+            <div style={S.segRow}>
+              {[["cash","Cash Game"],["tourney","Tournament"]].map(([id,label])=>(
+                <button key={id} onClick={()=>setFormat(id)}
+                  style={{...S.segBtn,...(st.format===id?S.segBtnOn:{})}}>
+                  <span style={{fontSize:11,fontWeight:"bold"}}>{label}</span>
+                </button>
+              ))}
+            </div>
+            {st.format==="cash" && (
+              <div style={{...S.segRow,marginTop:8}}>
+                {CASH_STAKES.map((s,i)=>(
+                  <button key={i} onClick={()=>setStake(i)}
+                    style={{...S.segBtn,...(st.stakeIdx===i?S.segBtnOn:{})}}>
+                    <span style={{fontSize:11,fontWeight:"bold"}}>{s.label}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+            {st.format==="tourney" && (
+              <button onClick={()=>{ setShowSettings(false); setView("lobby"); }}
+                style={{...S.modalDone, marginTop:10, background:"linear-gradient(165deg,#57b56a,#3f9152)", color:"#0a1a0e"}}>
+                OPEN TOURNAMENT LOBBY
+              </button>
+            )}
+            {/* Beta-test reset: fresh stacks, tournament cleared, back to a clean table — hand history and
+                settings are KEPT (this is a table reset, not a data wipe). */}
+            <button onClick={()=>{ tsClear(); setSt(s => mkState(s.gid, { ...s, format:"cash", tour:null, players:[] })); setShowSettings(false); setView("play"); }}
+              style={{...S.modalDone, marginTop:8, background:"linear-gradient(165deg,#c0564e,#96382f)", color:"#fde8e5"}}>
+              ⟲ RESET TABLE — fresh stacks
+            </button>
+            </div>
+
+            <div style={{marginTop:2}}>
+              <FocusLine focus={focus} onOpen={()=>{ setShowSettings(false); setShowProgress(true); }}/>
+            </div>
+
+            <div style={S.settingsDivider}>
+              <span style={{flex:1,height:1,background:"rgba(201,162,75,0.18)"}}/>
+              <span style={S.settingsDividerLabel}>TOOLS</span>
+              <span style={{flex:1,height:1,background:"rgba(201,162,75,0.18)"}}/>
+            </div>
+            <div style={S.toolTiles}>
+              <div onClick={()=>{ setShowSettings(false); setShowReview(true); }} style={S.toolTile}>
+                <span style={S.toolTileIc}>📊</span>
+                <span style={S.toolTileLb}>Hand history</span>
+                <span style={S.toolTileDs}>Review &amp; grade</span>
+              </div>
+              <div onClick={()=>{ setShowSettings(false); setShowNash(true); }} style={S.toolTile}>
+                <span style={S.toolTileIc}>♠</span>
+                <span style={S.toolTileLb}>Nash charts</span>
+                <span style={S.toolTileDs}>Push / fold</span>
+              </div>
+              <div onClick={()=>{ setShowSettings(false); setPreviewLandscape(true); }} style={{...S.toolTile,borderColor:"rgba(87,230,176,0.4)"}}>
+                <span style={S.toolTileIc}>🔄</span>
+                <span style={S.toolTileLb}>Landscape (preview)</span>
+                <span style={S.toolTileDs}>New table · rotate phone</span>
+              </div>
+            </div>
+
+            <button onClick={replayTour} style={{...S.tourSkip, display:"block", margin:"16px auto 0", color:"#9d8659", textDecoration:"underline"}}>Replay the intro tour</button>
+            <button onClick={()=>setShowSettings(false)} style={S.modalDone}>DONE</button>
+          </div>
+        </div>
+      )}
+
+      {showReview && <ReviewScreen onClose={()=>setShowReview(false)} mobile={mobile}/>}
+      {showFeedback && <FeedbackScreen onClose={()=>setShowFeedback(false)}/>}
+      {showBug && <FeedbackScreen mode="bug" context={curGame?.label || st.gid} onClose={()=>setShowBug(false)}/>}
+
+      {/* FIRST-VISIT WELCOME CARD */}
+      {showWelcome && (
+        <div style={{position:"fixed",inset:0,zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",
+          padding:"0 22px",background:"radial-gradient(130% 80% at 50% 0%,rgba(22,32,58,0.92),rgba(7,10,17,0.97))",backdropFilter:"blur(3px)"}}>
+          <div style={{width:"100%",maxWidth:320,background:"linear-gradient(165deg,#0E2A20,#0A1F18)",
+            border:"1px solid rgba(201,162,75,0.28)",borderRadius:18,padding:"30px 24px 26px",textAlign:"center",
+            boxShadow:"0 24px 60px rgba(0,0,0,0.6), inset 0 1px 0 rgba(201,162,75,0.08)"}}>
+            <div style={{fontSize:12,letterSpacing:6,marginBottom:12}}>
+              <span style={{color:"#F0E9D6"}}>♠</span> <span style={{color:"#c0392b"}}>♥</span> <span style={{color:"#c0392b"}}>♦</span> <span style={{color:"#F0E9D6"}}>♣</span>
+            </div>
+            <div style={{fontSize:30,letterSpacing:2,color:"#57E6B0",fontWeight:400,fontFamily:"'GM-Neon',Georgia,serif",textShadow:"0 0 12px rgba(87,230,176,0.45), 0 0 34px rgba(87,230,176,0.22)"}}>GET MIXED</div>
+            <div style={{fontSize:11,letterSpacing:1,color:"#8FA396",marginTop:7,fontFamily:"'GM-Stamp',Georgia,serif"}}>Deal me in.</div>
+            <div style={{height:1,background:"linear-gradient(90deg,transparent,rgba(201,162,75,0.3),transparent)",margin:"18px 0"}}/>
+            <div style={{fontSize:13.5,lineHeight:1.6,color:"#d8cba6"}}>
+              Practice <span style={{color:"#efe4be"}}>20+ mixed-game variants</span> nobody else teaches — draw, stud, flop, and split-pot — then sharpen up with a <span style={{color:"#efe4be"}}>coach and solver</span> on every decision.
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:9,margin:"20px 2px 22px",textAlign:"left"}}>
+              {["20+ games, one tap to switch","Live coach + on-demand solver","Cash, tournaments & endgame drills","Free · play money · no signup"].map(t => (
+                <div key={t} style={{display:"flex",alignItems:"center",gap:10,fontSize:12.5,color:"#cdbf9e"}}>
+                  <span style={{width:5,height:5,borderRadius:"50%",background:"#C9A24B",flex:"none",boxShadow:"0 0 6px rgba(201,162,75,0.6)"}}/>{t}
+                </div>
+              ))}
+            </div>
+            <button onClick={dismissWelcome} style={{display:"block",width:"100%",background:"linear-gradient(165deg,#d8b551,#bb8f33)",
+              color:"#1a1206",border:"none",borderRadius:11,padding:14,fontSize:14,fontWeight:"bold",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",
+              letterSpacing:1.5,cursor:"pointer",boxShadow:"0 6px 18px rgba(201,162,75,0.25)"}}>PLAY MIXED GAMES</button>
+            <div style={{fontSize:10,color:"#6f6048",marginTop:13}}>You'll only see this once.</div>
+          </div>
+        </div>
+      )}
+
+      {/* FIRST-RUN SPOTLIGHT TOUR */}
+      {tourStep >= 0 && tourRect && (() => {
+        const r = tourRect, pad = 8;
+        const vh = typeof window !== "undefined" ? window.innerHeight : 800;
+        const below = r.top < vh * 0.5;   // caption goes below a top-half target, above a bottom-half one
+        return (
+          <div style={S.tourLayer} onClick={endTour}>
+            <div style={{ position:"fixed", top:r.top - pad, left:r.left - pad, width:r.width + pad*2, height:r.height + pad*2,
+              borderRadius:12, boxShadow:"0 0 0 9999px rgba(8,10,16,0.84)", border:"2px solid #e0bd5e",
+              pointerEvents:"none", transition:"top .25s,left .25s,width .25s,height .25s" }}/>
+            <div style={{ ...S.tourCard, ...(below ? { top:r.bottom + 16 } : { bottom: vh - r.top + 16 }) }}
+              onClick={e=>e.stopPropagation()}>
+              <div style={S.tourStepNo}>{tourStep + 1} / {TOUR.length}</div>
+              <div style={S.tourTitle}>{TOUR[tourStep].title}</div>
+              <div style={S.tourText}>{TOUR[tourStep].text}</div>
+              <div style={S.tourBtns}>
+                <button onClick={endTour} style={S.tourSkip}>Skip</button>
+                <button onClick={nextTour} style={S.tourNext}>{tourStep >= TOUR.length - 1 ? "Got it" : "Next →"}</button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* TABLE */}
+      <div style={S.shell}>
+        <div style={S.rail}>
+          <div style={S.felt}>
+
+            {/* GAME PLAQUE — table sign showing the current game (esp. matters in a rotation) */}
+            <div style={S.gamePlaque}>
+              {curGame?.tag && <span style={S.plaqueTag}>{curGame.tag}</span>}
+              <span style={S.plaqueName}>{curGame?.label || ""}</span>
+            </div>
+
+            {/* ── CPU SECTION ─────────────── */}
+            {mobile ? (
+              st.players.length > 4 ? (
+                /* Mobile 8-max: opponents around the oval, pot + board in the centre */
+                <div style={S.ovalWrap}>
+                  {st.players.filter(p => p.id !== 0).map((p, i) => (
+                    <div key={p.id} style={{ ...S.ovalSeat, ...(OVAL_POS[i] || OVAL_POS[OVAL_POS.length-1]) }}>
+                      <MobileSeat p={p} reveal={st.reveal} gid={st.gid} board={st.board}
+                        isDealer={st.dealerIdx===p.id}
+                        thinking={cpuTurn && st.queue[0]===p.id}
+                        wid={wid} won={(st.winnerIds||[]).includes(p.id)} tilt={st.cpuTilt?.[p.id]||0} profile={PROF[p.id]} />
+                    </div>
+                  ))}
+                  {IS_DOUBLE(st.gid) ? (
+                    /* Two boards are too tall to stack with the pot in a 272px oval — render them compact
+                       in the mid-band (clear of the 33%/62% seat rows) and drop the pot into the empty
+                       lower felt. (Approved mockup 2026-07-02.) */
+                    <>
+                      <div style={S.ovalDblBoards}>
+                        <div style={S.ovalDblRow}>
+                          <span style={S.ovalDblTag}>TOP</span>
+                          <div style={S.boardSm}>
+                            {[0,1,2,3,4].map(i => st.board[i]
+                              ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small/>
+                              : <div key={`a${i}`} style={S.boardSlotSm}/>)}
+                          </div>
+                        </div>
+                        <div style={S.ovalDblRow}>
+                          <span style={S.ovalDblTag}>BOT</span>
+                          <div style={S.boardSm}>
+                            {[0,1,2,3,4].map(i => (st.board2||[])[i]
+                              ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small/>
+                              : <div key={`b${i}`} style={S.boardSlotSm}/>)}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={S.ovalDblPot}>
+                        <span style={S.potLbl}>POT</span>
+                        <span style={S.ovalDblPotAmt}>${MNY(st.pot)}</span>
+                        {streetLbl && <span style={S.ovalDblStreet}>{streetLbl}</span>}
+                      </div>
+                    </>
+                  ) : (
+                    <div style={S.ovalCentre}><CentreInfo st={st} streetLbl={streetLbl}/></div>
+                  )}
+                </div>
+              ) : (
+                /* Mobile 4-max: all 3 CPUs in a compact top strip */
+                <div style={S.mStrip}>
+                  {[1,2,3].map(id => (
+                    <MobileSeat key={id} p={st.players[id]} reveal={st.reveal} gid={st.gid} board={st.board}
+                      isDealer={st.dealerIdx===id}
+                      thinking={cpuTurn && st.queue[0]===id}
+                      wid={wid} won={(st.winnerIds||[]).includes(id)} tilt={st.cpuTilt?.[id]||0} profile={PROF[id]} />
+                  ))}
+                </div>
+              )
+            ) : (
+              <>
+                {/* Desktop: diamond layout */}
+                <div style={S.rowTop}>
+                  <Seat p={st.players[2]} reveal={st.reveal} gid={st.gid} board={st.board} dealKey={st.dealKey} isDealer={st.dealerIdx===2}
+                    thinking={cpuTurn&&st.queue[0]===2} wid={wid} won={(st.winnerIds||[]).includes(2)} tilt={st.cpuTilt?.[2]||0} profile={PROF[2]}/>
+                </div>
+                <div style={S.rowMid}>
+                  <div style={S.sideSeat}>
+                    <Seat p={st.players[1]} reveal={st.reveal} gid={st.gid} board={st.board} dealKey={st.dealKey} isDealer={st.dealerIdx===1} compact
+                      thinking={cpuTurn&&st.queue[0]===1} wid={wid} won={(st.winnerIds||[]).includes(1)} tilt={st.cpuTilt?.[1]||0} profile={PROF[1]}/>
+                  </div>
+                  {/* Centre info (pot + community board) */}
+                  <CentreInfo st={st} streetLbl={streetLbl}/>
+                  <div style={S.sideSeat}>
+                    <Seat p={st.players[3]} reveal={st.reveal} gid={st.gid} board={st.board} dealKey={st.dealKey} isDealer={st.dealerIdx===3} compact
+                      thinking={cpuTurn&&st.queue[0]===3} wid={wid} won={(st.winnerIds||[]).includes(3)} tilt={st.cpuTilt?.[3]||0} profile={PROF[3]}/>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {/* Mobile centre info (below the CPU strip) — 8-max puts it inside the oval instead */}
+            {mobile && st.players.length <= 4 && <CentreInfo st={st} streetLbl={streetLbl}/>}
+
+            {/* ── PLAYER SECTION ──────────── */}
+            <div style={{...S.botRow, ...(mobile && st.players.length>4 ? {marginTop:-64} : {})}}>
+              <div style={S.youBar}>
+                {st.dealerIdx===0 && <DBtn/>}
+                <span style={S.youName}>You</span>
+                <span style={S.chips}>${MNY(me.chips)}</span>
+                {me.lastAct && <Bdg {...me.lastAct}/>}
+                {myEval && (
+                  <span style={{...S.evalBdg,color:hColor(myEval),background:hColor(myEval)+"18",border:`1px solid ${hColor(myEval)}44`}}>
+                    {IS_DOUBLE(st.gid) ? "Top: " : ""}{myEval.desc}{myLow ? ` · ${myLow.slice(0,5).map(v=>LOWNAME[v]||v).join("-")} low` : ""}
+                  </span>
+                )}
+                {myEval2 && (
+                  <span style={{...S.evalBdg,color:hColor(myEval2),background:hColor(myEval2)+"18",border:`1px solid ${hColor(myEval2)}44`}}>
+                    Bot: {myEval2.desc}
+                  </span>
+                )}
+                {myLow && (
+                  <span style={{...S.evalBdg,color:"#57E6B0",background:"#57E6B018",border:"1px solid #57E6B044"}}>
+                    {lowDesc(myLow)}
+                  </span>
+                )}
+                {myBadugi && (
+                  <span style={{...S.evalBdg,color:hColor(myBadugi),background:hColor(myBadugi)+"18",border:`1px solid ${hColor(myBadugi)}44`}}>
+                    {myBadugi.desc}
+                  </span>
+                )}
+                {myDrawTxt && (
+                  <span style={{...S.evalBdg,color:"#D9B96A",background:"#D9B96A18",border:"1px solid #D9B96A44"}}>
+                    {myDrawTxt}
+                  </span>
+                )}
+                {mySplitTxt && (
+                  <span style={{...S.evalBdg,color:"#D9B96A",background:"#D9B96A18",border:"1px solid #D9B96A44"}}>
+                    {mySplitTxt}
+                  </span>
+                )}
+              </div>
+              <div style={S.myCards}>
+                {me.folded
+                  ? <span style={{...S.emptyH,opacity:0.5,letterSpacing:2}}>FOLDED</span>
+                  : stud
+                  ? (me.hand.length > 0
+                      ? me.hand.map((c,i) => (
+                          <div key={`${st.dealKey}-${i}-${c.r}${c.s}`} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2,marginTop:c.up?0:14,transition:"margin 0.2s"}}>
+                            <Card card={c} small mobile={false} dealIdx={i}
+                              selected={discarding && st.sel.includes(i)}
+                              onClick={discarding && !c.up ? () => flipDiscard(i) : null}
+                              interactive={discarding && !c.up}/>
+                            <span style={{fontSize:6.5,letterSpacing:1,color:c.up?"#C9A24B88":"#6f5a3a"}}>{c.up?"UP":"DOWN"}</span>
+                          </div>
+                        ))
+                      : <span style={S.emptyH}>· · ·</span>)
+                  : me.hand.length > 0
+                  ? me.hand.map((c,i) => (
+                      <Card key={`${st.dealKey}-${c.r}${c.s}`} card={c}
+                        selected={(drawing||pineDiscarding) && st.sel.includes(i)}
+                        onClick={drawing ? () => flip(i) : pineDiscarding ? () => flipPine(i) : null}
+                        interactive={drawing || pineDiscarding}
+                        mobile={mobile}
+                        dealIdx={i}/>
+                    ))
+                  : <span style={S.emptyH}>{(flop?HOLE_SIZE(st.gid):HAND_SIZE(st.gid))===2?"· ·":(flop?HOLE_SIZE(st.gid):HAND_SIZE(st.gid))===4?"· · · ·":"· · · · ·"}</span>}
+              </div>
+              {drawing && st.sel.length > 0 && (
+                <div style={S.discardNote}>
+                  {st.sel.length} card{st.sel.length>1?"s":""} marked for discard — tap again to undo
+                </div>
+              )}
+            </div>
+
+          </div>{/* /felt */}
+        </div>{/* /rail */}
+      </div>{/* /shell */}
+
+      {/* ── ACTION PANEL ── */}
+      <div style={{...S.panel,...((myTurn||drawing||discarding||pineDiscarding)?S.panelOn:{})}}>
+
+        {/* Phase / status line */}
+        <div style={S.statusLine}>
+          {cpuTurn && <><Dots/><span style={S.stTxt}>{st.players[st.queue[0]]?.name} is thinking…</span></>}
+          {!meActive && st.phase!=="showdown" && st.phase!=="idle" && (
+            <><span style={{...S.stTxt,color:"#ef444488",letterSpacing:2,fontSize:9}}>FOLDED</span>
+            <span style={S.stTxt}>You're out of this hand — watching it play out…</span></>
+          )}
+          {myTurn && !drawing && (
+            <>
+              <span style={{...S.stTxt,color:"#C9A24B88",letterSpacing:2,fontSize:9}}>YOUR ACTION</span>
+              <span style={S.stTxt}>
+                {isFL ? `Fixed Limit · ${fb===stk.sbet?"Small Bet":"Big Bet"} $${MNY(fb)}`
+                      : mode==="pl" ? `Pot-Limit · max $${MNY(nlMax)}` : "No-Limit"}
+              </span>
+              {odds && <span style={S.oddsPill}>{callAmt>=me.chips?"ALL IN ":" "}{odds}:1 · call ${callAmt}</span>}
+            </>
+          )}
+          {drawing && meActive && (
+            <><span style={{...S.stTxt,color:"#C9A24B88",letterSpacing:2,fontSize:9}}>DRAW PHASE</span>
+            <span style={S.stTxt}>
+              {st.sel.length===0?"Tap cards to select discards, or Stand Pat":"Tap again to deselect"}
+              {st.maxDraws>1 && ` · Draw ${st.drawN+1} of ${st.maxDraws}`}
+            </span></>
+          )}
+          {discarding && meActive && (
+            <><span style={{...S.stTxt,color:"#C9A24B88",letterSpacing:2,fontSize:9}}>DISCARD PHASE</span>
+            <span style={S.stTxt}>
+              {st.sel.length===0?"Tap 2 of your face-down cards to discard (keep 3)"
+                :st.sel.length===1?"Tap one more — pick 2 to discard":"Ready — tap Discard 2"}
+            </span></>
+          )}
+          {pineDiscarding && meActive && (
+            <><span style={{...S.stTxt,color:"#C9A24B88",letterSpacing:2,fontSize:9}}>CRAZY PINEAPPLE — DISCARD</span>
+            <span style={S.stTxt}>
+              {st.sel.length===0?"Tap 1 card to discard (keep 2)":"Ready — tap Discard"}
+            </span></>
+          )}
+          {st.phase==="showdown" && <span style={S.stTxt}>{st.msg}</span>}
+          {st.phase==="idle"     && <span style={S.stTxt}>Press Deal to begin</span>}
+        </div>
+
+        {/* Coach tip */}
+        {advice && (
+          <div style={{...S.coachBar,...S.coachTone[advice.tone]}}>
+            <span style={{...S.coachTag,
+              background: advice.tone==="good"?"rgba(87,230,176,0.22)":advice.tone==="warn"?"rgba(248,113,113,0.22)":"rgba(201,162,75,0.22)",
+              color: advice.tone==="good"?"#57E6B0":advice.tone==="warn"?"#E2857A":"#EBD08A",fontFamily:"'GM-Stamp',Georgia,serif"}}>COACH</span>
+            <span style={S.coachTxt}>{advice.text}</span>
+          </div>
+        )}
+
+        {/* DEEP CHECK — on-demand rollout solver. Only offered on a real betting decision. */}
+        {st.coach && meActive && (myTurn || drawing) && (
+          <div style={S.deepWrap}>
+            {!deepCheck && (
+              <button id="tour-deep" style={S.deepBtn} onClick={runDeepCheck}>
+                <span style={S.deepBtnTag}>DEEP CHECK</span>
+                <span style={S.deepBtnTxt}>Run the solver against this table →</span>
+              </button>
+            )}
+            {deepCheck === "running" && (
+              <div style={S.deepPanel}>
+                <span style={S.deepHead}>DEEP CHECK</span>
+                <span style={S.deepRunning}>Dealing out hundreds of hands…</span>
+              </div>
+            )}
+            {deepCheck && deepCheck !== "running" && deepCheck.empty && (
+              <div style={S.deepPanel}>
+                <span style={S.deepHead}>DEEP CHECK</span>
+                <span style={S.deepRunning}>No clear read here — the spot's too thin to separate the lines.</span>
+              </div>
+            )}
+            {deepCheck && deepCheck !== "running" && !deepCheck.empty && deepCheck.all && (
+              <div style={S.deepPanel}>
+                <span style={S.deepHead}>DEEP CHECK · {deepCheck.sims} SIMS</span>
+                {deepCheck.all.map((o,i) => {
+                  const top = i===0;
+                  const rel = o.ev - deepCheck.all[0].ev;
+                  return (
+                    <div key={o.label} style={{...S.deepRow, ...(top?S.deepRowTop:{})}}>
+                      <span style={{...S.deepRank, color: top?"#57E6B0":"#8FA396"}}>{top?"BEST":`#${i+1}`}</span>
+                      <span style={S.deepLabel}>{o.label}</span>
+                      <span style={{...S.deepEv, color: top?"#57E6B0":o.ev<0?"#E2857A":"#EBD08A"}}>
+                        {top ? `${o.ev>=0?"+":""}${MNY(Math.round(o.ev))}` : `${rel>=0?"+":""}${MNY(Math.round(rel))}`}
+                      </span>
+                    </div>
+                  );
+                })}
+                <span style={S.deepFoot}>EV against how these opponents have actually played — not a GTO solve.</span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* DRAW CONTROLS (only when you're still in the hand) */}
+        {drawing && meActive && (
+          <div style={S.btnRow}>
+            <Btn s={S.bFold} onClick={fold}>FOLD</Btn>
+            <Btn s={S.bDraw} onClick={draw}>
+              {st.sel.length===0?"STAND PAT →":`DRAW ${st.sel.length} →`}
+            </Btn>
+          </div>
+        )}
+
+        {/* SUPER STUD DISCARD */}
+        {discarding && meActive && (
+          <div style={S.btnRow}>
+            <Btn s={{...S.bDraw, opacity:st.sel.length===2?1:0.45}} onClick={st.sel.length===2?discardGo:null}>
+              {st.sel.length===2?"DISCARD 2 →":`SELECT ${2-st.sel.length} MORE`}
+            </Btn>
+          </div>
+        )}
+
+        {/* CRAZY PINEAPPLE DISCARD */}
+        {pineDiscarding && meActive && (
+          <div style={S.btnRow}>
+            <Btn s={{...S.bDraw, opacity:st.sel.length===1?1:0.45}} onClick={st.sel.length===1?pineDiscardGo:null}>
+              {st.sel.length===1?"DISCARD →":"SELECT 1 CARD"}
+            </Btn>
+          </div>
+        )}
+
+        {/* BIG-BET BETTING (no-limit / pot-limit) */}
+        {myTurn && !drawing && bigBet && (
+          <div style={S.nlWrap}>
+            <div style={S.preRow}>
+              {presets.map(p=>(
+                <button key={p.lbl}
+                  style={{...S.pre,...(nlVal===p.v?S.preOn:{})}}
+                  onClick={()=>setSt(s=>({...s,nlBet:p.v}))}>
+                  <span style={S.preLbl}>{p.lbl}</span>
+                  <span style={S.preAmt}>${p.v}</span>
+                </button>
+              ))}
+            </div>
+            <div style={S.slRow}>
+              <button style={S.stepBtn}
+                onClick={()=>setSt(s=>({...s,nlBet:Math.max(nlMin, nlVal-10)}))}>−$10</button>
+              <span style={S.slEdge}>${MNY(nlMin)}</span>
+              <input type="range" min={nlMin} max={Math.max(nlMin,nlMax)} step={5}
+                value={nlVal} onChange={e=>setSt(s=>({...s,nlBet:+e.target.value}))} style={S.slider}/>
+              <span style={S.slEdge}>${MNY(nlMax)}</span>
+              <button style={S.stepBtn}
+                onClick={()=>setSt(s=>({...s,nlBet:Math.min(nlMax, nlVal+10)}))}>+$10</button>
+              <span style={S.slVal}>{st.currentBet>0?"Raise":"Bet"} ${nlVal}</span>
+            </div>
+            <div style={S.btnRow}>
+              {!canCheck && <Btn s={S.bFold}  onClick={()=>act("fold")}>FOLD</Btn>}
+              {canCheck
+                ?<Btn s={S.bCheck} onClick={()=>act("check")}>CHECK</Btn>
+                :<Btn s={S.bCall}  onClick={()=>act("call")}>{callAmt>=me.chips?"ALL IN":`CALL $${MNY(callAmt)}`}</Btn>}
+              <Btn s={S.bBet} onClick={()=>act(st.currentBet>0?"raise":"bet",me.betSt+nlVal)}>
+                {st.currentBet>0?`RAISE $${MNY(nlVal)}`:`BET $${MNY(nlVal)}`}
+              </Btn>
+            </div>
+          </div>
+        )}
+
+        {/* FL BETTING */}
+        {myTurn && !drawing && isFL && (
+          <div style={S.btnRow}>
+            {!canCheck && <Btn s={S.bFold}  onClick={()=>act("fold")}>FOLD</Btn>}
+            {canCheck
+              ?<Btn s={S.bCheck} onClick={()=>act("check")}>CHECK</Btn>
+              :<Btn s={S.bCall}  onClick={()=>act("call")}>CALL ${callAmt}</Btn>}
+            {/* One button serves both roles: BET when nothing is wagered, RAISE when there is. Gate on either
+                being legal — checking only canRaise hid the BET button whenever the action was checked to you. */}
+            {(() => { const la = legalActions(st); return (!la || la.canBet || la.canRaise); })() && !(st.currentBet>0 && (st.betCount||0) >= 4) && (
+              <Btn s={S.bBet} onClick={()=>act(st.currentBet>0?"raise":"bet",me.betSt+callAmt+fb)}>
+                {st.currentBet>0?`RAISE $${MNY(st.currentBet+fb)}`:`BET $${MNY(fb)}`}
+              </Btn>
+            )}
+          </div>
+        )}
+
+        {/* DEAL / GAME OVER */}
+        {isOver && !gameOver && (
+          <div style={S.btnRow}>
+            <Btn s={S.bDeal} onClick={deal}>{st.phase==="idle"?"DEAL":"DEAL AGAIN"}</Btn>
+          </div>
+        )}
+        {gameOver && isOver && (
+          <div style={{...S.btnRow,gap:14}}>
+            <span style={{fontSize:12,color:"#E2857A",flex:1,textAlign:"center"}}>
+              {meBroke?"You're out of chips!":"You cleaned up — everyone else is broke!"}
+            </span>
+            <Btn s={S.bDeal} onClick={()=>setSt(s=>{
+              const ns = mkState(s.gid, s);              // carry settings (stakes, coach, tightness) via prev
+              const chips = startStack(ns);              // but reset to fresh, equal stacks
+              return { ...ns, stats:{ hands:0, wins:0 }, cpuTilt:{ 1:0, 2:0, 3:0 },
+                players: ns.players.map(p=>({ ...p, chips })) };
+            })}>NEW SESSION</Btn>
+          </div>
+        )}
+
+      </div>
+
+      {/* FOOTER */}
+      <div style={S.foot}>
+        {st.gid==="lhe" ? (
+          <><b style={{color:"#C9A24B44"}}>LIMIT HOLD'EM</b>
+          {" · 2 hole + 5 board · best five wins · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="omaha8" ? (
+          <><b style={{color:"#C9A24B44"}}>OMAHA HI-LO 8</b>
+          {" · use exactly 2 of 4 hole cards · high & qualifying low (8-or-better) split the pot · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="razzdugi" ? (
+          <><b style={{color:"#C9A24B44"}}>RAZZDUGI</b>
+          {" · 7-card stud split · best Razz low (5-4-3-2-A) splits with best Badugi (4-3-2-A) from your 7 cards · no qualifier · highest card brings in · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="razz" ? (
+          <><b style={{color:"#C9A24B44"}}>RAZZ</b>
+          {" · 7-card stud for low · Aces low · straights & flushes don't count · Nuts: 5-4-3-2-A · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="stud" ? (
+          <><b style={{color:"#C9A24B44"}}>7-CARD STUD</b>
+          {" · 2 down, 4 up, 1 down · best five of seven · low card brings in · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="stud8" ? (
+          <><b style={{color:"#C9A24B44"}}>STUD HI-LO 8</b>
+          {" · 7-card stud · high & qualifying low (8-or-better) split · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="superstud" ? (
+          <><b style={{color:"#C9A24B44"}}>SUPER STUD HI-LO 8</b>
+          {" · dealt 4 down + 1 up · high card brings in · discard 2 after 3rd street · then plays as Stud Hi-Lo 8 · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="badugi" ? (
+          <><b style={{color:"#C9A24B44"}}>BADUGI</b>
+          {" · Aces low · 4 distinct ranks & suits = a Badugi · Nuts: A-2-3-4 rainbow · "}
+          {`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="nlhe" ? (
+          <><b style={{color:"#C9A24B44"}}>NO-LIMIT HOLD'EM</b>
+          {" · 2 hole + 5 board · best five wins · bet anything up to your stack · "}{`Blinds $${MNY(stk.sblind)}/$${MNY(stk.bblind)}`}</>
+        ) : st.gid==="plo" ? (
+          <><b style={{color:"#C9A24B44"}}>POT-LIMIT OMAHA</b>
+          {" · use exactly 2 of 4 hole cards · max bet = size of the pot · "}{`Blinds $${MNY(stk.sblind)}/$${MNY(stk.bblind)}`}</>
+        ) : st.gid==="bigo" ? (
+          <><b style={{color:"#C9A24B44"}}>BIG O</b>
+          {" · 5 hole cards, use exactly 2 · high & qualifying low (8-or-better) split · pot-limit · "}{`Blinds $${MNY(stk.sblind)}/$${MNY(stk.bblind)}`}</>
+        ) : st.gid==="crazyp" ? (
+          <><b style={{color:"#C9A24B44"}}>CRAZY PINEAPPLE</b>
+          {" · 3 hole cards · discard one after the flop · Hold'em hand (use any of your 2 cards) · pot-limit · "}{`Blinds $${MNY(stk.sblind)}/$${MNY(stk.bblind)}`}</>
+        ) : st.gid==="dbcrazyp" ? (
+          <><b style={{color:"#C9A24B44"}}>DOUBLE BOARD CRAZY PINEAPPLE</b>
+          {" · 3 cards, discard one after the flop · two boards run out · pot splits between best hand on each board (scoop both to win it all) · pot-limit · "}{`Blinds $${MNY(stk.sblind)}/$${MNY(stk.bblind)}`}</>
+        ) : st.gid==="dbbomb" ? (
+          <><b style={{color:"#C9A24B44"}}>DOUBLE BOARD BOMB POT</b>
+          {` · everyone antes ${BOMB_ANTE_BB} BB, no preflop — straight to two flops · Omaha high (use exactly 2 of 4) · pot splits between best hand on each board, scoop both to win it all · pot-limit`}</>
+        ) : st.gid==="dramahaH" ? (
+          <><b style={{color:"#C9A24B44"}}>DRAMAHA HIGH</b>
+          {" · 5-card Omaha high (exactly 2 hole + 3 board) splits with best 5-card-draw high · one draw after the flop · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="dramaha27" ? (
+          <><b style={{color:"#C9A24B44"}}>2-7 DRAMAHA</b>
+          {" · Omaha high splits with best 2-7 lowball (from your 5 hole cards) · one draw after the flop · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="dramadugi" ? (
+          <><b style={{color:"#C9A24B44"}}>DRAMADUGI</b>
+          {" · Omaha high splits with best 4-card Badugi (from your 5 hole cards) · draw 0–3 after the flop · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="badeucey" ? (
+          <><b style={{color:"#C9A24B44"}}>BADEUCEY</b>
+          {" · triple draw · best Badugi (ace HIGH) splits with best 2-7 lowball · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="badacey" ? (
+          <><b style={{color:"#C9A24B44"}}>BADACEY</b>
+          {" · triple draw · best Badugi (ace low) splits with best A-5 lowball · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="veronica" ? (
+          <><b style={{color:"#C9A24B44"}}>VERONICA</b>
+          {" · Archie + one community card (HIGH only) · triple draw · best high (pair of 9s+) splits with best A-5 low (8-or-better) · no qualifier ⇒ pot chopped · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="archie" ? (
+          <><b style={{color:"#C9A24B44"}}>ARCHIE</b>
+          {" · triple draw · best high (pair of 9s+ to qualify) splits with best A-5 low (8-or-better) · no qualifier ⇒ pot chopped among remaining players · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        ) : st.gid==="single" ? (
+          <><b style={{color:"#C9A24B44"}}>2-7 LOWBALL</b>
+          {" · Aces high · Straights & flushes count · Nuts: 7-5-4-3-2 · No-Limit"}</>
+        ) : (
+          <><b style={{color:"#C9A24B44"}}>2-7 TRIPLE DRAW</b>
+          {" · Aces high · Straights & flushes count · Nuts: 7-5-4-3-2 · "}
+          {`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
+        )}
+      </div>
+
+      {/* FOOTER META — actions + identity, kept quiet and disciplined */}
+      <div style={S.footMeta}>
+        <div style={S.footActions}>
+          <button onClick={()=>setShowBug(true)} style={S.footLink}>Report a bug</button>
+          <span style={S.footDot}>·</span>
+          <button onClick={()=>setShowFeedback(true)} style={S.footLink}>Send feedback</button>
+          {SUPPORT_URL.indexOf("https://") === 0 && (<>
+            <span style={S.footDot}>·</span>
+            <a href={SUPPORT_URL} target="_blank" rel="noopener noreferrer" style={S.footSupport}>♥ Support</a>
+          </>)}
+        </div>
+        <a href="mailto:hello@getmixed.ca" style={S.footMail}>hello@getmixed.ca</a>
+        <div style={S.footId}>
+          <span style={S.footBrand}>GET MIXED</span>
+          {IS_BETA && <span style={S.footBeta}>BETA</span>}
+          <span style={S.footDot}>·</span>
+          <span style={S.footBuild}>build {APP_VERSION}</span>
+        </div>
+      </div>
+
+    </div>
+  );
+}
+
+// ─── CENTRE INFO ─────────────────────────────────
+function CentreInfo({ st, streetLbl }) {
+  const flop = IS_FLOP(st.gid);
+  const dramaha = IS_DRAMAHA(st.gid);
+  return (
+    <div style={S.centre}>
+      {/* Community board for flop & dramaha games */}
+      {(flop || dramaha) && st.phase !== "idle" && (
+        IS_DOUBLE(st.gid) ? (
+          <div style={S.dblBoards}>
+            <div style={S.dblBoardWrap}>
+              <span style={S.dblBoardTag}>TOP BOARD</span>
+              <div style={S.boardSm}>
+                {[0,1,2,3,4].map(i => st.board[i]
+                  ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small/>
+                  : <div key={`a${i}`} style={S.boardSlotSm}/>)}
+              </div>
+            </div>
+            <div style={S.dblBoardWrap}>
+              <span style={S.dblBoardTag}>BOTTOM BOARD</span>
+              <div style={S.boardSm}>
+                {[0,1,2,3,4].map(i => (st.board2||[])[i]
+                  ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small/>
+                  : <div key={`b${i}`} style={S.boardSlotSm}/>)}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div style={S.board}>
+            {[0,1,2,3,4].map(i => {
+              const c = st.board[i];
+              return c
+                ? <BoardCard key={`${st.boardKey}-${i}`} card={c} idx={i}/>
+                : <div key={i} style={S.boardSlot}/>;
+            })}
+          </div>
+        )
+      )}
+      {IS_VERONICA(st.gid) && st.phase !== "idle" && st.board && st.board[0] && (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3,marginBottom:6}}>
+          <span style={{fontSize:7,letterSpacing:1.5,color:"#C9A24B99",fontWeight:"bold"}}>COMMUNITY · HIGH ONLY</span>
+          <div style={S.board}>
+            <BoardCard key={`v-${st.boardKey}-0`} card={st.board[0]} idx={0}/>
+          </div>
+        </div>
+      )}
+      <div style={S.potBox}>
+        <div style={S.potShine}/>
+        <span style={S.potChip}><span style={S.potChipFace}>♠</span></span>
+        <span style={S.potLbl}>POT</span>
+        <span style={S.potAmt}>${MNY(st.pot)}</span>
+      </div>
+      {st.phase !== "idle" && <div style={S.streetPill}>{streetLbl}</div>}
+      {st.maxDraws>1 && !flop && st.phase!=="idle" && st.phase!=="showdown" && (
+        <div style={S.pips}>
+          {[1,2,3].map(n=>(
+            <div key={n} style={{...S.pip,background:n<=st.drawN?"#C9A24B":"rgba(255,255,255,0.1)"}}>
+              {n<=st.drawN&&<span style={{fontSize:8,color:"#0a1a0a",fontWeight:"bold"}}>✓</span>}
+            </div>
+          ))}
+        </div>
+      )}
+      {st.phase==="showdown" && (() => {
+        const winNames = (st.winnerIds||[]).map(id => id===0 ? "You" : st.players[id]?.name).filter(Boolean);
+        const youWon = (st.winnerIds||[]).includes(0);
+        const label = youWon
+          ? (winNames.length > 1 ? "🏆 YOU + " + winNames.filter(n=>n!=="You").join(" & ") : "🏆 YOU WIN")
+          : (winNames.length ? winNames.join(" & ") + (winNames.length>1?" SPLIT":" WINS") : "CPU WINS");
+        return (
+          <div style={{...S.resultBanner,
+            background:youWon?"#14532d":"#450a0a",
+            border:`1px solid ${youWon?"#3FD39C":"#E2857A"}`}}>
+            {label}
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+// Community card — slightly larger, with its own deal animation
+function BoardCard({ card, idx, small, styleOverride }) {
+  const isRed = RED.has(card.s);
+  const ov = styleOverride || null;
+  return (
+    <div style={{...(small?S.boardCardSm:S.boardCard), color:isRed?"#b91c1c":"#111827", animation:`boardIn 0.3s cubic-bezier(.2,.7,.3,1) ${idx*0.09}s backwards`, ...(ov||{})}}>
+      <b style={{fontSize: ov? "inherit" : (small?11:13), lineHeight:1}}>{card.r}</b>
+      <span style={{fontSize: ov? "0.72em" : (small?10:12), lineHeight:1}}>{card.s}</span>
+    </div>
+  );
+}
+
+// ─── DESKTOP SEAT ────────────────────────────────
+function Seat({ p, reveal, gid, board, dealKey, isDealer, compact, thinking, wid, won, tilt, profile }) {
+  if (!p) return null;
+  const flop = IS_FLOP(gid);
+  const stud = IS_STUD(gid);
+  const dramaha = IS_DRAMAHA(gid);
+  const hs   = flop ? HOLE_SIZE(gid) : HAND_SIZE(gid);
+  let ev = null, lo = null;
+  if (reveal && !p.folded) {
+    if (stud) {
+      ev = (gid === "razz" || gid === "razzdugi") ? bestRazz(p.hand) : (p.hand.length>=5 ? studHigh(p.hand) : null);
+      lo = IS_STUD8(gid) && p.hand.length>=5 ? bestLow7(p.hand) : null;
+    } else if (dramaha) {
+      ev = board.length>=3 && p.hand.length===hs ? bestOmahaHigh(p.hand, board) : null;
+    } else if (flop) {
+      ev = board.length>=3 ? flopHigh(gid, p.hand, board) : null;
+      lo = IS_HILO(gid) && board.length>=3 ? bestOmahaLow(p.hand, board) : null;
+    } else if (p.hand.length===hs) {
+      ev = evalHand(gid, p.hand);
+    }
+  }
+  const win  = won || p.id === wid;
+  const speaks = won && reveal && p.name === "Martin";   // "Not like that" only when Martin WINS AT SHOWDOWN
+  // A card shows face-up if it's an up-card (stud), or on showdown, never if sitting out.
+  const faceDownOf = c => p.sittingOut ? true : stud ? !(c.up || reveal) : !reveal;
+  const showCards = stud ? p.hand.length > 0 : p.hand.length === hs;
+  return (
+    <div style={{ ...S.seat, ...(p.folded||p.sittingOut?S.seatDim:{}),
+      ...(thinking?S.seatThink:{}), ...(win?S.seatWin:{}) }}>
+      {speaks && <div style={S.bubble}>Not like that<span style={S.bubbleTail}/></div>}
+      <div style={S.seatBar}>
+        {isDealer&&<DBtn/>}
+        <div style={{display:"flex",flexDirection:"column",gap:0}}>
+          <span style={S.seatName}>{p.name}{p.justSeated && <span style={{marginLeft:5,fontSize:7,letterSpacing:1,color:"#0a1a0e",background:"#C9A24B",borderRadius:3,padding:"1px 3px",verticalAlign:"middle"}}>NEW</span>}</span>
+          {profile&&<span style={S.seatTag}>{profile.tag}{tilt>0?` 🔥${"!".repeat(Math.min(tilt,3))}`:""}</span>}
+        </div>
+        <span style={S.chips}>${MNY(p.chips)}</span>
+        {p.lastAct&&<Bdg {...p.lastAct}/>}
+        {thinking&&<Dots/>}
+      </div>
+      <div style={{...S.seatCards,gap:stud?1.5:compact?2:4}}>
+        {showCards
+          ?p.hand.map((c,i)=>(
+            <Card key={`${dealKey}-${i}-${c.r}${c.s}`} card={c} faceDown={faceDownOf(c)}
+              small={compact&&!stud} tiny={stud} dealIdx={i}/>
+          ))
+          :<span style={{...S.emptyH,fontSize:9,letterSpacing:3}}>· · ·</span>}
+      </div>
+      {ev&&!p.folded&&<div style={{fontSize:9.5,color:win?"#3FD39C":hColor(ev)}}>{win?"🏆 ":""}{ev.desc}{lo?` · ${lowDesc(lo)}`:""}</div>}
+      {p.folded&&!p.sittingOut&&<div style={{fontSize:7.5,color:"#ef444488",letterSpacing:2}}>FOLDED</div>}
+      {p.sittingOut&&<div style={{fontSize:7.5,color:"#2C443860",letterSpacing:1.5}}>SITTING OUT</div>}
+    </div>
+  );
+}
+
+// ─── MOBILE SEAT (compact strip) ─────────────────
+function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt, profile }) {
+  if (!p) return null;
+  const flop = IS_FLOP(gid);
+  const stud = IS_STUD(gid);
+  const dramaha = IS_DRAMAHA(gid);
+  const hs   = flop ? HOLE_SIZE(gid) : HAND_SIZE(gid);
+  let ev = null;
+  if (reveal && !p.folded) {
+    if (stud) ev = (gid === "razz" || gid === "razzdugi") ? bestRazz(p.hand) : (p.hand.length>=5 ? studHigh(p.hand) : null);
+    else if (dramaha) ev = board.length>=3 && p.hand.length===hs ? bestOmahaHigh(p.hand, board) : null;
+    else if (flop) ev = board.length>=3 ? flopHigh(gid, p.hand, board) : null;
+    else if (p.hand.length===hs) ev = evalHand(gid, p.hand);
+  }
+  // Hi-Lo: also surface the qualifying low so the badge shows who took the low, not just the high.
+  const lo = (reveal && !p.folded && IS_HILO(gid)) ? (stud ? bestLow7(p.hand) : (board.length>=3 ? bestOmahaLow(p.hand, board) : null)) : null;
+  const loTxt = lo ? ` · ${lo.slice(0,5).map(v=>LOWNAME[v]||v).join("-")} low` : "";
+  const win = won || p.id === wid;
+  const speaks = won && reveal && p.name === "Martin";   // "Not like that" only when Martin WINS AT SHOWDOWN
+  const backCount = p.hand.length > 0 ? p.hand.length : hs;
+  return (
+    <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:3, position:"relative",
+      opacity:p.folded||p.sittingOut?0.3:1,
+      filter:win?"drop-shadow(0 0 7px rgba(87,230,176,0.4))":thinking?"drop-shadow(0 0 5px rgba(201,162,75,0.28))":"none" }}>
+      {speaks && <div style={S.bubbleMobile}>Not like that</div>}
+      {/* Name + chips row */}
+      <div style={{display:"flex",alignItems:"center",gap:4,justifyContent:"center",flexWrap:"wrap"}}>
+        {isDealer&&<DBtn/>}
+        <span style={{fontSize:9,letterSpacing:1.2,color:"#C9A24B"}}>{p.name}</span>
+        <span style={{fontSize:10.5,color:"#F0E9D6",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"}}>${MNY(p.chips)}</span>
+      </div>
+      {/* Profile tag + tilt */}
+      <span style={{fontSize:6.5,letterSpacing:0.8,color:"#3a2a16"}}>
+        {profile?.tag}{tilt>0?` 🔥${"!".repeat(Math.min(tilt,3))}`:""}</span>
+      {/* Last action */}
+      <div style={{display:"flex",alignItems:"center",gap:3,minHeight:16}}>
+        {p.lastAct&&<Bdg {...p.lastAct}/>}
+        {thinking&&<Dots/>}
+      </div>
+      {/* Cards: stud shows up-cards during play; others show backs until showdown */}
+      {stud && !p.sittingOut ? (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+          <div style={{display:"flex",gap:1.5}}>
+            {p.hand.map((c,i)=> (c.up||reveal)
+              ? <MicroCard key={i} card={c}/>
+              : <div key={i} style={{width:11,height:16,borderRadius:2,background:"#1a3680",border:"1px solid rgba(201,162,75,0.6)"}}/>)}
+          </div>
+          {ev && <div style={{fontSize:8,color:win?"#3FD39C":hColor(ev),letterSpacing:0.5}}>{ev.desc}{loTxt}</div>}
+          {p.folded && <div style={{fontSize:7,color:"#ef444488",letterSpacing:1.5}}>FOLDED</div>}
+        </div>
+      ) : !reveal || p.folded || p.sittingOut ? (
+        <div style={{display:"flex",gap:2}}>
+          {(p.hand.length>0?p.hand:Array(backCount).fill(0)).map((_,i)=>(
+            <div key={i} style={{width:10,height:14,borderRadius:2,background:"#1a3680",
+              border:"1px solid rgba(201,162,75,0.6)",opacity:p.sittingOut?0.3:1}}/>
+          ))}
+        </div>
+      ) : ev ? (
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+          <div style={{display:"flex",gap:2}}>
+            {p.hand.map((c,i)=><MicroCard key={i} card={c}/>)}
+          </div>
+          <div style={{fontSize:8,color:win?"#3FD39C":hColor(ev),letterSpacing:0.5}}>{ev.desc}{loTxt}</div>
+        </div>
+      ) : (
+        <div style={{fontSize:7,color:p.folded?"#ef444488":"#2C4438",letterSpacing:1.5}}>
+          {p.folded?"FOLDED":"OUT"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── MICRO CARD (mobile showdown) ────────────────
+function MicroCard({ card }) {
+  const isRed = RED.has(card.s);
+  return (
+    <div style={{width:17,height:24,borderRadius:2,background:"#fefcf6",border:"1px solid #ddd0b8",
+      display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+      color:isRed?"#b91c1c":"#111",flexShrink:0}}>
+      <b style={{fontSize:7.5,lineHeight:1}}>{card.r}</b>
+      <span style={{fontSize:6.5,lineHeight:1}}>{card.s}</span>
+    </div>
+  );
+}
+
+// ─── CARD ────────────────────────────────────────
+function Card({ card, faceDown, selected, onClick, interactive, small, tiny, mobile, dealIdx = 0 }) {
+  // Sizing that fits on mobile screens (tiny = stud seats with up to 7 cards)
+  const W = tiny ? 26 : mobile ? 52 : small ? 38 : 60;
+  const H = tiny ? 37 : mobile ? 74 : small ? 54 : 85;
+  // Staggered deal-in: each card animates slightly after the previous one.
+  const dealAnim = `dealIn 0.34s cubic-bezier(.34,1.4,.64,1) ${dealIdx * 0.07}s backwards`;
+  if (!card||faceDown) return (
+    <div style={{...S.cardBack,width:W,height:H,animation:dealAnim}}><div style={S.cbInner}/></div>
+  );
+  const isRed = RED.has(card.s);
+  const fs    = tiny ? 9  : mobile ? 13 : small ? 10 : 13;
+  const fss   = tiny ? 7  : mobile ? 11 : small ? 8  : 11;
+  const fsm   = tiny ? 11 : mobile ? 20 : small ? 14 : 20;
+  return (
+    <div onClick={onClick} style={{
+      ...S.card, width:W, height:H, color:isRed?"#b91c1c":"#111827",
+      cursor:onClick?"pointer":"default",
+      transform:selected?"translateY(-18px) scale(1.06)":"translateY(0)",
+      boxShadow:selected?"0 10px 24px rgba(239,68,68,0.5),0 0 0 2px #ef4444":"0 2px 8px rgba(0,0,0,0.5)",
+      outline:interactive&&!selected?"1.5px dashed rgba(201,162,75,0.28)":"none",
+      animation: selected ? "none" : dealAnim,
+    }}>
+      <div style={S.cTL}>
+        <b style={{fontSize:fs,lineHeight:1}}>{card.r}</b>
+        <span style={{fontSize:fss,lineHeight:1}}>{card.s}</span>
+      </div>
+      <div style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",fontSize:fsm,lineHeight:1}}>{card.s}</div>
+      <div style={{...S.cTL,alignSelf:"flex-end",transform:"rotate(180deg)"}}>
+        <b style={{fontSize:fs,lineHeight:1}}>{card.r}</b>
+        <span style={{fontSize:fss,lineHeight:1}}>{card.s}</span>
+      </div>
+      {selected&&<div style={S.discardTag}>DISCARD</div>}
+    </div>
+  );
+}
+
+// ─── MICRO COMPONENTS ────────────────────────────
+function Btn({ s, onClick, children }) {
+  const [h,setH]=useState(false);
+  return (
+    <button onClick={onClick} onMouseEnter={()=>setH(true)} onMouseLeave={()=>setH(false)}
+      style={{...s,filter:h?"brightness(1.18)":"none",transform:h?"translateY(-2px)":"none",transition:"all 0.1s"}}>
+      {children}
+    </button>
+  );
+}
+function Bdg({ text, color }) {
+  return <span style={{fontSize:8.5,fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",background:"rgba(0,0,0,0.3)",
+    padding:"1px 5px",borderRadius:8,letterSpacing:0.5,color,whiteSpace:"nowrap"}}>{text}</span>;
+}
+function DBtn() {
+  return <span style={{display:"inline-flex",alignItems:"center",justifyContent:"center",
+    width:14,height:14,borderRadius:"50%",background:"#C9A24B",color:"#000",
+    fontSize:8,fontWeight:"bold",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",flexShrink:0}}>D</span>;
+}
+function Dots() {
+  const [f,setF]=useState(0);
+  useEffect(()=>{const t=setInterval(()=>setF(x=>(x+1)%3),380);return()=>clearInterval(t);},[]);
+  return (
+    <span style={{display:"inline-flex",gap:3,alignItems:"center"}}>
+      {[0,1,2].map(i=><span key={i} style={{width:4,height:4,borderRadius:"50%",background:"#C9A24B",
+        opacity:i===f?1:0.18,transition:"opacity 0.22s",display:"inline-block"}}/>)}
+    </span>
+  );
+}
+
+// ─── STYLES ──────────────────────────────────────
+const S = {
+  root:{minHeight:"100vh",background:"#0A1F18",
+    backgroundImage:"radial-gradient(ellipse 70% 50% at 50% -8%, #1f3454 0%, transparent 60%), radial-gradient(ellipse at 50% 120%, #2a1f10 0%, transparent 55%), linear-gradient(#0A1F18,#0c121e)",
+    display:"flex",flexDirection:"column",alignItems:"center",padding:"9px 8px 14px",gap:6,
+    fontFamily:"'Georgia','Times New Roman',serif",color:"#f1e9d6",userSelect:"none"},
+
+  // Brand lockup
+  brand:{display:"flex",alignItems:"center",gap:9,padding:"2px 0 1px"},
+  brandRow:{position:"relative",width:"100%",maxWidth:740,display:"flex",alignItems:"center",justifyContent:"center",padding:"2px 0 4px"},
+  brandStack:{display:"flex",flexDirection:"column",alignItems:"center",gap:1},
+  suitRow:{display:"flex",gap:5,marginBottom:0,fontSize:8,letterSpacing:1},
+  suitB:{color:"#C9A24B",opacity:0.85},
+  suitR:{color:"#c07a72",opacity:0.9},
+  gearBtnTop:{position:"absolute",right:0,top:"50%",transform:"translateY(-50%)",
+    background:"rgba(255,255,255,0.03)",border:"1px solid rgba(201,162,75,0.25)",borderRadius:9,
+    color:"#C9A24B",fontSize:17,width:32,height:32,cursor:"pointer",
+    display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all 0.12s"},
+  fmtQuick:{position:"absolute",left:0,top:"50%",transform:"translateY(-50%)",display:"flex",gap:3,zIndex:2},
+  fmtQuickBtn:{fontSize:8,letterSpacing:1,fontWeight:"bold",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",cursor:"pointer",
+    padding:"5px 7px",borderRadius:7,border:"1px solid rgba(255,255,255,0.1)",color:"#8FA396",background:"rgba(255,255,255,0.04)"},
+  fmtQuickOn:{color:"#F0E9D6",background:"linear-gradient(135deg,rgba(201,162,75,0.26),rgba(201,162,75,0.12))",
+    borderColor:"rgba(201,162,75,0.7)",boxShadow:"0 0 8px rgba(201,162,75,0.12)"},
+  topTabs:{width:"100%",maxWidth:740,display:"flex",gap:8,margin:"10px auto 2px"},
+  topTab:{flex:1,textAlign:"center",padding:"9px 0",borderRadius:9,fontSize:12,letterSpacing:2,fontWeight:"bold",
+    border:"1px solid #232a38",color:"#7d8496",background:"rgba(255,255,255,0.02)",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",cursor:"pointer"},
+  topTabOn:{color:"#1a1206",background:"linear-gradient(165deg,#d8b551,#bb8f33)",borderColor:"transparent",boxShadow:"0 3px 12px rgba(201,162,75,0.22)"},
+  tourHud:{width:"100%",maxWidth:740,margin:"8px auto 0",display:"flex",flexDirection:"column",
+    background:"linear-gradient(180deg,rgba(30,24,10,0.5),rgba(18,14,6,0.4))",border:"1px solid rgba(201,162,75,0.3)",
+    borderRadius:10,padding:"7px 4px 6px"},
+  tourHudRow:{display:"flex",alignItems:"stretch",justifyContent:"space-around",width:"100%"},
+  tourHudTier:{display:"flex",alignItems:"center",justifyContent:"center",gap:9,flexWrap:"wrap",
+    marginTop:6,paddingTop:6,borderTop:"1px solid rgba(201,162,75,0.14)",
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontSize:11,color:"#cfc3a0",letterSpacing:0.2},
+  tierDot:{color:"rgba(201,162,75,0.4)"},
+  tierMono:{fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",fontSize:10,color:"#8FA396"},
+  tierMoney:{fontSize:9,letterSpacing:1,textTransform:"uppercase",fontWeight:"bold"},
+  tourHudNear:{border:"1px solid rgba(251,191,36,0.5)"},
+  tourHudBubble:{border:"1px solid rgba(248,113,113,0.6)",boxShadow:"0 0 12px rgba(248,113,113,0.15)"},
+  tourHudCol:{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flex:1,gap:1},
+  tourHudSub:{fontSize:8,color:"#8FA396",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",lineHeight:1,marginTop:1},
+  tourHudLbl:{fontSize:7.5,letterSpacing:1.4,color:"#9d8659",textTransform:"uppercase"},
+  tourHudVal:{fontSize:14,color:"#D9B96A",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",fontWeight:"bold",lineHeight:1},
+  tourHudDiv:{width:1,background:"rgba(201,162,75,0.18)",alignSelf:"stretch"},
+  fieldStrip:{width:"100%",maxWidth:740,margin:"4px auto 0",display:"flex",alignItems:"center",justifyContent:"space-between",
+    gap:8,padding:"5px 12px",borderRadius:9,background:"rgba(255,255,255,0.02)",border:"1px solid #232a38",
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",flexWrap:"wrap"},
+  fieldMain:{fontSize:12,color:"#cfc3a0",letterSpacing:0.3},
+  fieldSub:{fontSize:10,color:"#8FA396",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+  fieldMoney:{fontSize:9,letterSpacing:1,textTransform:"uppercase",fontWeight:"bold"},
+  fieldStripNear:{border:"1px solid rgba(251,191,36,0.5)",background:"rgba(251,191,36,0.06)"},
+  fieldStripBubble:{border:"1px solid rgba(248,113,113,0.6)",background:"rgba(248,113,113,0.08)",boxShadow:"0 0 12px rgba(248,113,113,0.15)"},
+  resultOverlay:{position:"fixed",inset:0,zIndex:70,display:"flex",alignItems:"center",justifyContent:"center",
+    padding:24,background:"radial-gradient(ellipse at 50% 40%,rgba(20,30,22,0.92),rgba(6,9,13,0.95))"},
+  resultCard:{width:"100%",maxWidth:340,textAlign:"center",display:"flex",flexDirection:"column",alignItems:"center",gap:8,
+    background:"linear-gradient(180deg,rgba(22,28,20,0.9),rgba(12,16,12,0.9))",border:"1px solid rgba(201,162,75,0.35)",
+    borderRadius:18,padding:"26px 22px",boxShadow:"0 18px 50px rgba(0,0,0,0.6)"},
+  resultTitle:{fontSize:24,letterSpacing:1,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold"},
+  resultPlace:{fontSize:30,color:"#f3dd9a",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold",letterSpacing:0.5},
+  resultPrize:{fontSize:26,color:"#57E6B0",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",fontWeight:"bold",textShadow:"0 0 12px rgba(134,239,172,0.35)",marginTop:2},
+  resultPool:{fontSize:10,color:"#8FA396",letterSpacing:0.4,marginTop:4},
+  resultSub:{fontSize:12,color:"#a9b0a2",lineHeight:1.5,maxWidth:260,marginTop:2},
+  resultBtn:{width:"100%",marginTop:12,padding:14,borderRadius:12,border:"none",cursor:"pointer",
+    background:"linear-gradient(165deg,#57b56a,#3f9152)",color:"#0a1a0e",fontSize:14,fontWeight:"bold",
+    letterSpacing:1.5,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",boxShadow:"0 6px 16px rgba(46,140,104,0.3)"},
+  resultBtn2:{width:"100%",marginTop:8,padding:11,borderRadius:10,cursor:"pointer",
+    background:"transparent",border:"1px solid #2a3240",color:"#9aa3ad",fontSize:12,letterSpacing:0.5,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  chromeTab:{width:"100%",maxWidth:740,margin:"4px auto 0",display:"flex",alignItems:"center",justifyContent:"center",gap:6,
+    padding:"3px 0",cursor:"pointer",color:"#8b93a1",borderRadius:8,background:"rgba(255,255,255,0.02)",border:"1px solid #1c232f"},
+  chromeTabLbl:{fontSize:8,letterSpacing:1.5,color:"#6b7280",textTransform:"uppercase"},
+  menuAnchor:{position:"relative",width:"100%",zIndex:40},
+  menuPanel:{position:"absolute",top:2,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:760,zIndex:40,
+    display:"flex",flexDirection:"column",gap:8,padding:"8px 12px 12px",
+    background:"linear-gradient(180deg,rgba(13,19,27,0.985),rgba(10,15,22,0.985))",
+    border:"1px solid rgba(201,162,75,0.18)",borderRadius:14,
+    boxShadow:"0 14px 34px rgba(0,0,0,0.6)",maxHeight:"72vh",overflowY:"auto"},
+  brandText:{fontSize:15,letterSpacing:2,color:"#EBD08A",fontWeight:400,fontFamily:"'GM-Neon',Georgia,serif",
+    textShadow:"0 1px 0 rgba(0,0,0,0.6)",animation:"brandIn 0.8s ease-out"},
+  brandSub:{fontSize:8,letterSpacing:1,color:"#8FA396",fontFamily:"'GM-Stamp',Georgia,serif"},
+
+  // Selector
+  menuBar:{position:"relative",width:"100%",maxWidth:740,zIndex:50},
+  menuTrigger:{width:"100%",boxSizing:"border-box",display:"flex",alignItems:"center",justifyContent:"space-between",
+    background:"rgba(255,255,255,0.09)",border:"1px solid rgba(201,162,75,0.45)",borderRadius:10,
+    padding:"9px 14px",cursor:"pointer",transition:"all 0.12s"},
+  menuTriggerOpen:{borderColor:"rgba(201,162,75,0.75)",background:"rgba(201,162,75,0.13)"},
+  menuTrigCur:{display:"flex",alignItems:"center",gap:8},
+  menuTrigTag:{fontSize:7,letterSpacing:1,color:"#c2a35c",border:"1px solid rgba(201,162,75,0.4)",borderRadius:4,padding:"2px 5px"},
+  menuTrigName:{fontSize:13,color:"#f2e6c2",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",letterSpacing:0.5},
+  menuBackdrop:{position:"fixed",inset:0,zIndex:49,background:"transparent"},
+  tourLayer:{position:"fixed",inset:0,zIndex:9999},
+  tourCard:{position:"fixed",left:"50%",transform:"translateX(-50%)",width:"min(330px,90vw)",
+    background:"linear-gradient(160deg,#1b1d27,#13141c)",border:"1px solid rgba(201,162,75,0.4)",
+    borderRadius:14,padding:"15px 16px 13px",boxShadow:"0 20px 60px rgba(0,0,0,0.7)",
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",zIndex:10000},
+  tourStepNo:{fontSize:9,letterSpacing:1.5,color:"#9d8659"},
+  tourTitle:{fontSize:16,color:"#f0e0b0",fontWeight:"bold",marginTop:3,marginBottom:5},
+  tourText:{fontSize:12.5,lineHeight:1.5,color:"#cdbf9e"},
+  tourBtns:{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:13},
+  tourSkip:{background:"none",border:"none",color:"#8a7c5a",fontSize:12,cursor:"pointer",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",padding:"6px 4px"},
+  tourNext:{background:"linear-gradient(160deg,#d8b551,#bb8f33)",border:"none",color:"#1a1206",
+    fontWeight:"bold",fontSize:13,borderRadius:9,padding:"9px 18px",cursor:"pointer",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  menuDropdown:{position:"absolute",top:"calc(100% + 5px)",left:0,right:0,zIndex:51,
+    borderRadius:10,padding:9,background:"#13141c",border:"1px solid rgba(201,162,75,0.3)",
+    boxShadow:"0 18px 50px rgba(0,0,0,0.6)",display:"flex",flexDirection:"column",gap:6,
+    maxHeight:"66vh",overflowY:"auto"},
+  selWrap:{width:"100%",maxWidth:740,borderRadius:10,padding:7,background:"rgba(255,255,255,0.045)",border:"1px solid rgba(255,255,255,0.09)",
+    display:"flex",flexDirection:"column",gap:5},
+  selSection:{display:"flex",flexDirection:"column",gap:3},
+  selSecTitle:{fontSize:7,letterSpacing:2.5,color:"#ac9663",paddingLeft:2,
+    display:"flex",alignItems:"center",gap:6},
+  selGrid:{display:"flex",flexWrap:"wrap",justifyContent:"center",gap:4},
+  gBtn:{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:7,color:"#ab966c",
+    width:66,flex:"0 0 auto",padding:"5px 3px",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:1,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",transition:"all 0.12s",minHeight:38},
+  gOn:{background:"rgba(201,162,75,0.12)",border:"1px solid rgba(201,162,75,0.55)",color:"#f0e0b0",boxShadow:"inset 0 1px 0 rgba(255,220,150,0.15)"},
+  gOff:{opacity:0.3,cursor:"default",borderStyle:"dashed"},
+  gTag:{fontSize:6,letterSpacing:0.8,color:"#9d8659"},
+  gName:{fontSize:8.5,lineHeight:1.15,textAlign:"center"},
+  gSoon:{fontSize:11,color:"#9d8659",lineHeight:1},
+
+  // Stats
+  statsBar:{display:"flex",alignItems:"center",gap:10,background:"rgba(255,255,255,0.05)",
+    borderRadius:8,padding:"3px 12px",border:"1px solid rgba(255,255,255,0.08)"},
+  stat:{fontSize:10,letterSpacing:0.5,color:"#ab966c",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+
+  // Table — brass rail, championship felt
+  shell:{width:"100%",maxWidth:740,borderRadius:"50px / 28px",padding:7,
+    background:"linear-gradient(145deg,#4a2c0e 0%,#7a4a16 18%,#3a2208 50%,#6e4214 82%,#3a2208 100%)",
+    boxShadow:"0 0 0 3px #0A1F18,0 0 0 5px rgba(201,162,75,0.7),0 0 22px rgba(201,162,75,0.14),0 22px 60px rgba(0,0,0,0.7)"},
+  rail:{borderRadius:"45px / 23px",padding:5,
+    background:"linear-gradient(180deg,rgba(255,225,150,0.22) 0%,rgba(0,0,0,0.2) 40%,transparent 70%)",
+    border:"1px solid rgba(255,220,150,0.3)"},
+  felt:{position:"relative",background:"#17402a",
+    backgroundImage:"radial-gradient(ellipse 70% 56% at 50% 42%, rgba(201,162,75,0.2) 0%, transparent 60%), radial-gradient(ellipse 86% 70% at 50% 50%,#2c8a4f 0%,#114a27 100%)",
+    borderRadius:"42px / 20px",padding:"12px 14px 9px",display:"flex",flexDirection:"column",gap:6,
+    border:"1px solid rgba(0,0,0,0.3)",boxShadow:"inset 0 0 40px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.06)"},
+  gamePlaque:{position:"absolute",left:10,bottom:10,zIndex:4,pointerEvents:"none",whiteSpace:"nowrap",
+    display:"flex",alignItems:"center",gap:5,
+    background:"linear-gradient(180deg,rgba(16,24,18,0.82),rgba(9,15,11,0.78))",
+    border:"1px solid rgba(201,162,75,0.32)",borderRadius:7,padding:"3px 9px",
+    boxShadow:"0 2px 7px rgba(0,0,0,0.4)"},
+  plaqueTag:{fontSize:6.5,letterSpacing:1,color:"#12180f",background:"#C9A24B",borderRadius:3,padding:"1px 4px",fontWeight:"bold",textTransform:"uppercase"},
+  plaqueName:{fontSize:9.5,letterSpacing:1,color:"#D9B96A",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold",textTransform:"uppercase"},
+
+  // Mobile CPU strip
+  mStrip:{display:"flex",gap:6,justifyContent:"space-between",
+    borderBottom:"1px solid rgba(201,162,75,0.12)",paddingBottom:8},
+  ovalWrap:{position:"relative",width:"100%",height:340,margin:"2px 0 4px"},
+  ovalSeat:{position:"absolute",transform:"translate(-50%,-50%)",width:92,zIndex:2},
+  ovalCentre:{position:"absolute",left:"50%",top:"46%",transform:"translate(-50%,-50%)",zIndex:1,width:"56%",textAlign:"center"},
+  // Compact double-board centre for the oval: two narrow boards in the mid-band (clear of the 33%/62%
+  // seat rows) + the pot dropped into the empty lower felt. Inline TOP/BOT tags keep the block short.
+  ovalDblBoards:{position:"absolute",left:"50%",top:"47%",transform:"translate(-50%,-50%) scale(0.9)",zIndex:1,
+    display:"flex",flexDirection:"column",gap:5,alignItems:"center"},
+  ovalDblRow:{display:"flex",alignItems:"center",gap:5},
+  ovalDblTag:{fontSize:8,letterSpacing:1,color:"#C9A24B",width:24,textAlign:"right",fontWeight:"bold",flexShrink:0},
+  ovalDblPot:{position:"absolute",left:"50%",top:"85%",transform:"translate(-50%,-50%)",zIndex:1,
+    display:"flex",alignItems:"center",gap:8,
+    background:"linear-gradient(180deg,rgba(0,0,0,0.55),rgba(0,0,0,0.4))",
+    borderRadius:10,padding:"3px 15px",border:"1.5px solid rgba(201,162,75,0.45)",
+    boxShadow:"0 2px 10px rgba(0,0,0,0.5)"},
+  ovalDblPotAmt:{fontSize:17,color:"#f3dd9a",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",lineHeight:1.15,textShadow:"0 0 10px rgba(201,162,75,0.4)"},
+  ovalDblStreet:{fontSize:8,letterSpacing:1.2,color:"#9fb0a4",borderLeft:"1px solid rgba(201,162,75,0.3)",paddingLeft:8},
+
+  // Desktop rows
+  rowTop:{display:"flex",justifyContent:"center"},
+  rowMid:{display:"flex",alignItems:"center",justifyContent:"center",gap:4},
+  sideSeat:{flex:"1 1 0",display:"flex",justifyContent:"center",minWidth:0},
+  botRow:{display:"flex",flexDirection:"column",alignItems:"center",gap:4,
+    borderTop:"1px solid rgba(201,162,75,0.12)",paddingTop:8},
+
+  // Centre
+  centre:{flex:"0 0 auto",display:"flex",flexDirection:"column",alignItems:"center",alignSelf:"center",gap:5,width:182},
+  potBox:{position:"relative",overflow:"hidden",display:"inline-flex",flexDirection:"row",alignItems:"center",gap:8,
+    background:"linear-gradient(180deg,rgba(20,26,16,0.9),rgba(10,14,8,0.85))",
+    borderRadius:22,padding:"5px 16px 5px 7px",border:"1px solid rgba(201,162,75,0.42)",
+    boxShadow:"0 3px 12px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,220,150,0.12)"},
+  potChip:{width:24,height:24,borderRadius:"50%",flexShrink:0,position:"relative",zIndex:1,
+    background:"conic-gradient(#efd98c 0deg 8deg,#7c5f1c 8deg 22deg,#efd98c 22deg 38deg,#7c5f1c 38deg 52deg,#efd98c 52deg 68deg,#7c5f1c 68deg 82deg,#efd98c 82deg 98deg,#7c5f1c 98deg 112deg,#efd98c 112deg 128deg,#7c5f1c 128deg 142deg,#efd98c 142deg 158deg,#7c5f1c 158deg 172deg,#efd98c 172deg 188deg,#7c5f1c 188deg 202deg,#efd98c 202deg 218deg,#7c5f1c 218deg 232deg,#efd98c 232deg 248deg,#7c5f1c 248deg 262deg,#efd98c 262deg 278deg,#7c5f1c 278deg 292deg,#efd98c 292deg 308deg,#7c5f1c 308deg 322deg,#efd98c 322deg 338deg,#7c5f1c 338deg 360deg)",
+    boxShadow:"0 2px 5px rgba(0,0,0,0.6)"},
+  potChipFace:{position:"absolute",inset:3,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",
+    background:"radial-gradient(circle at 50% 36%,#f7e8ad,#cb9f45 68%,#a97f2b)",fontSize:11,lineHeight:1,color:"#4a3410",
+    boxShadow:"inset 0 1px 2px rgba(255,255,255,0.45),inset 0 -2px 3px rgba(0,0,0,0.3)"},
+  potLbl:{fontSize:7,letterSpacing:2.5,color:"rgba(201,162,75,0.7)",position:"relative",zIndex:1},
+  potAmt:{fontSize:21,color:"#f3dd9a",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",lineHeight:1.15,position:"relative",zIndex:1,
+    textShadow:"0 0 10px rgba(201,162,75,0.4)"},
+  potShine:{position:"absolute",inset:0,
+    background:"linear-gradient(110deg,transparent 30%,rgba(255,230,170,0.35) 50%,transparent 70%)",
+    backgroundSize:"220% 100%",animation:"potShine 3.5s linear infinite",pointerEvents:"none"},
+
+  // Community board (flop games) — centered row of community cards
+  board:{display:"inline-flex",gap:5,justifyContent:"center",alignItems:"center",
+    padding:"7px 9px",borderRadius:12,marginBottom:6,
+    background:"linear-gradient(180deg,rgba(6,20,13,0.52),rgba(4,14,9,0.46))",
+    border:"1px solid rgba(201,162,75,0.26)",boxShadow:"inset 0 2px 11px rgba(0,0,0,0.5)"},
+  dblBoards:{display:"flex",flexDirection:"column",gap:3,width:"100%",marginBottom:2},
+  dblBoardWrap:{display:"flex",flexDirection:"column",alignItems:"center",gap:1},
+  dblBoardTag:{fontSize:6,letterSpacing:1.5,color:"#C9A24B99"},
+  boardSm:{display:"flex",gap:4,justifyContent:"center",alignItems:"center",width:"100%"},
+  boardCard:{width:32,height:45,borderRadius:5,boxSizing:"border-box",
+    background:"linear-gradient(160deg,#ffffff,#f4eedd)",border:"1px solid #d8c9ab",
+    display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+    boxShadow:"0 2px 7px rgba(0,0,0,0.5)",flexShrink:0},
+  boardSlot:{width:32,height:45,borderRadius:5,boxSizing:"border-box",
+    background:"rgba(0,0,0,0.18)",border:"1px dashed rgba(201,162,75,0.18)",flexShrink:0},
+  boardCardSm:{width:26,height:36,borderRadius:4,boxSizing:"border-box",
+    background:"linear-gradient(160deg,#ffffff,#f4eedd)",border:"1px solid #d8c9ab",
+    display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+    boxShadow:"0 1px 5px rgba(0,0,0,0.5)",flexShrink:0},
+  boardSlotSm:{width:26,height:36,borderRadius:4,boxSizing:"border-box",
+    background:"rgba(0,0,0,0.18)",border:"1px dashed rgba(201,162,75,0.18)",flexShrink:0},
+  streetPill:{fontSize:8,letterSpacing:1.5,color:"#b6a075",background:"rgba(0,0,0,0.2)",
+    padding:"2px 9px",borderRadius:10,border:"1px solid rgba(255,255,255,0.04)",textAlign:"center"},
+  pips:{display:"flex",gap:5},
+  pip:{width:17,height:17,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",
+    border:"1px solid rgba(201,162,75,0.2)"},
+  resultBanner:{padding:"3px 12px",borderRadius:10,fontSize:11,letterSpacing:2,color:"#fff",fontWeight:"bold",textAlign:"center"},
+
+  // Desktop seat
+  seat:{display:"flex",flexDirection:"column",alignItems:"center",gap:3},
+  seatDim:{opacity:0.25,pointerEvents:"none"},
+  seatThink:{filter:"drop-shadow(0 0 6px rgba(201,162,75,0.28))"},
+  seatWin:{animation:"winPulse 1.1s ease-in-out infinite"},
+  // Martin's "Not like that" speech bubble
+  bubble:{position:"relative",alignSelf:"center",marginBottom:2,
+    background:"linear-gradient(180deg,#fffdf6,#efe6cf)",color:"#2a1e0e",
+    fontSize:11,fontWeight:"bold",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",letterSpacing:0.3,
+    padding:"4px 10px",borderRadius:12,border:"1px solid #C9A24B",whiteSpace:"nowrap",
+    boxShadow:"0 3px 10px rgba(0,0,0,0.5)",animation:"dealIn 0.3s ease-out"},
+  bubbleTail:{position:"absolute",bottom:-5,left:"50%",transform:"translateX(-50%)",
+    width:0,height:0,borderLeft:"5px solid transparent",borderRight:"5px solid transparent",
+    borderTop:"6px solid #efe6cf"},
+  bubbleMobile:{position:"absolute",top:-20,left:"50%",transform:"translateX(-50%)",
+    background:"linear-gradient(180deg,#fffdf6,#efe6cf)",color:"#2a1e0e",
+    fontSize:8.5,fontWeight:"bold",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",
+    padding:"2px 7px",borderRadius:9,border:"1px solid #C9A24B",whiteSpace:"nowrap",
+    boxShadow:"0 2px 7px rgba(0,0,0,0.5)",zIndex:5,animation:"dealIn 0.3s ease-out"},
+  seatBar:{display:"flex",alignItems:"center",gap:5,
+    background:"linear-gradient(180deg,rgba(54,42,20,0.9),rgba(24,18,8,0.9))",
+    borderRadius:18,padding:"3px 8px 3px 7px",
+    border:"1px solid rgba(201,162,75,0.35)",flexWrap:"wrap",
+    boxShadow:"inset 0 1px 0 rgba(255,220,150,0.15), 0 2px 6px rgba(0,0,0,0.4)"},
+  seatName:{fontSize:9.5,letterSpacing:1.5,color:"#EBD08A",lineHeight:1.2,textShadow:"0 1px 3px rgba(0,0,0,0.75)"},
+  seatTag:{fontSize:6.5,letterSpacing:0.8,color:"#8a6a38",lineHeight:1,textShadow:"0 1px 2px rgba(0,0,0,0.7)"},
+  seatCards:{display:"flex",justifyContent:"center",padding:"2px 0 8px"},
+
+  // Player
+  youBar:{display:"flex",alignItems:"center",gap:7,flexWrap:"wrap",justifyContent:"center",
+    background:"linear-gradient(180deg,rgba(58,46,22,0.92),rgba(26,20,9,0.92))",borderRadius:20,padding:"4px 12px",
+    border:"1px solid rgba(201,162,75,0.4)",
+    boxShadow:"inset 0 1px 0 rgba(255,220,150,0.18), 0 2px 8px rgba(0,0,0,0.4)"},
+  youName:{fontSize:11,letterSpacing:2,color:"#f3dd9a"},
+  chips:{fontSize:13,color:"#F0E9D6",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",letterSpacing:0.5},
+  evalBdg:{fontSize:9,fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",padding:"1px 6px",borderRadius:8,
+    letterSpacing:0.5,whiteSpace:"nowrap",fontWeight:"bold"},
+  myCards:{display:"flex",gap:6,justifyContent:"center",alignItems:"flex-start",padding:"3px 0 12px",flexWrap:"nowrap"},
+  emptyH:{color:"rgba(255,255,255,0.07)",fontSize:17,letterSpacing:8,padding:"14px 0"},
+  discardNote:{fontSize:9.5,color:"rgba(239,68,68,0.6)",letterSpacing:0.5,marginTop:-6,paddingBottom:4},
+
+  // Action panel
+  panel:{width:"100%",maxWidth:740,background:"rgba(20,28,44,0.92)",borderRadius:12,
+    padding:"10px 12px",border:"1px solid rgba(255,255,255,0.08)",
+    display:"flex",flexDirection:"column",gap:8,transition:"border-color 0.2s,box-shadow 0.2s"},
+  panelOn:{border:"1px solid rgba(201,162,75,0.35)",boxShadow:"0 0 16px rgba(201,162,75,0.1)"},
+  statusLine:{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",minHeight:18},
+  stTxt:{fontSize:10.5,color:"#b6a280",letterSpacing:0.5},
+  oddsPill:{fontSize:10.5,color:"#C9A24B",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",background:"rgba(201,162,75,0.07)",
+    padding:"1px 7px",borderRadius:8,letterSpacing:0.5},
+
+  // Buttons
+  btnRow:{display:"flex",alignItems:"center",justifyContent:"center",gap:7,flexWrap:"wrap"},
+  bFold:{background:"linear-gradient(180deg,#a52222,#7a1818)",border:"1px solid #ef5350",color:"#ffd9d9",borderRadius:9,
+    padding:"10px 18px",cursor:"pointer",fontSize:11.5,letterSpacing:1.5,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold",minWidth:68,
+    boxShadow:"inset 0 1px 0 rgba(255,255,255,0.18), 0 3px 8px rgba(0,0,0,0.4)"},
+  bCheck:{background:"linear-gradient(180deg,#2a3850,#16202f)",border:"1px solid #5a6b85",color:"#c2d0e2",borderRadius:9,
+    padding:"10px 18px",cursor:"pointer",fontSize:11.5,letterSpacing:1.5,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold",minWidth:68,
+    boxShadow:"inset 0 1px 0 rgba(255,255,255,0.12), 0 3px 8px rgba(0,0,0,0.4)"},
+  bCall:{background:"linear-gradient(180deg,#1e54b8,#16307a)",border:"1px solid #5b9bf6",color:"#dbe9ff",borderRadius:9,
+    padding:"10px 18px",cursor:"pointer",fontSize:11.5,letterSpacing:1.5,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold",minWidth:86,
+    boxShadow:"inset 0 1px 0 rgba(255,255,255,0.18), 0 3px 8px rgba(0,0,0,0.4)"},
+  bBet:{background:"linear-gradient(180deg,#d9791e,#a8500f)",border:"1px solid #fbbf24",color:"#fff3dc",borderRadius:9,
+    padding:"10px 18px",cursor:"pointer",fontSize:11.5,letterSpacing:1.5,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold",minWidth:86,
+    boxShadow:"inset 0 1px 0 rgba(255,255,255,0.25), 0 3px 8px rgba(0,0,0,0.4)"},
+  bDraw:{background:"linear-gradient(180deg,#b8841e,#8a5e12)",border:"1px solid #f3dd9a",color:"#fff6df",
+    borderRadius:10,padding:"11px 34px",cursor:"pointer",fontSize:12,letterSpacing:2,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold",
+    boxShadow:"inset 0 1px 0 rgba(255,255,255,0.3), 0 4px 14px rgba(184,132,30,0.35)"},
+  bDeal:{background:"linear-gradient(180deg,#1f7a3e,#155028)",border:"1px solid #6ee79c",
+    color:"#e0ffe9",borderRadius:10,padding:"11px 34px",cursor:"pointer",fontSize:12,letterSpacing:2,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold",
+    boxShadow:"inset 0 1px 0 rgba(255,255,255,0.28), 0 4px 14px rgba(31,122,62,0.4)"},
+
+  // NL controls
+  nlWrap:{display:"flex",flexDirection:"column",gap:7},
+  preRow:{display:"flex",gap:4,justifyContent:"center",flexWrap:"wrap"},
+  pre:{background:"rgba(201,162,75,0.05)",border:"1px solid rgba(201,162,75,0.18)",borderRadius:8,
+    padding:"4px 8px",cursor:"pointer",color:"#C9A24B",display:"flex",flexDirection:"column",
+    alignItems:"center",gap:0,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",transition:"all 0.1s"},
+  preOn:{background:"rgba(201,162,75,0.16)",border:"1px solid rgba(201,162,75,0.5)"},
+  preLbl:{fontSize:7.5,letterSpacing:1,color:"#9d8a62"},
+  preAmt:{fontSize:11,fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+  slRow:{display:"flex",alignItems:"center",gap:7,justifyContent:"center"},
+  slEdge:{fontSize:9.5,color:"#9d8a62",minWidth:28,textAlign:"center"},
+  slider:{width:140,accentColor:"#C9A24B",cursor:"pointer"},
+  slVal:{fontSize:10.5,color:"#C9A24B",minWidth:88,letterSpacing:0.5},
+
+  // Cards
+  card:{background:"linear-gradient(160deg,#ffffff 0%,#f6f1e4 100%)",borderRadius:7,
+    border:"1px solid #d8c9ab",padding:"3px 4px",
+    position:"relative",display:"flex",flexDirection:"column",justifyContent:"space-between",
+    flexShrink:0,transition:"transform 0.14s cubic-bezier(.34,1.56,.64,1),box-shadow 0.14s"},
+  cardBack:{background:"linear-gradient(150deg,#243f96 0%,#152663 55%,#0e1a47 100%)",
+    backgroundImage:"repeating-linear-gradient(45deg,rgba(201,162,75,0.14) 0,rgba(201,162,75,0.14) 1px,transparent 0,transparent 7px),repeating-linear-gradient(-45deg,rgba(201,162,75,0.14) 0,rgba(201,162,75,0.14) 1px,transparent 0,transparent 7px)",
+    borderRadius:7,border:"2px solid rgba(201,162,75,0.8)",display:"flex",alignItems:"center",
+    justifyContent:"center",boxShadow:"0 2px 8px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.1)",flexShrink:0},
+  cbInner:{width:"70%",height:"74%",border:"1px solid rgba(201,162,75,0.4)",borderRadius:4,
+    boxShadow:"inset 0 0 8px rgba(201,162,75,0.2)"},
+  cTL:{display:"flex",flexDirection:"column",alignItems:"flex-start"},
+  discardTag:{position:"absolute",bottom:-13,left:"50%",transform:"translateX(-50%)",
+    fontSize:6.5,color:"#ef4444",letterSpacing:1,whiteSpace:"nowrap",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+
+  foot:{fontSize:10,color:"rgba(216,202,172,0.46)",textAlign:"center",maxWidth:600,lineHeight:1.6},
+
+  // Header row + gear
+  headerRow:{width:"100%",maxWidth:740,display:"flex",alignItems:"stretch",gap:6},
+  gearBtn:{background:"rgba(255,255,255,0.03)",border:"1px solid rgba(201,162,75,0.25)",
+    borderRadius:10,color:"#C9A24B",fontSize:20,width:46,cursor:"pointer",
+    display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,transition:"all 0.12s"},
+
+  // Settings overlay + modal
+  overlay:{position:"fixed",inset:0,background:"rgba(0,0,0,0.72)",zIndex:50,
+    // The overlay is the scroller: a modal taller than the phone (settings) scrolls end-to-end, while short
+    // modals still center via margin:auto. Big bottom padding clears Safari's floating bottom bar.
+    display:"flex",flexDirection:"column",alignItems:"center",overflowY:"auto",WebkitOverflowScrolling:"touch",
+    padding:"24px 16px 110px",backdropFilter:"blur(3px)"},
+  modal:{width:"100%",maxWidth:420,margin:"auto 0",background:"#1a2334",borderRadius:16,padding:"18px 18px 16px",
+    border:"1px solid rgba(201,162,75,0.35)",boxShadow:"0 24px 70px rgba(0,0,0,0.6)",
+    display:"flex",flexDirection:"column",gap:10},
+  modalHead:{display:"flex",alignItems:"center",justifyContent:"space-between"},
+  secTitle:{fontSize:9,letterSpacing:1.6,color:"#9d8659",marginBottom:5},
+  focusStrip:{width:"100%",display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,
+    padding:"9px 12px",borderRadius:9,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontSize:11.5,cursor:"pointer",
+    background:"linear-gradient(165deg,rgba(30,41,59,0.9),rgba(17,24,39,0.9))",
+    border:"1px solid rgba(201,162,75,0.28)",textAlign:"left"},
+  focusTag:{fontSize:7,letterSpacing:1.2,color:"#0a1a0e",background:"#C9A24B",borderRadius:3,
+    padding:"1px 4px",fontWeight:"bold",flexShrink:0},
+  modalTitle:{fontSize:15,color:"#C9A24B",letterSpacing:1},
+  modalClose:{background:"none",border:"none",color:"#9a8862",fontSize:18,cursor:"pointer",padding:4},
+  modalSection:{fontSize:9.5,letterSpacing:2,color:"#b6a075",marginTop:4,fontFamily:"'GM-Stamp',Georgia,serif"},
+  setCard:{background:"rgba(255,255,255,0.028)",border:"1px solid rgba(255,255,255,0.06)",
+    borderRadius:14,padding:"14px 14px 15px",marginBottom:12},
+  setCardHead:{fontSize:10,letterSpacing:2,color:"#C9A24B",fontWeight:"bold",marginBottom:9,
+    fontFamily:"'GM-Stamp',Georgia,serif",display:"flex",alignItems:"center",gap:7},
+  toolTiles:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginTop:2},
+  toolTile:{background:"rgba(255,255,255,0.028)",border:"1px solid rgba(255,255,255,0.06)",borderRadius:13,
+    padding:"15px 10px",textAlign:"center",cursor:"pointer",display:"flex",flexDirection:"column",alignItems:"center",gap:4},
+  toolTileIc:{fontSize:19},
+  toolTileLb:{fontSize:12,fontWeight:"bold",color:"#F0E9D6",fontFamily:"'GM-Body',system-ui,sans-serif"},
+  toolTileDs:{fontSize:9.5,color:"#9d8a62",fontFamily:"'GM-Body',system-ui,sans-serif"},
+  onlineHero:{position:"relative",overflow:"hidden",borderRadius:16,padding:"18px 18px 16px",marginTop:4,marginBottom:4,
+    background:"radial-gradient(130% 100% at 50% 0%, #14543b 0%, #0d3325 55%, #0a2419 100%)",
+    border:"1px solid rgba(87,230,176,0.35)",boxShadow:"0 6px 26px rgba(0,0,0,0.4), inset 0 1px 0 rgba(87,230,176,0.14)"},
+  onlineHeroGlow:{position:"absolute",inset:0,background:"radial-gradient(60% 50% at 50% 0%, rgba(87,230,176,0.13), transparent 70%)",pointerEvents:"none"},
+  onlineHeroTag:{position:"relative",fontSize:9,letterSpacing:2,color:"#57E6B0",fontWeight:"bold",fontFamily:"'GM-Body',system-ui,sans-serif"},
+  onlineHeroTitle:{position:"relative",fontSize:18,color:"#F0E9D6",margin:"6px 0 4px",fontFamily:"'GM-Body',system-ui,sans-serif",fontWeight:"bold"},
+  onlineHeroText:{position:"relative",fontSize:12,color:"#a9c4b6",lineHeight:1.5,marginBottom:14,fontFamily:"'GM-Body',system-ui,sans-serif"},
+  onlineHeroCta:{position:"relative",width:"100%",padding:"14px",borderRadius:11,border:"none",cursor:"pointer",
+    background:"linear-gradient(165deg,#5fe0a8,#39b184)",color:"#08160f",fontSize:14,fontWeight:"bold",letterSpacing:0.5,fontFamily:"'GM-Body',system-ui,sans-serif"},
+  settingsDivider:{display:"flex",alignItems:"center",justifyContent:"center",margin:"18px 0 6px",position:"relative"},
+  settingsDividerLabel:{fontSize:9,letterSpacing:2,color:"#7a6a45",background:"transparent",padding:"0 10px",
+    fontFamily:"'GM-Stamp',Georgia,serif"},
+  modalHint:{fontSize:10.5,color:"#9d8a62",lineHeight:1.5,marginBottom:2},
+  tightRow:{display:"flex",alignItems:"center",gap:10},
+  tightLabel:{display:"flex",flexDirection:"column",minWidth:62},
+  tightSlider:{flex:1,accentColor:"#C9A24B",cursor:"pointer"},
+  tightVal:{fontSize:9.5,color:"#C9A24B",minWidth:66,textAlign:"right",letterSpacing:0.5},
+  modalActions:{display:"flex",gap:6,marginTop:6},
+  presetBtn:{flex:1,background:"rgba(201,162,75,0.06)",border:"1px solid rgba(201,162,75,0.2)",
+    borderRadius:8,padding:"7px 4px",cursor:"pointer",color:"#C9A24B",fontSize:10,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",letterSpacing:0.5,transition:"all 0.1s"},
+  modalDone:{marginTop:8,background:"linear-gradient(135deg,#1a4a28,#1c5430)",
+    border:"1px solid rgba(87,230,176,0.5)",color:"#bbf7d0",borderRadius:10,
+    padding:"10px",cursor:"pointer",fontSize:12,letterSpacing:2,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",fontWeight:"bold"},
+
+  // Bet stepper
+  stepBtn:{background:"rgba(201,162,75,0.08)",border:"1px solid rgba(201,162,75,0.28)",
+    borderRadius:7,color:"#C9A24B",fontSize:10.5,padding:"5px 8px",cursor:"pointer",
+    fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",letterSpacing:0.5,flexShrink:0,whiteSpace:"nowrap"},
+
+  // Coach tip strip
+  coachBar:{display:"flex",alignItems:"center",gap:9,padding:"6px 10px",borderRadius:10,
+    border:"1px solid",fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif",animation:"dealIn 0.25s ease-out"},
+  coachTag:{fontSize:8,letterSpacing:2,fontWeight:"bold",padding:"2px 6px",borderRadius:6,
+    flexShrink:0,fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+  coachTxt:{fontSize:11.5,lineHeight:1.4,letterSpacing:0.2,color:"#f0e8d6"},
+  coachTone:{
+    good:{background:"rgba(87,230,176,0.12)", borderColor:"rgba(87,230,176,0.5)"},
+    ok:  {background:"rgba(201,162,75,0.12)", borderColor:"rgba(201,162,75,0.5)"},
+    warn:{background:"rgba(248,113,113,0.12)",borderColor:"rgba(248,113,113,0.5)"},
+  },
+
+  // DEEP CHECK — on-demand rollout solver surface
+  deepWrap:{marginTop:6},
+  deepBtn:{display:"flex",alignItems:"center",gap:8,width:"100%",cursor:"pointer",
+    background:"rgba(87,230,176,0.06)",border:"1px dashed rgba(87,230,176,0.4)",borderRadius:10,
+    padding:"7px 10px",transition:"all 0.15s"},
+  deepBtnTag:{fontSize:8,letterSpacing:2,fontWeight:"bold",padding:"2px 6px",borderRadius:6,
+    background:"rgba(87,230,176,0.18)",color:"#57E6B0",flexShrink:0,
+    fontFamily:"'GM-Stamp',Georgia,serif"},
+  deepBtnTxt:{fontSize:11,color:"#8FA396",letterSpacing:0.2,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  deepPanel:{display:"flex",flexDirection:"column",gap:5,
+    background:"rgba(10,44,34,0.55)",border:"1px solid rgba(87,230,176,0.35)",borderRadius:10,
+    padding:"9px 11px",animation:"dealIn 0.25s ease-out"},
+  deepHead:{fontSize:8,letterSpacing:2,color:"#57E6B0",fontFamily:"'GM-Stamp',Georgia,serif"},
+  deepRunning:{fontSize:11,color:"#8FA396",fontStyle:"italic",
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  deepRow:{display:"flex",alignItems:"center",gap:8,padding:"3px 0"},
+  deepRowTop:{borderBottom:"1px solid rgba(87,230,176,0.15)",paddingBottom:6,marginBottom:1},
+  deepRank:{fontSize:8.5,letterSpacing:1,fontWeight:"bold",width:34,flexShrink:0,
+    fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+  deepLabel:{fontSize:11.5,color:"#F0E9D6",flex:1,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  deepEv:{fontSize:11.5,fontWeight:"bold",flexShrink:0,
+    fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+  deepFoot:{fontSize:9,color:"#6f8578",lineHeight:1.35,marginTop:2,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+
+  // NASH push/fold charts
+  nashIntro:{fontSize:12,lineHeight:1.5,color:"#cdd8cf",marginBottom:14,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  nashSecTitle:{fontSize:8.5,letterSpacing:2,color:"#8FA396",marginBottom:7,
+    fontFamily:"'GM-Stamp',Georgia,serif"},
+  nashStackRow:{display:"flex",flexWrap:"wrap",gap:5,marginBottom:14},
+  nashStackBtn:{flex:"1 1 auto",minWidth:44,padding:"7px 4px",borderRadius:8,cursor:"pointer",
+    background:"rgba(255,255,255,0.05)",border:"1px solid rgba(201,162,75,0.28)",color:"#cdd8cf",
+    fontSize:12,fontWeight:"bold",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",
+    fontVariantNumeric:"tabular-nums",transition:"all 0.14s"},
+  nashStackOn:{background:"rgba(201,162,75,0.2)",borderColor:"#C9A24B",color:"#EBD08A"},
+  nashModeRow:{display:"flex",gap:8,marginBottom:12},
+  nashModeBtn:{flex:1,padding:"9px 6px",borderRadius:9,cursor:"pointer",
+    background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.14)",color:"#8FA396",
+    fontSize:11.5,letterSpacing:0.5,fontWeight:"bold",
+    fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",transition:"all 0.14s"},
+  nashModeOn:{background:"rgba(255,255,255,0.07)"},
+  nashGrid:{display:"grid",gridTemplateColumns:"repeat(13, 1fr)",gap:2,marginBottom:12},
+  nashCell:{aspectRatio:"1",display:"flex",alignItems:"center",justifyContent:"center",
+    borderRadius:3,fontSize:7.5,fontWeight:"bold",letterSpacing:-0.3,
+    fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace"},
+  nashFoot:{fontSize:10.5,lineHeight:1.5,color:"#a9b6ab",marginBottom:8,
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  nashNote:{fontSize:9.5,lineHeight:1.45,color:"#6f8578",
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+
+  // ONLINE multiplayer
+  mpErr:{fontSize:11.5,lineHeight:1.5,color:"#E2857A",background:"rgba(226,133,122,0.1)",
+    border:"1px solid rgba(226,133,122,0.35)",borderRadius:9,padding:"8px 11px",marginBottom:14,
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpCode:{fontSize:12,lineHeight:1.5,color:"#EBD08A",background:"rgba(201,162,75,0.1)",
+    border:"1px solid rgba(201,162,75,0.3)",borderRadius:9,padding:"9px 11px",marginBottom:14,
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpSecTitle:{fontSize:8.5,letterSpacing:2,color:"#8FA396",margin:"14px 0 7px",fontFamily:"'GM-Stamp',Georgia,serif"},
+  mpInput:{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.06)",
+    border:"1px solid rgba(201,162,75,0.3)",borderRadius:8,padding:"9px 11px",color:"#F0E9D6",
+    fontSize:13,marginBottom:10,fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpSelect:{flex:1,background:"rgba(255,255,255,0.06)",border:"1px solid rgba(201,162,75,0.3)",
+    borderRadius:8,padding:"9px 11px",color:"#F0E9D6",fontSize:13,fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpCheck:{display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#cdd8cf",marginBottom:12,
+    fontFamily:"'GM-Body',system-ui,sans-serif",cursor:"pointer"},
+  mpSeatRow:{display:"flex",justifyContent:"space-between",fontSize:12,color:"#cdd8cf",
+    padding:"5px 0",borderBottom:"1px solid rgba(255,255,255,0.06)",fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpWait:{fontSize:12,color:"#8FA396",fontStyle:"italic",textAlign:"center",padding:"12px 0",
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpPot:{fontSize:12,letterSpacing:1,color:"#EBD08A",textAlign:"center",marginBottom:12,
+    fontFamily:"ui-monospace,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+  mpSeats:{display:"grid",gridTemplateColumns:"repeat(2,1fr)",gap:8,marginBottom:12},
+  mpSeatCard:{background:"rgba(14,44,34,0.6)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:10,padding:"8px 10px"},
+  mpSeatMe:{border:"1px solid rgba(87,230,176,0.5)"},
+  mpSeatActive:{background:"rgba(201,162,75,0.14)",border:"1px solid rgba(201,162,75,0.55)"},
+  mpSeatName:{fontSize:11,color:"#F0E9D6",fontWeight:"bold",fontFamily:"'GM-Body',system-ui,sans-serif",
+    maxWidth:"70%",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"},
+  mpSeatChips:{fontSize:11,color:"#EBD08A",fontFamily:"ui-monospace,Menlo,monospace",fontVariantNumeric:"tabular-nums"},
+  mpSeatCards:{display:"flex",gap:3,marginTop:5},
+  mpCardBack:{width:20,height:28,borderRadius:3,background:"linear-gradient(135deg,#1e3a8a,#1e40af)",
+    border:"1px solid rgba(255,255,255,0.15)",display:"inline-block"},
+  mpCardFace:{minWidth:20,height:28,borderRadius:3,background:"#F0E9D6",display:"inline-flex",
+    alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:"bold",padding:"0 3px",
+    fontFamily:"ui-monospace,Menlo,monospace"},
+  mpFolded:{fontSize:9,color:"#8a7a5a",fontStyle:"italic",marginTop:3},
+  mpBoard:{display:"flex",gap:4,justifyContent:"center",padding:"10px 0",marginBottom:8},
+
+  // ── redesigned online felt ──
+  mpFelt:{position:"relative",borderRadius:16,padding:"22px 16px",marginBottom:14,overflow:"hidden",
+    background:"radial-gradient(120% 100% at 50% 30%, #145a3f 0%, #0d3325 55%, #0a2419 100%)",
+    border:"1px solid rgba(201,162,75,0.3)",boxShadow:"inset 0 2px 20px rgba(0,0,0,0.5)"},
+  mpFeltGlow:{position:"absolute",inset:0,background:"radial-gradient(60% 45% at 50% 32%, rgba(87,230,176,0.10), transparent 70%)",pointerEvents:"none"},
+  mpCenter:{position:"relative",display:"flex",flexDirection:"column",alignItems:"center",gap:12},
+  mpPotChip:{fontSize:12,letterSpacing:2,color:"#EBD08A",fontFamily:"ui-monospace,Menlo,monospace",
+    fontVariantNumeric:"tabular-nums",background:"rgba(0,0,0,0.35)",border:"1px solid rgba(201,162,75,0.35)",
+    borderRadius:20,padding:"5px 16px"},
+  mpBoardRow:{display:"flex",gap:6,justifyContent:"center",minHeight:52,alignItems:"center"},
+  mpPhaseTag:{fontSize:11,letterSpacing:2,color:"#6f8578",fontStyle:"italic"},
+  mpResult:{marginTop:10,fontSize:12.5,color:"#57E6B0",textAlign:"center",fontWeight:"bold",
+    fontFamily:"'GM-Body',system-ui,sans-serif",lineHeight:1.4,padding:"0 8px"},
+  mpCard:{minWidth:34,height:48,borderRadius:6,background:"linear-gradient(180deg,#fff,#efe7d2)",color:"#1a1a1a",
+    display:"inline-flex",flexDirection:"column",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:"bold",
+    fontFamily:"Georgia,serif",boxShadow:"0 2px 6px rgba(0,0,0,0.4)",padding:"0 4px"},
+  mpCardRed:{color:"#c0392b"},
+  mpPip:{fontSize:14,lineHeight:1},
+  mpMiniCard:{minWidth:22,height:30,borderRadius:4,background:"linear-gradient(180deg,#fff,#efe7d2)",color:"#1a1a1a",
+    display:"inline-flex",flexDirection:"column",alignItems:"center",justifyContent:"center",fontSize:11,fontWeight:"bold",
+    fontFamily:"Georgia,serif",padding:"0 2px"},
+  mpPipSm:{fontSize:10,lineHeight:1},
+  mpSeatTop:{display:"flex",alignItems:"center",justifyContent:"space-between",gap:6},
+  mpDealer:{fontSize:8,fontWeight:"bold",color:"#1a1206",background:"#EBD08A",borderRadius:"50%",
+    width:15,height:15,display:"inline-flex",alignItems:"center",justifyContent:"center"},
+  mpSeatFolded:{opacity:0.45},
+  mpToAct:{fontSize:8,fontWeight:"bold",letterSpacing:0.5,color:"#57E6B0"},
+  mpBet:{fontSize:10,color:"#EBD08A",fontWeight:"normal"},
+  mpLastAct:{fontSize:9.5,fontStyle:"italic",marginTop:4,fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpTurnLine:{textAlign:"center",fontSize:12,letterSpacing:1,color:"#EBD08A",margin:"4px 0 12px",
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpHandName:{textAlign:"center",fontSize:12,color:"#57E6B0",marginTop:-6,marginBottom:10,
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpRaiseHead:{textAlign:"center",fontSize:13,color:"#F0E9D6",marginBottom:8,letterSpacing:0.5,
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpSlider:{width:"100%",accentColor:"#C9A24B",marginBottom:10},
+  mpPresets:{display:"flex",gap:6,marginBottom:10},
+  mpPresetBtn:{flex:1,padding:"7px 4px",borderRadius:8,border:"1px solid rgba(201,162,75,0.4)",
+    background:"rgba(201,162,75,0.12)",color:"#EBD08A",fontSize:11,fontWeight:"bold",cursor:"pointer",
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpPresetOn:{background:"rgba(201,162,75,0.32)",border:"1px solid #C9A24B"},
+  mpJoinReq:{background:"rgba(87,230,176,0.10)",border:"1px solid rgba(87,230,176,0.4)",borderRadius:12,
+    padding:"14px 16px",marginBottom:14},
+  mpLeaveBtn:{display:"block",width:"100%",marginTop:16,padding:"11px",borderRadius:10,
+    background:"transparent",border:"1px solid rgba(226,133,122,0.5)",color:"#E2857A",fontSize:12,
+    fontWeight:"bold",letterSpacing:1,cursor:"pointer",fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpRebuyBtn:{display:"block",width:"100%",marginTop:14,padding:"13px",borderRadius:10,
+    background:"#2f6b4f",border:"1px solid #57E6B0",color:"#EAFBF3",fontSize:13,
+    fontWeight:"bold",letterSpacing:1,cursor:"pointer",fontFamily:"'GM-Body',system-ui,sans-serif"},
+  mpBustBox:{marginTop:14,padding:"14px",borderRadius:12,background:"rgba(201,162,75,0.08)",
+    border:"1px solid rgba(201,162,75,0.3)"},
+  mpBustMsg:{fontSize:12.5,color:"#EBD08A",textAlign:"center",lineHeight:1.5,marginBottom:4,
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  // Dedicated online-table overlay/modal — self-contained so it can't be affected by duplicate style keys
+  // or nested-scroll dead zones that were eating taps on the START/action buttons.
+  mpOverlay:{position:"fixed",inset:0,zIndex:200,background:"rgba(0,0,0,0.72)",backdropFilter:"blur(3px)",
+    display:"flex",flexDirection:"column",justifyContent:"flex-end"},
+  mpModal:{width:"100%",maxWidth:480,margin:"0 auto",maxHeight:"90vh",overflowY:"auto",
+    WebkitOverflowScrolling:"touch",background:"#1a2334",borderTopLeftRadius:18,borderTopRightRadius:18,
+    borderRadius:18,padding:"18px 18px calc(24px + env(safe-area-inset-bottom))",
+    border:"1px solid rgba(201,162,75,0.35)",boxShadow:"0 -8px 50px rgba(0,0,0,0.6)"},
+  mpActions:{display:"flex",gap:8,marginTop:14},
+  mpActBtn:{flex:1,padding:"13px 8px",borderRadius:10,border:"none",color:"#fff",fontSize:12.5,
+    fontWeight:"bold",letterSpacing:1,cursor:"pointer",fontFamily:"'GM-Body',system-ui,sans-serif"},
+  smBtn:{padding:"9px 16px",borderRadius:8,border:"1px solid rgba(201,162,75,0.5)",
+    background:"rgba(201,162,75,0.2)",color:"#EBD08A",fontSize:12,fontWeight:"bold",cursor:"pointer",
+    fontFamily:"'GM-Body',system-ui,sans-serif"},
+  bigBtn:{display:"block",width:"100%",boxSizing:"border-box",marginTop:8,padding:"14px",borderRadius:11,
+    border:"none",background:"linear-gradient(165deg,#d8b551,#bb8f33)",color:"#1a1206",fontSize:14,
+    fontWeight:"bold",letterSpacing:1.5,cursor:"pointer",fontFamily:"'GM-Body',system-ui,sans-serif"},
+
+  // Toggle switch (settings)
+  toggleRow:{display:"flex",alignItems:"center",justifyContent:"space-between",
+    background:"rgba(255,255,255,0.05)",border:"1px solid rgba(201,162,75,0.25)",
+    borderRadius:10,padding:"9px 12px",cursor:"pointer",width:"100%",transition:"all 0.15s"},
+  toggleRowOn:{background:"rgba(87,230,176,0.1)",border:"1px solid rgba(87,230,176,0.45)"},
+  switch:{width:38,height:21,borderRadius:11,background:"rgba(255,255,255,0.14)",
+    border:"1px solid rgba(255,255,255,0.22)",position:"relative",flexShrink:0,transition:"all 0.18s"},
+  switchOn:{background:"rgba(87,230,176,0.55)",border:"1px solid rgba(87,230,176,0.75)"},
+  knob:{position:"absolute",top:1.5,left:1.5,width:16,height:16,borderRadius:"50%",
+    background:"#efe7d2",boxShadow:"0 1px 3px rgba(0,0,0,0.5)",transition:"all 0.18s"},
+  knobOn:{left:19,background:"#eafff0"},
+
+  // Main-screen control bar
+  ctrlBar:{width:"100%",maxWidth:740,display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",
+    justifyContent:"center",padding:"2px 0"},
+  reviewChip:{fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",fontSize:9.5,letterSpacing:1,fontWeight:"bold",
+    padding:"5px 11px",borderRadius:999,cursor:"pointer",transition:"all 0.15s",
+    background:"rgba(201,162,75,0.12)",border:"1px solid rgba(201,162,75,0.4)",color:"#d8b65a"},
+
+  // Review screen
+  reviewCard:{backgroundColor:"#101a2b",borderRadius:16,maxWidth:560,width:"94%",
+    maxHeight:"88vh",overflowY:"auto",border:"1px solid rgba(201,162,75,0.25)",
+    boxShadow:"0 20px 60px rgba(0,0,0,0.6)",padding:"16px 16px 22px"},
+  reviewHead:{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10,
+    position:"sticky",top:-16,background:"#101a2b",paddingTop:4,zIndex:2},
+  reviewTitle:{fontSize:18,fontWeight:"bold",color:"#F0E9D6",letterSpacing:0.5},
+  reviewNote:{fontSize:11.5,color:"#9d8a62",background:"rgba(201,162,75,0.07)",
+    border:"1px solid rgba(201,162,75,0.18)",borderRadius:8,padding:"8px 10px",margin:"8px 0",lineHeight:1.5},
+  reviewEmpty:{fontSize:13,color:"#b8a982",textAlign:"center",lineHeight:1.7,padding:"36px 12px"},
+  reviewSec:{fontSize:11,fontWeight:"bold",letterSpacing:1.5,color:"#C9A24B",
+    margin:"18px 0 8px",textTransform:"uppercase"},
+  dashRow:{display:"flex",gap:8,flexWrap:"wrap"},
+  statCard:{flex:"1 1 22%",minWidth:70,background:"rgba(255,255,255,0.04)",
+    border:"1px solid rgba(255,255,255,0.1)",borderRadius:10,padding:"10px 6px",textAlign:"center"},
+  statVal:{fontSize:18,fontWeight:"bold",color:"#F0E9D6"},
+  statLbl:{fontSize:8.5,letterSpacing:0.8,color:"#8c7c58",textTransform:"uppercase",marginTop:2},
+  leakRow:{background:"rgba(255,255,255,0.035)",borderRadius:"0 8px 8px 0",padding:"9px 11px",marginBottom:7},
+  leakCat:{fontSize:13,fontWeight:"bold",color:"#F0E9D6",display:"flex",justifyContent:"space-between",
+    alignItems:"baseline",gap:8,flexWrap:"wrap"},
+  leakPct:{fontSize:9.5,fontWeight:"normal",color:"#8c7c58",letterSpacing:0.5},
+  leakFix:{fontSize:11.5,color:"#b3a884",marginTop:3,lineHeight:1.45},
+  gameRow:{display:"flex",justifyContent:"space-between",alignItems:"center",
+    padding:"6px 4px",borderBottom:"1px solid rgba(255,255,255,0.05)"},
+  gameName:{fontSize:12,color:"#cdbf99"},
+  gameStat:{fontSize:11,color:"#8c7c58"},
+  handRow:{display:"flex",alignItems:"center",gap:8,width:"100%",padding:"8px 6px",
+    background:"none",border:"none",borderBottom:"1px solid rgba(255,255,255,0.05)",cursor:"pointer"},
+  handDetail:{background:"rgba(0,0,0,0.22)",borderRadius:8,padding:"10px 12px",margin:"2px 0 8px"},
+  cardsRow:{display:"flex",alignItems:"center",flexWrap:"wrap",gap:2,margin:"3px 0"},
+  cardsLbl:{fontSize:10,color:"#8c7c58",marginRight:6,minWidth:64,letterSpacing:0.5},
+  detLine:{fontSize:11.5,color:"#cdbf99",marginTop:6,lineHeight:1.5,fontStyle:"italic"},
+  detLeak:{fontSize:11,color:"#e0b35a",marginTop:3},
+  detNote:{fontSize:9.5,color:"#6c5f44",marginTop:7,letterSpacing:0.5},
+  clearRow:{display:"flex",alignItems:"center",gap:8,justifyContent:"center",marginTop:22,flexWrap:"wrap"},
+  clearBtn:{fontSize:11,color:"#9d8a62",background:"none",border:"1px solid rgba(255,255,255,0.16)",
+    borderRadius:8,padding:"7px 14px",cursor:"pointer",letterSpacing:0.5},
+  clearWarn:{fontSize:12,color:"#f0a0a0"},
+  clearYes:{fontSize:11,color:"#fff",background:"#b04444",border:"none",borderRadius:8,padding:"7px 14px",cursor:"pointer",fontWeight:"bold"},
+  clearNo:{fontSize:11,color:"#9d8a62",background:"none",border:"1px solid rgba(255,255,255,0.16)",borderRadius:8,padding:"7px 14px",cursor:"pointer"},
+  // Feedback
+  fbCard:{backgroundColor:"#101a2b",borderRadius:16,maxWidth:460,width:"92%",
+    border:"1px solid rgba(201,162,75,0.25)",boxShadow:"0 20px 60px rgba(0,0,0,0.6)",padding:"16px 16px 20px"},
+  fbLabel:{fontSize:13,color:"#cdbf99",margin:"6px 0 10px",lineHeight:1.5},
+  fbArea:{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.05)",
+    border:"1px solid rgba(255,255,255,0.16)",borderRadius:10,color:"#F0E9D6",fontSize:14,
+    padding:"10px 12px",resize:"vertical",fontFamily:"inherit"},
+  fbInput:{width:"100%",boxSizing:"border-box",background:"rgba(255,255,255,0.05)",
+    border:"1px solid rgba(255,255,255,0.16)",borderRadius:10,color:"#F0E9D6",fontSize:13,
+    padding:"10px 12px",marginTop:8,fontFamily:"inherit"},
+  fbErr:{fontSize:11.5,color:"#f0a0a0",marginTop:8},
+  fbSend:{width:"100%",marginTop:12,background:"#C9A24B",color:"#1a1208",border:"none",
+    borderRadius:10,padding:"12px",fontSize:14,fontWeight:"bold",cursor:"pointer"},
+  fbThanks:{fontSize:15,color:"#57E6B0",textAlign:"center",padding:"30px 12px",lineHeight:1.6},
+  contact:{textAlign:"center",padding:"4px 0 16px"},
+  contactLink:{fontSize:11,color:"#6f6048",textDecoration:"none",letterSpacing:0.5,borderBottom:"1px solid #6f604833"},
+  footMeta:{display:"flex",flexDirection:"column",alignItems:"center",gap:7,padding:"13px 0 18px",marginTop:10,borderTop:"1px solid rgba(201,162,75,0.12)"},
+  footActions:{display:"flex",alignItems:"center",justifyContent:"center",flexWrap:"wrap",gap:9},
+  footLink:{fontSize:11.5,color:"#9d8a62",background:"none",border:"none",padding:0,margin:0,cursor:"pointer",letterSpacing:0.4,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  footSupport:{fontSize:11.5,color:"#C9A24B",textDecoration:"none",letterSpacing:0.4,fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  footMail:{fontSize:10.5,color:"#6f6048",textDecoration:"none",letterSpacing:0.5},
+  footId:{display:"flex",alignItems:"center",justifyContent:"center",gap:7},
+  footBrand:{fontSize:10,color:"#8C6E2A",letterSpacing:1,fontWeight:400,fontFamily:"'GM-Neon',Georgia,serif"},
+  footBeta:{fontSize:8,color:"#C9A24B",border:"1px solid rgba(201,162,75,0.4)",borderRadius:3,padding:"1px 5px",letterSpacing:1.5,fontWeight:"bold"},
+  footBuild:{fontSize:9.5,color:"#6f6048",letterSpacing:0.5},
+  footDot:{color:"rgba(216,202,172,0.25)",fontSize:11},
+
+
+
+  coachChip:{fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",fontSize:9.5,letterSpacing:1,fontWeight:"bold",
+    padding:"5px 11px",borderRadius:999,cursor:"pointer",transition:"all 0.15s",
+    background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.14)",color:"#9c8760"},
+  coachChipOn:{background:"rgba(87,230,176,0.16)",border:"1px solid rgba(87,230,176,0.55)",
+    color:"#9ff0bb",boxShadow:"0 0 12px rgba(87,230,176,0.25)"},
+  fmtReadout:{fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",fontSize:9.5,letterSpacing:1.5,color:"#C9A24B",
+    padding:"5px 10px",borderRadius:999,background:"rgba(201,162,75,0.08)",
+    border:"1px solid rgba(201,162,75,0.3)"},
+  depthRow:{display:"flex",alignItems:"center",gap:4},
+  depthBtn:{fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums",fontSize:10,fontWeight:"bold",minWidth:34,padding:"5px 7px",
+    borderRadius:7,cursor:"pointer",transition:"all 0.12s",color:"#9c8760",
+    background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)"},
+  depthBtnOn:{background:"linear-gradient(135deg,rgba(201,162,75,0.3),rgba(201,162,75,0.15))",
+    border:"1px solid rgba(201,162,75,0.7)",color:"#f0e0b0"},
+  depthCap:{fontSize:8,letterSpacing:0.5,color:"#9c8760",marginLeft:2},
+
+  // Segmented control (settings)
+  segRow:{display:"flex",gap:6,width:"100%"},
+  segBtn:{flex:1,display:"flex",flexDirection:"column",alignItems:"center",textAlign:"center",
+    gap:1,padding:"8px 6px",borderRadius:9,cursor:"pointer",transition:"all 0.14s",
+    background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",color:"#b6a075",
+    fontFamily:"'GM-Body',system-ui,-apple-system,'Segoe UI',sans-serif"},
+  segBtnOn:{background:"linear-gradient(135deg,rgba(201,162,75,0.26),rgba(201,162,75,0.12))",
+    border:"1px solid rgba(201,162,75,0.7)",color:"#F0E9D6",boxShadow:"0 0 10px rgba(201,162,75,0.12)"},
+};

@@ -1,0 +1,13 @@
+{
+  "name": "getmixed-app",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Get Mixed — mixed-game poker trainer. Single-file React app.",
+  "type": "module",
+  "scripts": {
+    "build": "node build-html.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}
