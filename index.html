@@ -7,21 +7,12 @@
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <title>Get Mixed</title>
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-FCYV1NGPS6"></script>
 <script>
-  // Analytics runs on the live domain only, so a staging copy on github.io
-  // stays out of the GA4 property and test sessions never pollute real numbers.
-  // gtag is always defined either way, so no call site can throw.
   window.dataLayer = window.dataLayer || [];
-  function gtag(){ window.dataLayer.push(arguments); }
-  window.gtag = gtag;
-  if (location.hostname === 'getmixed.ca' || location.hostname === 'www.getmixed.ca') {
-    var gaTag = document.createElement('script');
-    gaTag.async = true;
-    gaTag.src = 'https://www.googletagmanager.com/gtag/js?id=G-FCYV1NGPS6';
-    document.head.appendChild(gaTag);
-    gtag('js', new Date());
-    gtag('config', 'G-FCYV1NGPS6');
-  }
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-FCYV1NGPS6');
 </script>
 <style>
   html, body { margin:0; padding:0; background:#0A1F18; color:#F0E9D6;
@@ -132,6 +123,7 @@ const SEAT_CAP = {
     dramahaH: 6, dramaha27: 6, dramadugi: 6,
 };
 const seatCap = gid => SEAT_CAP[gid] || 6;
+const TABLE_SEATS = 6;
 const rotationCap = gids => Math.min(...gids.map(seatCap));
 const TABLE_SHAPE = gid => IS_STUD(gid) ? "stud" :
     IS_DRAMAHA(gid) ? "drawBoard" :
@@ -142,15 +134,22 @@ const TABLE_SHAPE = gid => IS_STUD(gid) ? "stud" :
 function tableRows(n, land) {
     const opp = Math.max(0, n - 1);
     if (land) {
-        const flank = opp >= 8 ? 4 : opp >= 2 ? 2 : 0;
-        const back = opp - flank;
+        const flank = opp >= 6 ? 2 : 0;
+        const sides = opp >= 4 ? 2 : 0;
+        const back = opp - flank - sides;
         const rows = [];
+        let k = 1;
         if (back > 0)
-            rows.push(Array.from({ length: back }, (_, i) => i + 1));
-        rows.push("C");
+            rows.push(Array.from({ length: back }, () => k++));
+        if (sides === 2) {
+            const L = k++, R = k++;
+            rows.push([L, "C", R]);
+        }
+        else
+            rows.push("C");
         const l = [], r = [];
         for (let i = 0; i < flank; i++)
-            (i < flank / 2 ? l : r).push(back + 1 + i);
+            (i < flank / 2 ? l : r).push(k++);
         rows.push([...l, "H", ...r]);
         return rows;
     }
@@ -166,6 +165,19 @@ function tableRows(n, land) {
         rows.splice(rows.length - 1, 0, "C");
     rows.push(["H"]);
     return rows;
+}
+function seatNudge(row, ri, rowCount) {
+    const n = row.length;
+    if (n < 2 || row.indexOf("C") >= 0)
+        return () => undefined;
+    const dir = ri === 0 ? 1 : (ri === rowCount - 1 ? -1 : 0);
+    if (!dir)
+        return () => undefined;
+    const c = (n - 1) / 2;
+    return (i) => {
+        const t = (i - c) / c;
+        return `translate(calc(var(--u) * ${(-t * 2.9).toFixed(2)}), calc(var(--u) * ${(dir * 0.7 * t * t).toFixed(2)}))`;
+    };
 }
 const BET_MODE = gid => (gid === "single" || gid === "nlhe") ? "nl"
     : (gid === "plo" || gid === "bigo" || IS_PINEAPPLE(gid) || gid === "dbbomb" || gid === "plo8" || gid === "pl27td" || gid === "plbad" || gid === "pl5d") ? "pl" : "fl";
@@ -2598,7 +2610,7 @@ const mkState = (gid, prev = null) => {
     const bbDepth = prev?.bbDepth ?? 100;
     const stk = format === "tourney" ? TOURNEY_STAKES : CASH_STAKES[stakeIdx];
     const startChips = depthUnit(gid, stk) * (format === "tourney" ? bbDepth * depthMult(gid) : CASH_DEPTH);
-    const nSeats = Math.min(seatCap(gid), gid === "dbbomb" ? 7 : (format === "tourney" && IS_FLOP(gid)) ? 8 : 4);
+    const nSeats = Math.min(seatCap(gid), TABLE_SEATS);
     return {
         gid, phase: "idle", deck: [], players: mkPs(prev?.players, startChips, nSeats), board: [], board2: [],
         pot: 0, currentBet: 0, betCount: 0, queue: [], streetN: 0, drawN: 0, seq: 0,
@@ -4377,7 +4389,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05k";
+const APP_VERSION = "2026.07.05l";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -5352,7 +5364,7 @@ function useOnlineTable() {
     const declineJoin = (token) => { sendMsg({ type: "join-decline", token }); setJoinReq(null); };
     return { status, server, code, err, joinState, joinReq, srvVer, connect, disconnect, leaveTable, createTable, joinTable, startTable, sendIntent, rebuy, approveJoin, declineJoin, clearJoinState: () => setJoinState(null), sockState: (wsRef.current ? ["connecting", "open", "closing", "closed"][wsRef.current.readyState] : "none") };
 }
-function TSeat({ p, hero, acting, dealer, shape, reveal, drawsShown }) {
+function TSeat({ p, hero, acting, dealer, shape, reveal, drawsShown, land }) {
     if (!p)
         return null;
     const hand = p.hand || [];
@@ -5376,14 +5388,17 @@ function TSeat({ p, hero, acting, dealer, shape, reveal, drawsShown }) {
             borderRadius: "calc(var(--u)*1)", padding: "calc(var(--u)*0.55) calc(var(--u)*0.8)",
             opacity: p.folded ? 0.34 : 1, transition: "opacity .2s, box-shadow .2s, border-color .2s",
         } },
-        React.createElement("div", { style: { display: "flex", alignItems: "baseline", gap: "calc(var(--u)*0.6)", whiteSpace: "nowrap" } },
+        React.createElement("div", { style: { display: "flex", whiteSpace: "nowrap", position: "relative",
+                ...(land ? { alignItems: "baseline", gap: "calc(var(--u)*0.6)" }
+                    : { flexDirection: "column", alignItems: "center", gap: 0 }) } },
             React.createElement("span", { style: { fontSize: "calc(var(--u)*1.7)", fontWeight: "bold", color: "#F0E9D6",
                     fontFamily: "'GM-Body',system-ui,sans-serif" } }, hero ? "You" : p.name),
             React.createElement("span", { style: { fontSize: "calc(var(--u)*1.55)", color: "#EBD08A", fontVariantNumeric: "tabular-nums",
                     fontFamily: "'GM-Body',system-ui,sans-serif" } },
                 "$",
                 MNY(p.chips || 0)),
-            dealer && shape !== "stud" && (React.createElement("span", { style: { width: "calc(var(--u)*1.8)", height: "calc(var(--u)*1.8)", borderRadius: "50%",
+            dealer && shape !== "stud" && (React.createElement("span", { style: { ...(land ? {} : { position: "absolute", top: "calc(var(--u)*-0.5)", right: "calc(var(--u)*-1.4)" }),
+                    width: "calc(var(--u)*1.8)", height: "calc(var(--u)*1.8)", borderRadius: "50%",
                     background: "#C9A24B", color: "#08160f", fontSize: "calc(var(--u)*1.15)", fontWeight: "bold",
                     display: "inline-flex", alignItems: "center", justifyContent: "center", alignSelf: "center" } }, "D"))),
         showOwn && (React.createElement("div", { style: { display: "flex", marginTop: "calc(var(--u)*0.4)" } }, hand.map((c, ci) => (React.createElement(BoardCard, { key: ci, card: c, idx: ci, styleOverride: {
@@ -5467,7 +5482,7 @@ function LandscapeTable({ st, la, onAction, coachAdvice, turnText, onClose }) {
     const seatFor = k => {
         const i = k === "H" ? 0 : k;
         const p = st.players[i];
-        return React.createElement(TSeat, { key: k, p: p, hero: i === 0, acting: acting === i, dealer: st.dealerIdx === i, shape: shape, reveal: st.reveal, drawsShown: draws && (st.drawN || 0) > 0 });
+        return React.createElement(TSeat, { key: k, p: p, hero: i === 0, acting: acting === i, dealer: st.dealerIdx === i, shape: shape, reveal: st.reveal, drawsShown: draws && (st.drawN || 0) > 0, land: land });
     };
     const centre = (React.createElement("div", { key: "C", style: { display: "flex", flexDirection: "column", alignItems: "center",
             gap: "calc(var(--u)*0.7)" } },
@@ -5522,9 +5537,16 @@ function LandscapeTable({ st, la, onAction, coachAdvice, turnText, onClose }) {
                         background: "radial-gradient(56% 50% at 50% 46%, rgba(87,230,176,0.05), transparent 72%)" } }),
                 React.createElement("div", { ref: fieldRef, style: { position: "absolute", left: "calc(var(--u)*0.9)",
                         right: "calc(var(--u)*0.9)", top: "calc(var(--u)*0.9)", bottom: "calc(var(--u)*3.1)",
-                        display: "flex", flexDirection: "column", justifyContent: "space-between", zIndex: 3 } }, rows.map((r, ri) => r === "C" ? centre : (React.createElement("div", { key: ri, className: "gm-row", style: { display: "flex", alignItems: "center",
-                        width: "100%", gap: "calc(var(--u)*0.7)",
-                        justifyContent: r.length >= 2 ? "space-between" : "center" } }, r.map(k => seatFor(k)))))),
+                        display: "flex", flexDirection: "column", justifyContent: "space-between", zIndex: 3 } }, rows.map((r, ri) => {
+                    if (r === "C")
+                        return centre;
+                    const nudge = seatNudge(r, ri, rows.length);
+                    return (React.createElement("div", { key: ri, className: "gm-row", style: { display: "flex", alignItems: "center",
+                            width: "100%", gap: "calc(var(--u)*0.7)",
+                            justifyContent: r.length >= 2 ? "space-between" : "center" } }, r.map((k, ki) => k === "C"
+                        ? React.createElement("div", { key: "C", style: { flex: "1 1 auto", display: "flex", justifyContent: "center" } }, centre)
+                        : React.createElement("div", { key: k, style: { transform: nudge(ki), display: "flex" } }, seatFor(k)))));
+                })),
                 React.createElement("div", { style: { position: "absolute", left: "calc(var(--u)*0.9)", right: "calc(var(--u)*0.9)",
                         bottom: "calc(var(--u)*0.7)", zIndex: 4, textAlign: "center", pointerEvents: "none",
                         fontSize: "calc(var(--u)*1.45)", color: "#EBD08A", whiteSpace: "nowrap", overflow: "hidden",
@@ -7850,5 +7872,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
 
   </script>
 
+  <script defer src="https://static.cloudflareinsights.com/beacon.min.js"
+          data-cf-beacon='{"token": "58ce68fea4504dde8e8e96ca1c0dd912"}'></script>
 </body>
 </html>

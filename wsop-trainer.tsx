@@ -117,6 +117,7 @@ const SEAT_CAP = {
   dramahaH:6, dramaha27:6, dramadugi:6,
 };
 const seatCap = gid => SEAT_CAP[gid] || 6;
+const TABLE_SEATS = 6;   // six-handed across the board; every game's cap allows it
 // A rotation can only seat as many as its most restrictive game. This is why
 // HORSE is 8-handed and any mix containing a draw game is 6-handed.
 const rotationCap = gids => Math.min(...gids.map(seatCap));
@@ -135,13 +136,18 @@ const TABLE_SHAPE = gid =>
 function tableRows(n, land) {
   const opp = Math.max(0, n - 1);
   if (land) {
-    const flank = opp >= 8 ? 4 : opp >= 2 ? 2 : 0;   // must be even, or the hero isn't centred
-    const back  = opp - flank;
+    // A seat each side of the pot is what makes it read as a table rather than
+    // two straight lines. Front row stays odd so the hero sits dead centre.
+    const flank = opp >= 6 ? 2 : 0;   // seats beside the hero only once the back row is full
+    const sides = opp >= 4 ? 2 : 0;   // a seat each side of the pot
+    const back  = opp - flank - sides;
     const rows  = [];
-    if (back > 0) rows.push(Array.from({ length: back }, (_, i) => i + 1));
-    rows.push("C");
+    let k = 1;
+    if (back > 0) rows.push(Array.from({ length: back }, () => k++));
+    if (sides === 2) { const L = k++, R = k++; rows.push([L, "C", R]); }
+    else rows.push("C");
     const l = [], r = [];
-    for (let i = 0; i < flank; i++) (i < flank / 2 ? l : r).push(back + 1 + i);
+    for (let i = 0; i < flank; i++) (i < flank / 2 ? l : r).push(k++);
     rows.push([...l, "H", ...r]);
     return rows;
   }
@@ -153,6 +159,20 @@ function tableRows(n, land) {
   else rows.splice(rows.length - 1, 0, "C");
   rows.push(["H"]);
   return rows;
+}
+
+// The back and front rows taper inward and drop slightly toward the middle, so
+// the side seats are the widest point and the rows read as a curve.
+function seatNudge(row, ri, rowCount) {
+  const n = row.length;
+  if (n < 2 || row.indexOf("C") >= 0) return () => undefined;
+  const dir = ri === 0 ? 1 : (ri === rowCount - 1 ? -1 : 0);
+  if (!dir) return () => undefined;
+  const c = (n - 1) / 2;
+  return (i) => {
+    const t = (i - c) / c;
+    return `translate(calc(var(--u) * ${(-t * 2.9).toFixed(2)}), calc(var(--u) * ${(dir * 0.7 * t * t).toFixed(2)}))`;
+  };
 }
 
 // Betting structure per game: "fl" fixed-limit, "nl" no-limit, "pl" pot-limit.
@@ -2373,8 +2393,7 @@ const mkState = (gid, prev = null) => {
   const startChips = depthUnit(gid, stk) * (format === "tourney" ? bbDepth * depthMult(gid) : CASH_DEPTH);
   // Double Board Bomb Pot is a multiway format — always 7-handed (5 hole cards + two boards fits a 52-card
   // deck only up to 7; 8 would exhaust the deck on the river). Other games: 8-max is tournament-only, cash 4-max.
-  const nSeats = Math.min(seatCap(gid),
-    gid === "dbbomb" ? 7 : (format === "tourney" && IS_FLOP(gid)) ? 8 : 4);   // never exceed what the deck can deal
+  const nSeats = Math.min(seatCap(gid), TABLE_SEATS);   // never exceed what the deck can deal
   return {
   gid, phase:"idle", deck:[], players:mkPs(prev?.players, startChips, nSeats), board:[], board2:[],
   pot:0, currentBet:0, betCount:0, queue:[], streetN:0, drawN:0, seq:0,
@@ -4135,7 +4154,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05k";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05l";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -5124,7 +5143,7 @@ function useOnlineTable() {
 // scale that unit until both fit — which is what makes landscape use the room
 // it actually has instead of a guess.
 
-function TSeat({ p, hero, acting, dealer, shape, reveal, drawsShown }) {
+function TSeat({ p, hero, acting, dealer, shape, reveal, drawsShown, land }) {
   if (!p) return null;
   const hand = p.hand || [];
   const up   = hand.filter(c => !c.down);
@@ -5148,13 +5167,16 @@ function TSeat({ p, hero, acting, dealer, shape, reveal, drawsShown }) {
       borderRadius:"calc(var(--u)*1)", padding:"calc(var(--u)*0.55) calc(var(--u)*0.8)",
       opacity: p.folded ? 0.34 : 1, transition:"opacity .2s, box-shadow .2s, border-color .2s",
     }}>
-      <div style={{display:"flex",alignItems:"baseline",gap:"calc(var(--u)*0.6)",whiteSpace:"nowrap"}}>
+      <div style={{display:"flex",whiteSpace:"nowrap",position:"relative",
+        ...(land ? {alignItems:"baseline",gap:"calc(var(--u)*0.6)"}
+                 : {flexDirection:"column",alignItems:"center",gap:0})}}>
         <span style={{fontSize:"calc(var(--u)*1.7)",fontWeight:"bold",color:"#F0E9D6",
           fontFamily:"'GM-Body',system-ui,sans-serif"}}>{hero ? "You" : p.name}</span>
         <span style={{fontSize:"calc(var(--u)*1.55)",color:"#EBD08A",fontVariantNumeric:"tabular-nums",
           fontFamily:"'GM-Body',system-ui,sans-serif"}}>${MNY(p.chips||0)}</span>
         {dealer && shape !== "stud" && (
-          <span style={{width:"calc(var(--u)*1.8)",height:"calc(var(--u)*1.8)",borderRadius:"50%",
+          <span style={{...(land?{}:{position:"absolute",top:"calc(var(--u)*-0.5)",right:"calc(var(--u)*-1.4)"}),
+            width:"calc(var(--u)*1.8)",height:"calc(var(--u)*1.8)",borderRadius:"50%",
             background:"#C9A24B",color:"#08160f",fontSize:"calc(var(--u)*1.15)",fontWeight:"bold",
             display:"inline-flex",alignItems:"center",justifyContent:"center",alignSelf:"center"}}>D</span>
         )}
@@ -5271,7 +5293,7 @@ function LandscapeTable({ st, la, onAction, coachAdvice, turnText, onClose }) {
     const i = k === "H" ? 0 : k;
     const p = st.players[i];
     return <TSeat key={k} p={p} hero={i===0} acting={acting===i} dealer={st.dealerIdx===i}
-      shape={shape} reveal={st.reveal} drawsShown={draws && (st.drawN||0) > 0}/>;
+      shape={shape} reveal={st.reveal} drawsShown={draws && (st.drawN||0) > 0} land={land}/>;
   };
 
   const centre = (
@@ -5344,13 +5366,18 @@ function LandscapeTable({ st, la, onAction, coachAdvice, turnText, onClose }) {
           <div ref={fieldRef} style={{position:"absolute",left:"calc(var(--u)*0.9)",
             right:"calc(var(--u)*0.9)",top:"calc(var(--u)*0.9)",bottom:"calc(var(--u)*3.1)",
             display:"flex",flexDirection:"column",justifyContent:"space-between",zIndex:3}}>
-            {rows.map((r,ri)=> r === "C" ? centre : (
+            {rows.map((r,ri)=> {
+              if (r === "C") return centre;
+              const nudge = seatNudge(r, ri, rows.length);
+              return (
               <div key={ri} className="gm-row" style={{display:"flex",alignItems:"center",
                 width:"100%",gap:"calc(var(--u)*0.7)",
                 justifyContent: r.length >= 2 ? "space-between" : "center"}}>
-                {r.map(k => seatFor(k))}
-              </div>
-            ))}
+                {r.map((k,ki)=> k === "C"
+                  ? <div key="C" style={{flex:"1 1 auto",display:"flex",justifyContent:"center"}}>{centre}</div>
+                  : <div key={k} style={{transform:nudge(ki),display:"flex"}}>{seatFor(k)}</div>)}
+              </div>);
+            })}
           </div>
 
           <div style={{position:"absolute",left:"calc(var(--u)*0.9)",right:"calc(var(--u)*0.9)",
