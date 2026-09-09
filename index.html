@@ -4389,7 +4389,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05l";
+const APP_VERSION = "2026.07.05m";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -5048,7 +5048,7 @@ function dealCards(s) {
     const stk = STK(s);
     if (IS_STUD(s.gid)) {
         let cursor = 0;
-        let players = mkPs(s.players, 0, s.players.length).map(p => {
+        let players = mkPs(s.players, 0, Math.min(seatCap(s.gid), TABLE_SEATS)).map(p => {
             if (p.chips < stk.studAnte + 1)
                 return { ...p, sittingOut: true, folded: true, hand: [], lastAct: { text: "Sitting Out", color: "#2C4438" } };
             const hole = s.gid === "superstud"
@@ -5087,7 +5087,7 @@ function dealCards(s) {
         const hs = HOLE_SIZE(s.gid);
         const ante = stk.bblind * BOMB_ANTE_BB;
         let cursor = 0;
-        let players = mkPs(s.players, 0, s.players.length).map(p => {
+        let players = mkPs(s.players, 0, Math.min(seatCap(s.gid), TABLE_SEATS)).map(p => {
             if (p.chips < ante)
                 return { ...p, sittingOut: true, folded: true, hand: [], lastAct: { text: "Sitting Out", color: "#2C4438" } };
             const hand = deck.slice(cursor, cursor + hs);
@@ -5112,7 +5112,7 @@ function dealCards(s) {
     if (IS_FLOP(s.gid) || IS_DRAMAHA(s.gid)) {
         const hs = HOLE_SIZE(s.gid);
         let cursor = 0;
-        let players = mkPs(s.players, 0, s.players.length).map(p => {
+        let players = mkPs(s.players, 0, Math.min(seatCap(s.gid), TABLE_SEATS)).map(p => {
             if (p.chips <= 0)
                 return { ...p, sittingOut: true, folded: true, hand: [], lastAct: { text: "Sitting Out", color: "#2C4438" } };
             const hand = deck.slice(cursor, cursor + hs);
@@ -5146,7 +5146,7 @@ function dealCards(s) {
     }
     const hs = HAND_SIZE(s.gid);
     let cursor = 0;
-    let players = mkPs(s.players, 0, s.players.length).map(p => {
+    let players = mkPs(s.players, 0, Math.min(seatCap(s.gid), TABLE_SEATS)).map(p => {
         if (p.chips <= 0)
             return { ...p, sittingOut: true, folded: true, hand: [], lastAct: { text: "Sitting Out", color: "#2C4438" } };
         const hand = deck.slice(cursor, cursor + hs);

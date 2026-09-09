@@ -4154,7 +4154,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05l";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05m";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -4868,7 +4868,7 @@ function dealCards(s) {
     // ── STUD GAMES: antes, deal 2 down + 1 up, bring-in posts ──
     if (IS_STUD(s.gid)) {
       let cursor = 0;
-      let players = mkPs(s.players, 0, s.players.length).map(p => {
+      let players = mkPs(s.players, 0, Math.min(seatCap(s.gid), TABLE_SEATS)).map(p => {
         if (p.chips < stk.studAnte + 1)
           return { ...p, sittingOut:true, folded:true, hand:[], lastAct:{ text:"Sitting Out", color:"#2C4438" } };
         const hole = s.gid === "superstud"
@@ -4909,7 +4909,7 @@ function dealCards(s) {
       const hs = HOLE_SIZE(s.gid);          // Omaha: 4 hole cards
       const ante = stk.bblind * BOMB_ANTE_BB;
       let cursor = 0;
-      let players = mkPs(s.players, 0, s.players.length).map(p => {
+      let players = mkPs(s.players, 0, Math.min(seatCap(s.gid), TABLE_SEATS)).map(p => {
         if (p.chips < ante)
           return { ...p, sittingOut:true, folded:true, hand:[], lastAct:{ text:"Sitting Out", color:"#2C4438" } };
         const hand = deck.slice(cursor, cursor + hs); cursor += hs;
@@ -4933,7 +4933,7 @@ function dealCards(s) {
     if (IS_FLOP(s.gid) || IS_DRAMAHA(s.gid)) {
       const hs = HOLE_SIZE(s.gid);
       let cursor = 0;
-      let players = mkPs(s.players, 0, s.players.length).map(p => {
+      let players = mkPs(s.players, 0, Math.min(seatCap(s.gid), TABLE_SEATS)).map(p => {
         if (p.chips <= 0)
           return { ...p, sittingOut:true, folded:true, hand:[], lastAct:{ text:"Sitting Out", color:"#2C4438" } };
         const hand = deck.slice(cursor, cursor + hs);
@@ -4967,7 +4967,7 @@ function dealCards(s) {
     // ── DRAW GAMES: blinds + full hands (forced bet pre-draw, like real limit draw) ──
     const hs = HAND_SIZE(s.gid);
     let cursor = 0;
-    let players = mkPs(s.players, 0, s.players.length).map(p => {
+    let players = mkPs(s.players, 0, Math.min(seatCap(s.gid), TABLE_SEATS)).map(p => {
       if (p.chips <= 0)  // only busted players sit out; short stacks play all-in for less than the blind
         return { ...p, sittingOut:true, folded:true, hand:[], lastAct:{ text:"Sitting Out", color:"#2C4438" } };
       const hand = deck.slice(cursor, cursor + hs);
