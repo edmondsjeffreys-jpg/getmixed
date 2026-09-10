@@ -4391,7 +4391,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05n";
+const APP_VERSION = "2026.07.05o";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -6776,7 +6776,7 @@ function App() {
                     React.createElement("div", { style: S.gamePlaque },
                         curGame?.tag && React.createElement("span", { style: S.plaqueTag }, curGame.tag),
                         React.createElement("span", { style: S.plaqueName }, curGame?.label || "")),
-                    mobile ? (st.players.length > 4 ? (React.createElement("div", { style: S.ovalWrap },
+                    mobile ? (st.players.length > 4 ? (React.createElement("div", { style: { ...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 215)) } },
                         st.players.filter(p => p.id !== 0).map((p, i) => (React.createElement("div", { key: p.id, style: { ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1) } },
                             React.createElement(MobileSeat, { p: p, reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === p.id, thinking: cpuTurn && st.queue[0] === p.id, wid: wid, won: (st.winnerIds || []).includes(p.id), tilt: st.cpuTilt?.[p.id] || 0, profile: PROF[p.id] })))),
                         IS_DOUBLE(st.gid) ? (React.createElement(React.Fragment, null,
