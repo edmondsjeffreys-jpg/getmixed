@@ -4158,7 +4158,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05o";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05p";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -5808,6 +5808,7 @@ export default function App() {
   const screenW       = useWidth();
   const screenH       = typeof window !== 'undefined' ? window.innerHeight : 900;
   const mobile        = Math.min(screenW, screenH) < 560;   // a phone is a phone in either orientation
+  const landPhone     = mobile && screenW > screenH;   // phone held sideways: everything must fit one screen
   const curGame       = GAMES.find(g => g.id === st.gid);
 
   // ── Hand-history logging (silent; works even with Coach off) ──
@@ -7059,7 +7060,7 @@ useEffect(() => {
       </div>
 
       {/* FOOTER */}
-      <div style={S.foot}>
+      {!landPhone && <div style={S.foot}>
         {st.gid==="lhe" ? (
           <><b style={{color:"#C9A24B44"}}>LIMIT HOLD'EM</b>
           {" · 2 hole + 5 board · best five wins · "}{`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
@@ -7132,10 +7133,10 @@ useEffect(() => {
           {" · Aces high · Straights & flushes count · Nuts: 7-5-4-3-2 · "}
           {`Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`}</>
         )}
-      </div>
+      </div>}
 
       {/* FOOTER META — actions + identity, kept quiet and disciplined */}
-      <div style={S.footMeta}>
+      {!landPhone && <div style={S.footMeta}>
         <div style={S.footActions}>
           <button onClick={()=>setShowBug(true)} style={S.footLink}>Report a bug</button>
           <span style={S.footDot}>·</span>
@@ -7152,7 +7153,7 @@ useEffect(() => {
           <span style={S.footDot}>·</span>
           <span style={S.footBuild}>build {APP_VERSION}</span>
         </div>
-      </div>
+      </div>}
 
     </div>
   );
@@ -7328,6 +7329,12 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
   return (
     <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:3, position:"relative",
       opacity:p.folded||p.sittingOut?0.3:1,
+      // A quiet frame around each seat so a name, a stack and a hand read as
+      // belonging together instead of floating on the felt.
+      padding:"5px 7px 6px", borderRadius:12,
+      background:"linear-gradient(180deg, rgba(8,26,18,0.44), rgba(4,16,11,0.56))",
+      border:`1px solid ${win?"rgba(87,230,176,0.55)":thinking?"rgba(201,162,75,0.5)":"rgba(201,162,75,0.22)"}`,
+      boxShadow:win?"0 0 10px rgba(87,230,176,0.28)":"0 1px 6px rgba(0,0,0,0.35)",
       filter:win?"drop-shadow(0 0 7px rgba(87,230,176,0.4))":thinking?"drop-shadow(0 0 5px rgba(201,162,75,0.28))":"none" }}>
       {speaks && <div style={S.bubbleMobile}>Not like that</div>}
       {/* Name + chips row */}

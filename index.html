@@ -4391,7 +4391,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05o";
+const APP_VERSION = "2026.07.05p";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -5896,6 +5896,7 @@ function App() {
     const screenW = useWidth();
     const screenH = typeof window !== 'undefined' ? window.innerHeight : 900;
     const mobile = Math.min(screenW, screenH) < 560;
+    const landPhone = mobile && screenW > screenH;
     const curGame = GAMES.find(g => g.id === st.gid);
     const histRef = useRef({ dealKey: -1, decisions: [], startChips: null, startHole: null });
     const scenLogRef = useRef([]);
@@ -6955,7 +6956,7 @@ function App() {
                         return { ...ns, stats: { hands: 0, wins: 0 }, cpuTilt: { 1: 0, 2: 0, 3: 0 },
                             players: ns.players.map(p => ({ ...p, chips })) };
                     }) }, "NEW SESSION")))),
-        React.createElement("div", { style: S.foot }, st.gid === "lhe" ? (React.createElement(React.Fragment, null,
+        !landPhone && React.createElement("div", { style: S.foot }, st.gid === "lhe" ? (React.createElement(React.Fragment, null,
             React.createElement("b", { style: { color: "#C9A24B44" } }, "LIMIT HOLD'EM"),
             " · 2 hole + 5 board · best five wins · ",
             `Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`)) : st.gid === "omaha8" ? (React.createElement(React.Fragment, null,
@@ -7023,7 +7024,7 @@ function App() {
             React.createElement("b", { style: { color: "#C9A24B44" } }, "2-7 TRIPLE DRAW"),
             " · Aces high · Straights & flushes count · Nuts: 7-5-4-3-2 · ",
             `Fixed Limit $${MNY(stk.sbet)}/$${MNY(stk.bbet)}`))),
-        React.createElement("div", { style: S.footMeta },
+        !landPhone && React.createElement("div", { style: S.footMeta },
             React.createElement("div", { style: S.footActions },
                 React.createElement("button", { onClick: () => setShowBug(true), style: S.footLink }, "Report a bug"),
                 React.createElement("span", { style: S.footDot }, "\u00B7"),
@@ -7174,6 +7175,10 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
     const backCount = p.hand.length > 0 ? p.hand.length : hs;
     return (React.createElement("div", { style: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, position: "relative",
             opacity: p.folded || p.sittingOut ? 0.3 : 1,
+            padding: "5px 7px 6px", borderRadius: 12,
+            background: "linear-gradient(180deg, rgba(8,26,18,0.44), rgba(4,16,11,0.56))",
+            border: `1px solid ${win ? "rgba(87,230,176,0.55)" : thinking ? "rgba(201,162,75,0.5)" : "rgba(201,162,75,0.22)"}`,
+            boxShadow: win ? "0 0 10px rgba(87,230,176,0.28)" : "0 1px 6px rgba(0,0,0,0.35)",
             filter: win ? "drop-shadow(0 0 7px rgba(87,230,176,0.4))" : thinking ? "drop-shadow(0 0 5px rgba(201,162,75,0.28))" : "none" } },
         speaks && React.createElement("div", { style: S.bubbleMobile }, "Not like that"),
         React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 4, justifyContent: "center", flexWrap: "wrap" } },
