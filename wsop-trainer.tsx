@@ -400,7 +400,13 @@ const OVAL_POS = [
 // Which slots to use for a given number of opponents. Taking the first N left
 // everyone bunched down the left-hand side; these are mirrored about the centre.
 const OVAL_PICK = { 1:[3], 2:[1,5], 3:[1,3,5], 4:[0,1,5,6], 5:[0,1,3,5,6], 6:[0,1,2,4,5,6], 7:[0,1,2,3,4,5,6] };
-const ovalSlot = (i, n) => OVAL_POS[(OVAL_PICK[n] || OVAL_PICK[7])[i] ?? 6];
+const ovalSlot = (i, n, land) => {
+  if (land) {
+    // one evenly-spaced row across the top: uses the width, needs no height
+    return { left: `${Math.round(((i + 1) / (n + 1)) * 1000) / 10}%`, top: "30%" };
+  }
+  return OVAL_POS[(OVAL_PICK[n] || OVAL_PICK[7])[i] ?? 6];
+};
 
 // ─── DECK ────────────────────────────────────────
 function mkDeck() {
@@ -4158,7 +4164,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05p";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05q";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -6708,7 +6714,7 @@ useEffect(() => {
                 /* Mobile 8-max: opponents around the oval, pot + board in the centre */
                 <div style={{...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 215))}}>
                   {st.players.filter(p => p.id !== 0).map((p, i) => (
-                    <div key={p.id} style={{ ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1) }}>
+                    <div key={p.id} style={{ ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone) }}>
                       <MobileSeat p={p} reveal={st.reveal} gid={st.gid} board={st.board}
                         isDealer={st.dealerIdx===p.id}
                         thinking={cpuTurn && st.queue[0]===p.id}
