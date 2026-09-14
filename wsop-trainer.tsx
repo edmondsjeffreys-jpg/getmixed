@@ -400,17 +400,18 @@ const OVAL_POS = [
 // Which slots to use for a given number of opponents. Taking the first N left
 // everyone bunched down the left-hand side; these are mirrored about the centre.
 const OVAL_PICK = { 1:[3], 2:[1,5], 3:[1,3,5], 4:[0,1,5,6], 5:[0,1,3,5,6], 6:[0,1,2,4,5,6], 7:[0,1,2,3,4,5,6] };
+// Landscape seat ring: one down each side low, one each side high, one at the
+// top, hero at the bottom — the usual 6-max shape.
+const LAND_POS = [
+  { left:"14%", top:"68%" }, { left:"14%", top:"21%" }, { left:"50%", top:"21%" },
+  { left:"86%", top:"21%" }, { left:"86%", top:"68%" },
+];
+const LAND_PICK = { 1:[2], 2:[1,3], 3:[1,2,3], 4:[0,1,3,4], 5:[0,1,2,3,4] };
 const ovalSlot = (i, n, land) => {
-  if (land) {
-    const a = (n === 1) ? 90 : 165 - (150 * i) / (n - 1);   // 165deg round to 15deg
-    const r = a * Math.PI / 180;
-    return {
-      left: `${Math.round((50 + 43 * Math.cos(r)) * 10) / 10}%`,
-      top:  `${Math.round((33 - 13 * Math.sin(r)) * 10) / 10}%`,
-    };
-  }
+  if (land) return LAND_POS[(LAND_PICK[n] || LAND_PICK[5])[i] ?? 2];
   return OVAL_POS[(OVAL_PICK[n] || OVAL_PICK[7])[i] ?? 6];
 };
+
 
 // ─── DECK ────────────────────────────────────────
 function mkDeck() {
@@ -4168,7 +4169,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05s";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05t";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -6756,7 +6757,7 @@ useEffect(() => {
                       </div>
                     </>
                   ) : (
-                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"60%"} : {})}}><CentreInfo st={st} streetLbl={streetLbl}/></div>
+                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"54%"} : {})}}><CentreInfo st={st} streetLbl={streetLbl}/></div>
                   )}
                 </div>
               ) : (
