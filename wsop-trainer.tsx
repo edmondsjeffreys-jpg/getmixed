@@ -395,7 +395,7 @@ function freshName(taken, seed = 0) {
 // 8-max mobile: the 7 opponent seats placed around the top oval (hero sits below). translate(-50%,-50%).
 const OVAL_POS = [
   { left:"13%", top:"68%" }, { left:"9%",  top:"35%" }, { left:"27%", top:"11%" },
-  { left:"50%", top:"8%" }, { left:"73%", top:"11%" }, { left:"91%", top:"35%" }, { left:"87%", top:"68%" },
+  { left:"50%", top:"16%" }, { left:"73%", top:"11%" }, { left:"91%", top:"35%" }, { left:"87%", top:"68%" },
 ];
 // Which slots to use for a given number of opponents. Taking the first N left
 // everyone bunched down the left-hand side; these are mirrored about the centre.
@@ -4169,7 +4169,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05u";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05v";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -6757,7 +6757,7 @@ useEffect(() => {
                       </div>
                     </>
                   ) : (
-                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"50%", left:"50%", width:"auto", display:"flex", flexDirection:"column", alignItems:"center"} : {})}}><CentreInfo st={st} streetLbl={streetLbl}/></div>
+                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"57%", left:"50%", width:"auto", display:"flex", flexDirection:"column", alignItems:"center"} : {})}}><CentreInfo st={st} streetLbl={streetLbl}/></div>
                   )}
                 </div>
               ) : (

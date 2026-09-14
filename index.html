@@ -362,7 +362,7 @@ function freshName(taken, seed = 0) {
 }
 const OVAL_POS = [
     { left: "13%", top: "68%" }, { left: "9%", top: "35%" }, { left: "27%", top: "11%" },
-    { left: "50%", top: "8%" }, { left: "73%", top: "11%" }, { left: "91%", top: "35%" }, { left: "87%", top: "68%" },
+    { left: "50%", top: "16%" }, { left: "73%", top: "11%" }, { left: "91%", top: "35%" }, { left: "87%", top: "68%" },
 ];
 const OVAL_PICK = { 1: [3], 2: [1, 5], 3: [1, 3, 5], 4: [0, 1, 5, 6], 5: [0, 1, 3, 5, 6], 6: [0, 1, 2, 4, 5, 6], 7: [0, 1, 2, 3, 4, 5, 6] };
 const LAND_POS = [
@@ -4409,7 +4409,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05u";
+const APP_VERSION = "2026.07.05v";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -6816,7 +6816,7 @@ function App() {
                                 React.createElement("span", { style: S.ovalDblPotAmt },
                                     "$",
                                     MNY(st.pot)),
-                                streetLbl && React.createElement("span", { style: S.ovalDblStreet }, streetLbl)))) : (React.createElement("div", { style: { ...S.ovalCentre, ...(landPhone ? { top: "50%", left: "50%", width: "auto", display: "flex", flexDirection: "column", alignItems: "center" } : {}) } },
+                                streetLbl && React.createElement("span", { style: S.ovalDblStreet }, streetLbl)))) : (React.createElement("div", { style: { ...S.ovalCentre, ...(landPhone ? { top: "57%", left: "50%", width: "auto", display: "flex", flexDirection: "column", alignItems: "center" } : {}) } },
                             React.createElement(CentreInfo, { st: st, streetLbl: streetLbl }))))) : (React.createElement("div", { style: S.mStrip }, [1, 2, 3].map(id => (React.createElement(MobileSeat, { key: id, p: st.players[id], reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === id, thinking: cpuTurn && st.queue[0] === id, wid: wid, won: (st.winnerIds || []).includes(id), tilt: st.cpuTilt?.[id] || 0, profile: PROF[id] })))))) : (React.createElement(React.Fragment, null,
                         React.createElement("div", { style: S.rowTop },
                             React.createElement(Seat, { p: st.players[2], reveal: st.reveal, gid: st.gid, board: st.board, dealKey: st.dealKey, isDealer: st.dealerIdx === 2, thinking: cpuTurn && st.queue[0] === 2, wid: wid, won: (st.winnerIds || []).includes(2), tilt: st.cpuTilt?.[2] || 0, profile: PROF[2] })),
