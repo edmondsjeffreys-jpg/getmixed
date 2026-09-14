@@ -406,7 +406,7 @@ const ovalSlot = (i, n, land) => {
     const r = a * Math.PI / 180;
     return {
       left: `${Math.round((50 + 43 * Math.cos(r)) * 10) / 10}%`,
-      top:  `${Math.round((46 - 22 * Math.sin(r)) * 10) / 10}%`,
+      top:  `${Math.round((33 - 13 * Math.sin(r)) * 10) / 10}%`,
     };
   }
   return OVAL_POS[(OVAL_PICK[n] || OVAL_PICK[7])[i] ?? 6];
@@ -4168,7 +4168,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05r";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05s";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -6192,7 +6192,8 @@ useEffect(() => {
           70%  { opacity: 1; }
           100% { opacity: 1; transform: translateY(0) scale(1); }
         }
-        @keyframes winPulse {
+        @keyframes gmThink{0%,100%{box-shadow:0 0 0 1px rgba(201,162,75,0.5),0 0 6px rgba(201,162,75,0.15)}50%{box-shadow:0 0 0 2px rgba(255,214,110,0.95),0 0 18px rgba(201,162,75,0.55)}}
+@keyframes winPulse {
           0%,100% { filter: drop-shadow(0 0 8px rgba(87,230,176,0.4)); }
           50%     { filter: drop-shadow(0 0 18px rgba(87,230,176,0.85)); }
         }
@@ -6716,7 +6717,7 @@ useEffect(() => {
             {mobile ? (
               st.players.length > 4 ? (
                 /* Mobile 8-max: opponents around the oval, pot + board in the centre */
-                <div style={{...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 215))}}>
+                <div style={{...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 160))}}>
                   {st.players.filter(p => p.id !== 0).map((p, i) => (
                     <div key={p.id} style={{ ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone) }}>
                       <MobileSeat p={p} reveal={st.reveal} gid={st.gid} board={st.board}
@@ -6755,7 +6756,7 @@ useEffect(() => {
                       </div>
                     </>
                   ) : (
-                    <div style={S.ovalCentre}><CentreInfo st={st} streetLbl={streetLbl}/></div>
+                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"60%"} : {})}}><CentreInfo st={st} streetLbl={streetLbl}/></div>
                   )}
                 </div>
               ) : (
@@ -7345,6 +7346,7 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
       background:"linear-gradient(180deg, rgba(8,26,18,0.44), rgba(4,16,11,0.56))",
       border:`1px solid ${win?"rgba(87,230,176,0.55)":thinking?"rgba(201,162,75,0.5)":"rgba(201,162,75,0.22)"}`,
       boxShadow:win?"0 0 10px rgba(87,230,176,0.28)":"0 1px 6px rgba(0,0,0,0.35)",
+      animation: thinking ? "gmThink 0.85s ease-in-out infinite" : undefined,
       filter:win?"drop-shadow(0 0 7px rgba(87,230,176,0.4))":thinking?"drop-shadow(0 0 5px rgba(201,162,75,0.28))":"none" }}>
       {speaks && <div style={S.bubbleMobile}>Not like that</div>}
       {/* Name + chips row */}

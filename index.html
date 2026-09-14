@@ -7,12 +7,21 @@
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <title>Get Mixed</title>
-<script async src="https://www.googletagmanager.com/gtag/js?id=G-FCYV1NGPS6"></script>
 <script>
+  // Analytics runs on the live domain only, so a staging copy on github.io
+  // stays out of the GA4 property and test sessions never pollute real numbers.
+  // gtag is always defined either way, so no call site can throw.
   window.dataLayer = window.dataLayer || [];
-  function gtag(){dataLayer.push(arguments);}
-  gtag('js', new Date());
-  gtag('config', 'G-FCYV1NGPS6');
+  function gtag(){ window.dataLayer.push(arguments); }
+  window.gtag = gtag;
+  if (location.hostname === 'getmixed.ca' || location.hostname === 'www.getmixed.ca') {
+    var gaTag = document.createElement('script');
+    gaTag.async = true;
+    gaTag.src = 'https://www.googletagmanager.com/gtag/js?id=G-FCYV1NGPS6';
+    document.head.appendChild(gaTag);
+    gtag('js', new Date());
+    gtag('config', 'G-FCYV1NGPS6');
+  }
 </script>
 <style>
   html, body { margin:0; padding:0; background:#0A1F18; color:#F0E9D6;
@@ -362,7 +371,7 @@ const ovalSlot = (i, n, land) => {
         const r = a * Math.PI / 180;
         return {
             left: `${Math.round((50 + 43 * Math.cos(r)) * 10) / 10}%`,
-            top: `${Math.round((46 - 22 * Math.sin(r)) * 10) / 10}%`,
+            top: `${Math.round((33 - 13 * Math.sin(r)) * 10) / 10}%`,
         };
     }
     return OVAL_POS[(OVAL_PICK[n] || OVAL_PICK[7])[i] ?? 6];
@@ -4401,7 +4410,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05r";
+const APP_VERSION = "2026.07.05s";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -6313,7 +6322,8 @@ function App() {
           70%  { opacity: 1; }
           100% { opacity: 1; transform: translateY(0) scale(1); }
         }
-        @keyframes winPulse {
+        @keyframes gmThink{0%,100%{box-shadow:0 0 0 1px rgba(201,162,75,0.5),0 0 6px rgba(201,162,75,0.15)}50%{box-shadow:0 0 0 2px rgba(255,214,110,0.95),0 0 18px rgba(201,162,75,0.55)}}
+@keyframes winPulse {
           0%,100% { filter: drop-shadow(0 0 8px rgba(87,230,176,0.4)); }
           50%     { filter: drop-shadow(0 0 18px rgba(87,230,176,0.85)); }
         }
@@ -6787,7 +6797,7 @@ function App() {
                     React.createElement("div", { style: S.gamePlaque },
                         curGame?.tag && React.createElement("span", { style: S.plaqueTag }, curGame.tag),
                         React.createElement("span", { style: S.plaqueName }, curGame?.label || "")),
-                    mobile ? (st.players.length > 4 ? (React.createElement("div", { style: { ...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 215)) } },
+                    mobile ? (st.players.length > 4 ? (React.createElement("div", { style: { ...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 160)) } },
                         st.players.filter(p => p.id !== 0).map((p, i) => (React.createElement("div", { key: p.id, style: { ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone) } },
                             React.createElement(MobileSeat, { p: p, reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === p.id, thinking: cpuTurn && st.queue[0] === p.id, wid: wid, won: (st.winnerIds || []).includes(p.id), tilt: st.cpuTilt?.[p.id] || 0, profile: PROF[p.id], land: landPhone })))),
                         IS_DOUBLE(st.gid) ? (React.createElement(React.Fragment, null,
@@ -6807,7 +6817,7 @@ function App() {
                                 React.createElement("span", { style: S.ovalDblPotAmt },
                                     "$",
                                     MNY(st.pot)),
-                                streetLbl && React.createElement("span", { style: S.ovalDblStreet }, streetLbl)))) : (React.createElement("div", { style: S.ovalCentre },
+                                streetLbl && React.createElement("span", { style: S.ovalDblStreet }, streetLbl)))) : (React.createElement("div", { style: { ...S.ovalCentre, ...(landPhone ? { top: "60%" } : {}) } },
                             React.createElement(CentreInfo, { st: st, streetLbl: streetLbl }))))) : (React.createElement("div", { style: S.mStrip }, [1, 2, 3].map(id => (React.createElement(MobileSeat, { key: id, p: st.players[id], reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === id, thinking: cpuTurn && st.queue[0] === id, wid: wid, won: (st.winnerIds || []).includes(id), tilt: st.cpuTilt?.[id] || 0, profile: PROF[id] })))))) : (React.createElement(React.Fragment, null,
                         React.createElement("div", { style: S.rowTop },
                             React.createElement(Seat, { p: st.players[2], reveal: st.reveal, gid: st.gid, board: st.board, dealKey: st.dealKey, isDealer: st.dealerIdx === 2, thinking: cpuTurn && st.queue[0] === 2, wid: wid, won: (st.winnerIds || []).includes(2), tilt: st.cpuTilt?.[2] || 0, profile: PROF[2] })),
@@ -7189,6 +7199,7 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
             background: "linear-gradient(180deg, rgba(8,26,18,0.44), rgba(4,16,11,0.56))",
             border: `1px solid ${win ? "rgba(87,230,176,0.55)" : thinking ? "rgba(201,162,75,0.5)" : "rgba(201,162,75,0.22)"}`,
             boxShadow: win ? "0 0 10px rgba(87,230,176,0.28)" : "0 1px 6px rgba(0,0,0,0.35)",
+            animation: thinking ? "gmThink 0.85s ease-in-out infinite" : undefined,
             filter: win ? "drop-shadow(0 0 7px rgba(87,230,176,0.4))" : thinking ? "drop-shadow(0 0 5px rgba(201,162,75,0.28))" : "none" } },
         speaks && React.createElement("div", { style: S.bubbleMobile }, "Not like that"),
         React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 4, justifyContent: "center", flexWrap: "wrap" } },
@@ -7888,7 +7899,5 @@ ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(
 
   </script>
 
-  <script defer src="https://static.cloudflareinsights.com/beacon.min.js"
-          data-cf-beacon='{"token": "58ce68fea4504dde8e8e96ca1c0dd912"}'></script>
 </body>
 </html>
