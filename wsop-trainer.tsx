@@ -402,8 +402,12 @@ const OVAL_POS = [
 const OVAL_PICK = { 1:[3], 2:[1,5], 3:[1,3,5], 4:[0,1,5,6], 5:[0,1,3,5,6], 6:[0,1,2,4,5,6], 7:[0,1,2,3,4,5,6] };
 const ovalSlot = (i, n, land) => {
   if (land) {
-    // one evenly-spaced row across the top: uses the width, needs no height
-    return { left: `${Math.round(((i + 1) / (n + 1)) * 1000) / 10}%`, top: "30%" };
+    const a = (n === 1) ? 90 : 165 - (150 * i) / (n - 1);   // 165deg round to 15deg
+    const r = a * Math.PI / 180;
+    return {
+      left: `${Math.round((50 + 43 * Math.cos(r)) * 10) / 10}%`,
+      top:  `${Math.round((46 - 22 * Math.sin(r)) * 10) / 10}%`,
+    };
   }
   return OVAL_POS[(OVAL_PICK[n] || OVAL_PICK[7])[i] ?? 6];
 };
@@ -4164,7 +4168,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05q";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05r";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -6718,7 +6722,7 @@ useEffect(() => {
                       <MobileSeat p={p} reveal={st.reveal} gid={st.gid} board={st.board}
                         isDealer={st.dealerIdx===p.id}
                         thinking={cpuTurn && st.queue[0]===p.id}
-                        wid={wid} won={(st.winnerIds||[]).includes(p.id)} tilt={st.cpuTilt?.[p.id]||0} profile={PROF[p.id]} />
+                        wid={wid} won={(st.winnerIds||[]).includes(p.id)} tilt={st.cpuTilt?.[p.id]||0} profile={PROF[p.id]} land={landPhone} />
                     </div>
                   ))}
                   {IS_DOUBLE(st.gid) ? (
@@ -7313,7 +7317,7 @@ function Seat({ p, reveal, gid, board, dealKey, isDealer, compact, thinking, wid
 }
 
 // ─── MOBILE SEAT (compact strip) ─────────────────
-function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt, profile }) {
+function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt, profile, land }) {
   if (!p) return null;
   const flop = IS_FLOP(gid);
   const stud = IS_STUD(gid);
@@ -7351,7 +7355,7 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
       </div>
       {/* Profile tag + tilt */}
       <span style={{fontSize:6.5,letterSpacing:0.8,color:"#3a2a16"}}>
-        {profile?.tag}{tilt>0?` 🔥${"!".repeat(Math.min(tilt,3))}`:""}</span>
+        {land ? (tilt>0?`🔥${"!".repeat(Math.min(tilt,3))}`:"") : `${profile?.tag||""}${tilt>0?` 🔥${"!".repeat(Math.min(tilt,3))}`:""}`}</span>
       {/* Last action */}
       <div style={{display:"flex",alignItems:"center",gap:3,minHeight:16}}>
         {p.lastAct&&<Bdg {...p.lastAct}/>}
