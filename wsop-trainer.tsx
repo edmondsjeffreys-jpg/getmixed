@@ -4169,7 +4169,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05t";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05u";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -6720,7 +6720,7 @@ useEffect(() => {
                 /* Mobile 8-max: opponents around the oval, pot + board in the centre */
                 <div style={{...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 160))}}>
                   {st.players.filter(p => p.id !== 0).map((p, i) => (
-                    <div key={p.id} style={{ ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone) }}>
+                    <div key={p.id} style={{ ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone), ...(landPhone ? {width:210} : {}) }}>
                       <MobileSeat p={p} reveal={st.reveal} gid={st.gid} board={st.board}
                         isDealer={st.dealerIdx===p.id}
                         thinking={cpuTurn && st.queue[0]===p.id}
@@ -6757,7 +6757,7 @@ useEffect(() => {
                       </div>
                     </>
                   ) : (
-                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"54%"} : {})}}><CentreInfo st={st} streetLbl={streetLbl}/></div>
+                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"50%", left:"50%", width:"auto", display:"flex", flexDirection:"column", alignItems:"center"} : {})}}><CentreInfo st={st} streetLbl={streetLbl}/></div>
                   )}
                 </div>
               ) : (
@@ -7347,7 +7347,7 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
       background:"linear-gradient(180deg, rgba(8,26,18,0.44), rgba(4,16,11,0.56))",
       border:`1px solid ${win?"rgba(87,230,176,0.55)":thinking?"rgba(201,162,75,0.5)":"rgba(201,162,75,0.22)"}`,
       boxShadow:win?"0 0 10px rgba(87,230,176,0.28)":"0 1px 6px rgba(0,0,0,0.35)",
-      animation: thinking ? "gmThink 0.85s ease-in-out infinite" : undefined,
+      animation: thinking ? "gmThink 0.42s ease-in-out infinite" : undefined,
       filter:win?"drop-shadow(0 0 7px rgba(87,230,176,0.4))":thinking?"drop-shadow(0 0 5px rgba(201,162,75,0.28))":"none" }}>
       {speaks && <div style={S.bubbleMobile}>Not like that</div>}
       {/* Name + chips row */}
@@ -7356,11 +7356,11 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
         <span style={{fontSize:9,letterSpacing:1.2,color:"#C9A24B"}}>{p.name}</span>
         <span style={{fontSize:10.5,color:"#F0E9D6",fontFamily:"ui-monospace,SFMono-Regular,Menlo,monospace",fontVariantNumeric:"tabular-nums"}}>${MNY(p.chips)}</span>
       </div>
-      {/* Profile tag + tilt */}
-      <span style={{fontSize:6.5,letterSpacing:0.8,color:"#3a2a16"}}>
-        {land ? (tilt>0?`🔥${"!".repeat(Math.min(tilt,3))}`:"") : `${profile?.tag||""}${tilt>0?` 🔥${"!".repeat(Math.min(tilt,3))}`:""}`}</span>
+      {/* Profile tag + tilt — hidden sideways, where the height buys card size */}
+      {!land && <span style={{fontSize:6.5,letterSpacing:0.8,color:"#3a2a16"}}>
+        {`${profile?.tag||""}${tilt>0?` 🔥${"!".repeat(Math.min(tilt,3))}`:""}`}</span>}
       {/* Last action */}
-      <div style={{display:"flex",alignItems:"center",gap:3,minHeight:16}}>
+      <div style={{display:"flex",alignItems:"center",gap:3,minHeight:land?0:16,marginTop:land?1:0}}>
         {p.lastAct&&<Bdg {...p.lastAct}/>}
         {thinking&&<Dots/>}
       </div>
@@ -7369,8 +7369,8 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
         <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
           <div style={{display:"flex",gap:1.5}}>
             {p.hand.map((c,i)=> (c.up||reveal)
-              ? <MicroCard key={i} card={c}/>
-              : <div key={i} style={{width:11,height:16,borderRadius:2,background:"#1a3680",border:"1px solid rgba(201,162,75,0.6)"}}/>)}
+              ? <MicroCard key={i} card={c} big={land}/>
+              : <div key={i} style={{width:land?16:11,height:land?23:16,borderRadius:2,background:"#1a3680",border:"1px solid rgba(201,162,75,0.6)"}}/>)}
           </div>
           {ev && <div style={{fontSize:8,color:win?"#3FD39C":hColor(ev),letterSpacing:0.5}}>{ev.desc}{loTxt}</div>}
           {p.folded && <div style={{fontSize:7,color:"#ef444488",letterSpacing:1.5}}>FOLDED</div>}
@@ -7399,14 +7399,14 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
 }
 
 // ─── MICRO CARD (mobile showdown) ────────────────
-function MicroCard({ card }) {
+function MicroCard({ card, big }) {
   const isRed = RED.has(card.s);
   return (
-    <div style={{width:17,height:24,borderRadius:2,background:"#fefcf6",border:"1px solid #ddd0b8",
+    <div style={{width:big?25:17,height:big?35:24,borderRadius:big?3:2,background:"#fefcf6",border:"1px solid #ddd0b8",
       display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
       color:isRed?"#b91c1c":"#111",flexShrink:0}}>
-      <b style={{fontSize:7.5,lineHeight:1}}>{card.r}</b>
-      <span style={{fontSize:6.5,lineHeight:1}}>{card.s}</span>
+      <b style={{fontSize:big?11:7.5,lineHeight:1}}>{card.r}</b>
+      <span style={{fontSize:big?10:6.5,lineHeight:1}}>{card.s}</span>
     </div>
   );
 }

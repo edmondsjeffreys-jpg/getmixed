@@ -4409,7 +4409,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05t";
+const APP_VERSION = "2026.07.05u";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -6797,7 +6797,7 @@ function App() {
                         curGame?.tag && React.createElement("span", { style: S.plaqueTag }, curGame.tag),
                         React.createElement("span", { style: S.plaqueName }, curGame?.label || "")),
                     mobile ? (st.players.length > 4 ? (React.createElement("div", { style: { ...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 160)) } },
-                        st.players.filter(p => p.id !== 0).map((p, i) => (React.createElement("div", { key: p.id, style: { ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone) } },
+                        st.players.filter(p => p.id !== 0).map((p, i) => (React.createElement("div", { key: p.id, style: { ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone), ...(landPhone ? { width: 210 } : {}) } },
                             React.createElement(MobileSeat, { p: p, reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === p.id, thinking: cpuTurn && st.queue[0] === p.id, wid: wid, won: (st.winnerIds || []).includes(p.id), tilt: st.cpuTilt?.[p.id] || 0, profile: PROF[p.id], land: landPhone })))),
                         IS_DOUBLE(st.gid) ? (React.createElement(React.Fragment, null,
                             React.createElement("div", { style: S.ovalDblBoards },
@@ -6816,7 +6816,7 @@ function App() {
                                 React.createElement("span", { style: S.ovalDblPotAmt },
                                     "$",
                                     MNY(st.pot)),
-                                streetLbl && React.createElement("span", { style: S.ovalDblStreet }, streetLbl)))) : (React.createElement("div", { style: { ...S.ovalCentre, ...(landPhone ? { top: "54%" } : {}) } },
+                                streetLbl && React.createElement("span", { style: S.ovalDblStreet }, streetLbl)))) : (React.createElement("div", { style: { ...S.ovalCentre, ...(landPhone ? { top: "50%", left: "50%", width: "auto", display: "flex", flexDirection: "column", alignItems: "center" } : {}) } },
                             React.createElement(CentreInfo, { st: st, streetLbl: streetLbl }))))) : (React.createElement("div", { style: S.mStrip }, [1, 2, 3].map(id => (React.createElement(MobileSeat, { key: id, p: st.players[id], reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === id, thinking: cpuTurn && st.queue[0] === id, wid: wid, won: (st.winnerIds || []).includes(id), tilt: st.cpuTilt?.[id] || 0, profile: PROF[id] })))))) : (React.createElement(React.Fragment, null,
                         React.createElement("div", { style: S.rowTop },
                             React.createElement(Seat, { p: st.players[2], reveal: st.reveal, gid: st.gid, board: st.board, dealKey: st.dealKey, isDealer: st.dealerIdx === 2, thinking: cpuTurn && st.queue[0] === 2, wid: wid, won: (st.winnerIds || []).includes(2), tilt: st.cpuTilt?.[2] || 0, profile: PROF[2] })),
@@ -7198,7 +7198,7 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
             background: "linear-gradient(180deg, rgba(8,26,18,0.44), rgba(4,16,11,0.56))",
             border: `1px solid ${win ? "rgba(87,230,176,0.55)" : thinking ? "rgba(201,162,75,0.5)" : "rgba(201,162,75,0.22)"}`,
             boxShadow: win ? "0 0 10px rgba(87,230,176,0.28)" : "0 1px 6px rgba(0,0,0,0.35)",
-            animation: thinking ? "gmThink 0.85s ease-in-out infinite" : undefined,
+            animation: thinking ? "gmThink 0.42s ease-in-out infinite" : undefined,
             filter: win ? "drop-shadow(0 0 7px rgba(87,230,176,0.4))" : thinking ? "drop-shadow(0 0 5px rgba(201,162,75,0.28))" : "none" } },
         speaks && React.createElement("div", { style: S.bubbleMobile }, "Not like that"),
         React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 4, justifyContent: "center", flexWrap: "wrap" } },
@@ -7207,14 +7207,14 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
             React.createElement("span", { style: { fontSize: 10.5, color: "#F0E9D6", fontFamily: "ui-monospace,SFMono-Regular,Menlo,monospace", fontVariantNumeric: "tabular-nums" } },
                 "$",
                 MNY(p.chips))),
-        React.createElement("span", { style: { fontSize: 6.5, letterSpacing: 0.8, color: "#3a2a16" } }, land ? (tilt > 0 ? `🔥${"!".repeat(Math.min(tilt, 3))}` : "") : `${profile?.tag || ""}${tilt > 0 ? ` 🔥${"!".repeat(Math.min(tilt, 3))}` : ""}`),
-        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 3, minHeight: 16 } },
+        !land && React.createElement("span", { style: { fontSize: 6.5, letterSpacing: 0.8, color: "#3a2a16" } }, `${profile?.tag || ""}${tilt > 0 ? ` 🔥${"!".repeat(Math.min(tilt, 3))}` : ""}`),
+        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 3, minHeight: land ? 0 : 16, marginTop: land ? 1 : 0 } },
             p.lastAct && React.createElement(Bdg, { ...p.lastAct }),
             thinking && React.createElement(Dots, null)),
         stud && !p.sittingOut ? (React.createElement("div", { style: { display: "flex", flexDirection: "column", alignItems: "center", gap: 2 } },
             React.createElement("div", { style: { display: "flex", gap: 1.5 } }, p.hand.map((c, i) => (c.up || reveal)
-                ? React.createElement(MicroCard, { key: i, card: c })
-                : React.createElement("div", { key: i, style: { width: 11, height: 16, borderRadius: 2, background: "#1a3680", border: "1px solid rgba(201,162,75,0.6)" } }))),
+                ? React.createElement(MicroCard, { key: i, card: c, big: land })
+                : React.createElement("div", { key: i, style: { width: land ? 16 : 11, height: land ? 23 : 16, borderRadius: 2, background: "#1a3680", border: "1px solid rgba(201,162,75,0.6)" } }))),
             ev && React.createElement("div", { style: { fontSize: 8, color: win ? "#3FD39C" : hColor(ev), letterSpacing: 0.5 } },
                 ev.desc,
                 loTxt),
@@ -7225,13 +7225,13 @@ function MobileSeat({ p, reveal, gid, board, isDealer, thinking, wid, won, tilt,
                 ev.desc,
                 loTxt))) : (React.createElement("div", { style: { fontSize: 7, color: p.folded ? "#ef444488" : "#2C4438", letterSpacing: 1.5 } }, p.folded ? "FOLDED" : "OUT"))));
 }
-function MicroCard({ card }) {
+function MicroCard({ card, big }) {
     const isRed = RED.has(card.s);
-    return (React.createElement("div", { style: { width: 17, height: 24, borderRadius: 2, background: "#fefcf6", border: "1px solid #ddd0b8",
+    return (React.createElement("div", { style: { width: big ? 25 : 17, height: big ? 35 : 24, borderRadius: big ? 3 : 2, background: "#fefcf6", border: "1px solid #ddd0b8",
             display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
             color: isRed ? "#b91c1c" : "#111", flexShrink: 0 } },
-        React.createElement("b", { style: { fontSize: 7.5, lineHeight: 1 } }, card.r),
-        React.createElement("span", { style: { fontSize: 6.5, lineHeight: 1 } }, card.s)));
+        React.createElement("b", { style: { fontSize: big ? 11 : 7.5, lineHeight: 1 } }, card.r),
+        React.createElement("span", { style: { fontSize: big ? 10 : 6.5, lineHeight: 1 } }, card.s)));
 }
 function Card({ card, faceDown, selected, onClick, interactive, small, tiny, mobile, dealIdx = 0 }) {
     const W = tiny ? 26 : mobile ? 52 : small ? 38 : 60;
