@@ -4409,7 +4409,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05y";
+const APP_VERSION = "2026.07.05z";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -6796,7 +6796,7 @@ function App() {
                     React.createElement("div", { style: S.gamePlaque },
                         curGame?.tag && React.createElement("span", { style: S.plaqueTag }, curGame.tag),
                         React.createElement("span", { style: S.plaqueName }, curGame?.label || "")),
-                    mobile ? (st.players.length > 4 ? (React.createElement("div", { style: { ...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 160)) } },
+                    mobile ? (st.players.length > 4 ? (React.createElement("div", { style: { ...S.ovalWrap, height: IS_DOUBLE(st.gid) ? 440 : Math.max(168, Math.min(340, screenH - 160)) } },
                         st.players.filter(p => p.id !== 0).map((p, i) => (React.createElement("div", { key: p.id, style: { ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone), ...(landPhone ? { width: 210 } : {}) } },
                             React.createElement(MobileSeat, { p: p, reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === p.id, thinking: cpuTurn && st.queue[0] === p.id, wid: wid, won: (st.winnerIds || []).includes(p.id), tilt: st.cpuTilt?.[p.id] || 0, profile: PROF[p.id], land: landPhone })))),
                         IS_DOUBLE(st.gid) ? (React.createElement(React.Fragment, null,
@@ -6804,12 +6804,12 @@ function App() {
                                 React.createElement("div", { style: S.ovalDblRow },
                                     React.createElement("span", { style: S.ovalDblTag }, "TOP"),
                                     React.createElement("div", { style: S.boardSm }, [0, 1, 2, 3, 4].map(i => st.board[i]
-                                        ? React.createElement(BoardCard, { key: `a-${st.boardKey}-${i}`, card: st.board[i], idx: i, small: true, tiny: landPhone })
+                                        ? React.createElement(BoardCard, { key: `a-${st.boardKey}-${i}`, card: st.board[i], idx: i, small: true, tiny: landPhone || IS_DOUBLE(st.gid) })
                                         : React.createElement("div", { key: `a${i}`, style: S.boardSlotSm })))),
                                 React.createElement("div", { style: S.ovalDblRow },
                                     React.createElement("span", { style: S.ovalDblTag }, "BOT"),
                                     React.createElement("div", { style: S.boardSm }, [0, 1, 2, 3, 4].map(i => (st.board2 || [])[i]
-                                        ? React.createElement(BoardCard, { key: `b-${st.boardKey}-${i}`, card: st.board2[i], idx: i, small: true, tiny: landPhone })
+                                        ? React.createElement(BoardCard, { key: `b-${st.boardKey}-${i}`, card: st.board2[i], idx: i, small: true, tiny: landPhone || IS_DOUBLE(st.gid) })
                                         : React.createElement("div", { key: `b${i}`, style: S.boardSlotSm }))))),
                             React.createElement("div", { style: S.ovalDblPot },
                                 React.createElement("span", { style: S.potLbl }, "POT"),

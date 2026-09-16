@@ -4169,7 +4169,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05y";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05z";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -6720,7 +6720,7 @@ useEffect(() => {
             {mobile ? (
               st.players.length > 4 ? (
                 /* Mobile 8-max: opponents around the oval, pot + board in the centre */
-                <div style={{...S.ovalWrap, height: Math.max(168, Math.min(340, screenH - 160))}}>
+                <div style={{...S.ovalWrap, height: IS_DOUBLE(st.gid) ? 440 : Math.max(168, Math.min(340, screenH - 160))}}>
                   {st.players.filter(p => p.id !== 0).map((p, i) => (
                     <div key={p.id} style={{ ...S.ovalSeat, ...ovalSlot(i, st.players.length - 1, landPhone), ...(landPhone ? {width:210} : {}) }}>
                       <MobileSeat p={p} reveal={st.reveal} gid={st.gid} board={st.board}
@@ -6739,7 +6739,7 @@ useEffect(() => {
                           <span style={S.ovalDblTag}>TOP</span>
                           <div style={S.boardSm}>
                             {[0,1,2,3,4].map(i => st.board[i]
-                              ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small tiny={landPhone}/>
+                              ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small tiny={landPhone || IS_DOUBLE(st.gid)}/>
                               : <div key={`a${i}`} style={S.boardSlotSm}/>)}
                           </div>
                         </div>
@@ -6747,7 +6747,7 @@ useEffect(() => {
                           <span style={S.ovalDblTag}>BOT</span>
                           <div style={S.boardSm}>
                             {[0,1,2,3,4].map(i => (st.board2||[])[i]
-                              ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small tiny={landPhone}/>
+                              ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small tiny={landPhone || IS_DOUBLE(st.gid)}/>
                               : <div key={`b${i}`} style={S.boardSlotSm}/>)}
                           </div>
                         </div>
