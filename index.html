@@ -4409,7 +4409,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05x";
+const APP_VERSION = "2026.07.05y";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -6804,12 +6804,12 @@ function App() {
                                 React.createElement("div", { style: S.ovalDblRow },
                                     React.createElement("span", { style: S.ovalDblTag }, "TOP"),
                                     React.createElement("div", { style: S.boardSm }, [0, 1, 2, 3, 4].map(i => st.board[i]
-                                        ? React.createElement(BoardCard, { key: `a-${st.boardKey}-${i}`, card: st.board[i], idx: i, small: true, tiny: land })
+                                        ? React.createElement(BoardCard, { key: `a-${st.boardKey}-${i}`, card: st.board[i], idx: i, small: true, tiny: landPhone })
                                         : React.createElement("div", { key: `a${i}`, style: S.boardSlotSm })))),
                                 React.createElement("div", { style: S.ovalDblRow },
                                     React.createElement("span", { style: S.ovalDblTag }, "BOT"),
                                     React.createElement("div", { style: S.boardSm }, [0, 1, 2, 3, 4].map(i => (st.board2 || [])[i]
-                                        ? React.createElement(BoardCard, { key: `b-${st.boardKey}-${i}`, card: st.board2[i], idx: i, small: true, tiny: land })
+                                        ? React.createElement(BoardCard, { key: `b-${st.boardKey}-${i}`, card: st.board2[i], idx: i, small: true, tiny: landPhone })
                                         : React.createElement("div", { key: `b${i}`, style: S.boardSlotSm }))))),
                             React.createElement("div", { style: S.ovalDblPot },
                                 React.createElement("span", { style: S.potLbl }, "POT"),

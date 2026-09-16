@@ -4169,7 +4169,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05x";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05y";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -6739,7 +6739,7 @@ useEffect(() => {
                           <span style={S.ovalDblTag}>TOP</span>
                           <div style={S.boardSm}>
                             {[0,1,2,3,4].map(i => st.board[i]
-                              ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small tiny={land}/>
+                              ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small tiny={landPhone}/>
                               : <div key={`a${i}`} style={S.boardSlotSm}/>)}
                           </div>
                         </div>
@@ -6747,7 +6747,7 @@ useEffect(() => {
                           <span style={S.ovalDblTag}>BOT</span>
                           <div style={S.boardSm}>
                             {[0,1,2,3,4].map(i => (st.board2||[])[i]
-                              ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small tiny={land}/>
+                              ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small tiny={landPhone}/>
                               : <div key={`b${i}`} style={S.boardSlotSm}/>)}
                           </div>
                         </div>
