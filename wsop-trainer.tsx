@@ -4169,7 +4169,7 @@ const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 // Tip-jar link. Paste your Ko-fi / Buy Me a Coffee URL (e.g. https://ko-fi.com/yourname)
 // in place of PASTE_SUPPORT_LINK and the "Support" link appears in the footer. Until then it stays hidden.
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05v";  // build stamp — bump when you ship a new build
+const APP_VERSION = "2026.07.05x";  // build stamp — bump when you ship a new build
 const IS_BETA = true;               // shows a BETA badge in header + footer
 // First-run guided tour: spotlight these elements in order.
 const TOUR = [
@@ -5819,7 +5819,9 @@ export default function App() {
   const screenW       = useWidth();
   const screenH       = typeof window !== 'undefined' ? window.innerHeight : 900;
   const mobile        = Math.min(screenW, screenH) < 560;   // a phone is a phone in either orientation
-  const landPhone     = mobile && screenW > screenH;   // phone held sideways: everything must fit one screen
+  const landPhone     = mobile && screenW > screenH && !IS_DOUBLE(st.gid);   // sideways one-screen layout
+  // Double-board games stack two boards, which will not fit one screen sideways.
+  // They get the tall table instead and are allowed to scroll.
   const curGame       = GAMES.find(g => g.id === st.gid);
 
   // ── Hand-history logging (silent; works even with Coach off) ──
@@ -6737,7 +6739,7 @@ useEffect(() => {
                           <span style={S.ovalDblTag}>TOP</span>
                           <div style={S.boardSm}>
                             {[0,1,2,3,4].map(i => st.board[i]
-                              ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small/>
+                              ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small tiny={land}/>
                               : <div key={`a${i}`} style={S.boardSlotSm}/>)}
                           </div>
                         </div>
@@ -6745,7 +6747,7 @@ useEffect(() => {
                           <span style={S.ovalDblTag}>BOT</span>
                           <div style={S.boardSm}>
                             {[0,1,2,3,4].map(i => (st.board2||[])[i]
-                              ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small/>
+                              ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small tiny={land}/>
                               : <div key={`b${i}`} style={S.boardSlotSm}/>)}
                           </div>
                         </div>
@@ -6757,7 +6759,7 @@ useEffect(() => {
                       </div>
                     </>
                   ) : (
-                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"57%", left:"50%", width:"auto", display:"flex", flexDirection:"column", alignItems:"center"} : {})}}><CentreInfo st={st} streetLbl={streetLbl}/></div>
+                    <div style={{...S.ovalCentre, ...(landPhone ? {top:"57%", left:"50%", width:"auto", display:"flex", flexDirection:"column", alignItems:"center"} : {})}}><CentreInfo st={st} streetLbl={streetLbl} land={landPhone}/></div>
                   )}
                 </div>
               ) : (
@@ -6784,7 +6786,7 @@ useEffect(() => {
                       thinking={cpuTurn&&st.queue[0]===1} wid={wid} won={(st.winnerIds||[]).includes(1)} tilt={st.cpuTilt?.[1]||0} profile={PROF[1]}/>
                   </div>
                   {/* Centre info (pot + community board) */}
-                  <CentreInfo st={st} streetLbl={streetLbl}/>
+                  <CentreInfo st={st} streetLbl={streetLbl} land={landPhone}/>
                   <div style={S.sideSeat}>
                     <Seat p={st.players[3]} reveal={st.reveal} gid={st.gid} board={st.board} dealKey={st.dealKey} isDealer={st.dealerIdx===3} compact
                       thinking={cpuTurn&&st.queue[0]===3} wid={wid} won={(st.winnerIds||[]).includes(3)} tilt={st.cpuTilt?.[3]||0} profile={PROF[3]}/>
@@ -6794,7 +6796,7 @@ useEffect(() => {
             )}
 
             {/* Mobile centre info (below the CPU strip) — 8-max puts it inside the oval instead */}
-            {mobile && st.players.length <= 4 && <CentreInfo st={st} streetLbl={streetLbl}/>}
+            {mobile && st.players.length <= 4 && <CentreInfo st={st} streetLbl={streetLbl} land={landPhone}/>}
 
             {/* ── PLAYER SECTION ──────────── */}
             <div style={{...S.botRow, ...(mobile && st.players.length>4 ? {marginTop:-64} : {})}}>
@@ -7172,7 +7174,7 @@ useEffect(() => {
 }
 
 // ─── CENTRE INFO ─────────────────────────────────
-function CentreInfo({ st, streetLbl }) {
+function CentreInfo({ st, streetLbl, land }) {
   const flop = IS_FLOP(st.gid);
   const dramaha = IS_DRAMAHA(st.gid);
   return (
@@ -7185,7 +7187,7 @@ function CentreInfo({ st, streetLbl }) {
               <span style={S.dblBoardTag}>TOP BOARD</span>
               <div style={S.boardSm}>
                 {[0,1,2,3,4].map(i => st.board[i]
-                  ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small/>
+                  ? <BoardCard key={`a-${st.boardKey}-${i}`} card={st.board[i]} idx={i} small tiny={land}/>
                   : <div key={`a${i}`} style={S.boardSlotSm}/>)}
               </div>
             </div>
@@ -7193,7 +7195,7 @@ function CentreInfo({ st, streetLbl }) {
               <span style={S.dblBoardTag}>BOTTOM BOARD</span>
               <div style={S.boardSm}>
                 {[0,1,2,3,4].map(i => (st.board2||[])[i]
-                  ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small/>
+                  ? <BoardCard key={`b-${st.boardKey}-${i}`} card={st.board2[i]} idx={i} small tiny={land}/>
                   : <div key={`b${i}`} style={S.boardSlotSm}/>)}
               </div>
             </div>
@@ -7252,13 +7254,13 @@ function CentreInfo({ st, streetLbl }) {
 }
 
 // Community card — slightly larger, with its own deal animation
-function BoardCard({ card, idx, small, styleOverride }) {
+function BoardCard({ card, idx, small, tiny, styleOverride }) {
   const isRed = RED.has(card.s);
-  const ov = styleOverride || null;
+  const ov = styleOverride || (tiny ? {width:20,height:28,borderRadius:3} : null);
   return (
     <div style={{...(small?S.boardCardSm:S.boardCard), color:isRed?"#b91c1c":"#111827", animation:`boardIn 0.3s cubic-bezier(.2,.7,.3,1) ${idx*0.09}s backwards`, ...(ov||{})}}>
-      <b style={{fontSize: ov? "inherit" : (small?11:13), lineHeight:1}}>{card.r}</b>
-      <span style={{fontSize: ov? "0.72em" : (small?10:12), lineHeight:1}}>{card.s}</span>
+      <b style={{fontSize: tiny?9 : (ov? "inherit" : (small?11:13)), lineHeight:1}}>{card.r}</b>
+      <span style={{fontSize: tiny?8 : (ov? "0.72em" : (small?10:12)), lineHeight:1}}>{card.s}</span>
     </div>
   );
 }

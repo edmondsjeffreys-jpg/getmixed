@@ -4409,7 +4409,7 @@ function ReviewScreen({ onClose }) {
 }
 const FORMSPREE_ENDPOINT = "https://formspree.io/f/xzdleqva";
 const SUPPORT_URL = "https://ko-fi.com/getmixed";
-const APP_VERSION = "2026.07.05v";
+const APP_VERSION = "2026.07.05x";
 const IS_BETA = true;
 const TOUR = [
     { id: "tour-menu", title: "Pick your game", text: "Tap this bar to switch between 20+ mixed games — draw, stud, flop, and split-pot. The ones nobody else lets you practice." },
@@ -5914,7 +5914,7 @@ function App() {
     const screenW = useWidth();
     const screenH = typeof window !== 'undefined' ? window.innerHeight : 900;
     const mobile = Math.min(screenW, screenH) < 560;
-    const landPhone = mobile && screenW > screenH;
+    const landPhone = mobile && screenW > screenH && !IS_DOUBLE(st.gid);
     const curGame = GAMES.find(g => g.id === st.gid);
     const histRef = useRef({ dealKey: -1, decisions: [], startChips: null, startHole: null });
     const scenLogRef = useRef([]);
@@ -6804,12 +6804,12 @@ function App() {
                                 React.createElement("div", { style: S.ovalDblRow },
                                     React.createElement("span", { style: S.ovalDblTag }, "TOP"),
                                     React.createElement("div", { style: S.boardSm }, [0, 1, 2, 3, 4].map(i => st.board[i]
-                                        ? React.createElement(BoardCard, { key: `a-${st.boardKey}-${i}`, card: st.board[i], idx: i, small: true })
+                                        ? React.createElement(BoardCard, { key: `a-${st.boardKey}-${i}`, card: st.board[i], idx: i, small: true, tiny: land })
                                         : React.createElement("div", { key: `a${i}`, style: S.boardSlotSm })))),
                                 React.createElement("div", { style: S.ovalDblRow },
                                     React.createElement("span", { style: S.ovalDblTag }, "BOT"),
                                     React.createElement("div", { style: S.boardSm }, [0, 1, 2, 3, 4].map(i => (st.board2 || [])[i]
-                                        ? React.createElement(BoardCard, { key: `b-${st.boardKey}-${i}`, card: st.board2[i], idx: i, small: true })
+                                        ? React.createElement(BoardCard, { key: `b-${st.boardKey}-${i}`, card: st.board2[i], idx: i, small: true, tiny: land })
                                         : React.createElement("div", { key: `b${i}`, style: S.boardSlotSm }))))),
                             React.createElement("div", { style: S.ovalDblPot },
                                 React.createElement("span", { style: S.potLbl }, "POT"),
@@ -6817,16 +6817,16 @@ function App() {
                                     "$",
                                     MNY(st.pot)),
                                 streetLbl && React.createElement("span", { style: S.ovalDblStreet }, streetLbl)))) : (React.createElement("div", { style: { ...S.ovalCentre, ...(landPhone ? { top: "57%", left: "50%", width: "auto", display: "flex", flexDirection: "column", alignItems: "center" } : {}) } },
-                            React.createElement(CentreInfo, { st: st, streetLbl: streetLbl }))))) : (React.createElement("div", { style: S.mStrip }, [1, 2, 3].map(id => (React.createElement(MobileSeat, { key: id, p: st.players[id], reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === id, thinking: cpuTurn && st.queue[0] === id, wid: wid, won: (st.winnerIds || []).includes(id), tilt: st.cpuTilt?.[id] || 0, profile: PROF[id] })))))) : (React.createElement(React.Fragment, null,
+                            React.createElement(CentreInfo, { st: st, streetLbl: streetLbl, land: landPhone }))))) : (React.createElement("div", { style: S.mStrip }, [1, 2, 3].map(id => (React.createElement(MobileSeat, { key: id, p: st.players[id], reveal: st.reveal, gid: st.gid, board: st.board, isDealer: st.dealerIdx === id, thinking: cpuTurn && st.queue[0] === id, wid: wid, won: (st.winnerIds || []).includes(id), tilt: st.cpuTilt?.[id] || 0, profile: PROF[id] })))))) : (React.createElement(React.Fragment, null,
                         React.createElement("div", { style: S.rowTop },
                             React.createElement(Seat, { p: st.players[2], reveal: st.reveal, gid: st.gid, board: st.board, dealKey: st.dealKey, isDealer: st.dealerIdx === 2, thinking: cpuTurn && st.queue[0] === 2, wid: wid, won: (st.winnerIds || []).includes(2), tilt: st.cpuTilt?.[2] || 0, profile: PROF[2] })),
                         React.createElement("div", { style: S.rowMid },
                             React.createElement("div", { style: S.sideSeat },
                                 React.createElement(Seat, { p: st.players[1], reveal: st.reveal, gid: st.gid, board: st.board, dealKey: st.dealKey, isDealer: st.dealerIdx === 1, compact: true, thinking: cpuTurn && st.queue[0] === 1, wid: wid, won: (st.winnerIds || []).includes(1), tilt: st.cpuTilt?.[1] || 0, profile: PROF[1] })),
-                            React.createElement(CentreInfo, { st: st, streetLbl: streetLbl }),
+                            React.createElement(CentreInfo, { st: st, streetLbl: streetLbl, land: landPhone }),
                             React.createElement("div", { style: S.sideSeat },
                                 React.createElement(Seat, { p: st.players[3], reveal: st.reveal, gid: st.gid, board: st.board, dealKey: st.dealKey, isDealer: st.dealerIdx === 3, compact: true, thinking: cpuTurn && st.queue[0] === 3, wid: wid, won: (st.winnerIds || []).includes(3), tilt: st.cpuTilt?.[3] || 0, profile: PROF[3] }))))),
-                    mobile && st.players.length <= 4 && React.createElement(CentreInfo, { st: st, streetLbl: streetLbl }),
+                    mobile && st.players.length <= 4 && React.createElement(CentreInfo, { st: st, streetLbl: streetLbl, land: landPhone }),
                     React.createElement("div", { style: { ...S.botRow, ...(mobile && st.players.length > 4 ? { marginTop: -64 } : {}) } },
                         React.createElement("div", { style: S.youBar },
                             st.dealerIdx === 0 && React.createElement(DBtn, null),
@@ -7060,7 +7060,7 @@ function App() {
                     "build ",
                     APP_VERSION)))));
 }
-function CentreInfo({ st, streetLbl }) {
+function CentreInfo({ st, streetLbl, land }) {
     const flop = IS_FLOP(st.gid);
     const dramaha = IS_DRAMAHA(st.gid);
     return (React.createElement("div", { style: S.centre },
@@ -7068,12 +7068,12 @@ function CentreInfo({ st, streetLbl }) {
             React.createElement("div", { style: S.dblBoardWrap },
                 React.createElement("span", { style: S.dblBoardTag }, "TOP BOARD"),
                 React.createElement("div", { style: S.boardSm }, [0, 1, 2, 3, 4].map(i => st.board[i]
-                    ? React.createElement(BoardCard, { key: `a-${st.boardKey}-${i}`, card: st.board[i], idx: i, small: true })
+                    ? React.createElement(BoardCard, { key: `a-${st.boardKey}-${i}`, card: st.board[i], idx: i, small: true, tiny: land })
                     : React.createElement("div", { key: `a${i}`, style: S.boardSlotSm })))),
             React.createElement("div", { style: S.dblBoardWrap },
                 React.createElement("span", { style: S.dblBoardTag }, "BOTTOM BOARD"),
                 React.createElement("div", { style: S.boardSm }, [0, 1, 2, 3, 4].map(i => (st.board2 || [])[i]
-                    ? React.createElement(BoardCard, { key: `b-${st.boardKey}-${i}`, card: st.board2[i], idx: i, small: true })
+                    ? React.createElement(BoardCard, { key: `b-${st.boardKey}-${i}`, card: st.board2[i], idx: i, small: true, tiny: land })
                     : React.createElement("div", { key: `b${i}`, style: S.boardSlotSm })))))) : (React.createElement("div", { style: S.board }, [0, 1, 2, 3, 4].map(i => {
             const c = st.board[i];
             return c
@@ -7105,12 +7105,12 @@ function CentreInfo({ st, streetLbl }) {
                     border: `1px solid ${youWon ? "#3FD39C" : "#E2857A"}` } }, label));
         })()));
 }
-function BoardCard({ card, idx, small, styleOverride }) {
+function BoardCard({ card, idx, small, tiny, styleOverride }) {
     const isRed = RED.has(card.s);
-    const ov = styleOverride || null;
+    const ov = styleOverride || (tiny ? { width: 20, height: 28, borderRadius: 3 } : null);
     return (React.createElement("div", { style: { ...(small ? S.boardCardSm : S.boardCard), color: isRed ? "#b91c1c" : "#111827", animation: `boardIn 0.3s cubic-bezier(.2,.7,.3,1) ${idx * 0.09}s backwards`, ...(ov || {}) } },
-        React.createElement("b", { style: { fontSize: ov ? "inherit" : (small ? 11 : 13), lineHeight: 1 } }, card.r),
-        React.createElement("span", { style: { fontSize: ov ? "0.72em" : (small ? 10 : 12), lineHeight: 1 } }, card.s)));
+        React.createElement("b", { style: { fontSize: tiny ? 9 : (ov ? "inherit" : (small ? 11 : 13)), lineHeight: 1 } }, card.r),
+        React.createElement("span", { style: { fontSize: tiny ? 8 : (ov ? "0.72em" : (small ? 10 : 12)), lineHeight: 1 } }, card.s)));
 }
 function Seat({ p, reveal, gid, board, dealKey, isDealer, compact, thinking, wid, won, tilt, profile }) {
     if (!p)
